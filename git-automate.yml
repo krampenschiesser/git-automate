@@ -1,0 +1,7 @@
+projects:
+  sks-iac:
+    repository: https://github.com/krampenschiesser/sks-iac
+    projectId: 1
+    opencode:
+      url: http://localhost:8081
+      pw: ${env:OPENCODE_PW}

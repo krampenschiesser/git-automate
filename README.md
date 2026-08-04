@@ -1,1 +1,1 @@
-github automation
+automation for github
