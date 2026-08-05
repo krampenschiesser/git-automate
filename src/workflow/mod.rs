@@ -1,0 +1,1318 @@
+//! Workflow orchestrator — port of `src/workflow.ts`.
+//!
+//! The [`Workflow`] struct ties together all workflow checks in sequence:
+//! setup → opencode → triage → todo → review. Each public `run_*_check`
+//! method wraps per-project work in error isolation (errors are logged,
+//! never propagated).
+
+pub mod checks;
+pub mod helpers;
+
+use crate::config::ProjectConfig;
+use crate::github::repo::parse_repository_url;
+use crate::github::types::ParsedRepo;
+use crate::log::LogLevel;
+use crate::opencode::client::OpenCodeClient;
+use crate::opencode::types::AgentInfo;
+
+use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
+use self::helpers::{
+    SESSION_FIELD_NAME, WorkflowDeps, WorkflowError, resolve_context, write_project_id,
+};
+
+// ─── Constants ─────────────────────────────────────────────────
+
+/// The six required OpenCode agents that must be installed.
+///
+/// Equivalent to `REQUIRED_AGENTS` in `src/workflow.ts`.
+pub const REQUIRED_AGENTS: [&str; 6] = [
+    "git-automate-triage",
+    "git-automate-taskmanager",
+    "git-automate-developer",
+    "git-automate-reviewer",
+    "git-automate-product",
+    "git-automate-qa",
+];
+
+/// The seven status options that must exist on the project's Status field.
+///
+/// Equivalent to `STATUS_OPTIONS` in `src/workflow.ts`.
+pub const STATUS_OPTIONS: [&str; 7] = [
+    "Triage",
+    "Todo",
+    "In Development",
+    "Review Technical",
+    "Review Product",
+    "QA",
+    "Done",
+];
+
+// ─── Workflow ──────────────────────────────────────────────────
+
+/// Orchestrator that runs workflow checks in sequence.
+///
+/// Equivalent to the `Workflow` class from `src/workflow.ts`.
+pub struct Workflow {
+    deps: WorkflowDeps,
+}
+
+impl Workflow {
+    /// Create a new `Workflow` with the given dependencies.
+    pub fn new(deps: WorkflowDeps) -> Self {
+        Self { deps }
+    }
+
+    // ── Logging helper ──────────────────────────────────────────
+
+    /// Call the injected logger, if any.
+    fn log(&self, level: LogLevel, msg: &str) {
+        if let Some(log) = &self.deps.on_log {
+            log(level, msg);
+        }
+    }
+
+    // ── Public API ─────────────────────────────────────────────
+
+    /// Run all checks in order: setup → opencode → triage → todo → review.
+    ///
+    /// Each sub-check catches and logs its own errors internally, so this
+    /// method always returns `Ok(())`.
+    pub async fn run_all(&self) -> Result<(), WorkflowError> {
+        let _ = self.run_setup_check().await;
+        let _ = self.run_opencode_check().await;
+        let _ = self.run_triage_check().await;
+        let _ = self.run_todo_check().await;
+        let _ = self.run_review_check().await;
+        Ok(())
+    }
+
+    /// For each project: parse the repo URL, create the GitHub project if
+    /// missing, ensure status options, and ensure the sessionId field.
+    pub async fn run_setup_check(&self) -> Result<(), WorkflowError> {
+        let Some(_github) = self.deps.github.as_ref() else {
+            self.log(
+                LogLevel::Warn,
+                "GitHub client not available — skipping setup check",
+            );
+            return Ok(());
+        };
+
+        for (project_name, project_config) in &self.deps.config.projects {
+            if let Err(e) = self.setup_project(project_name, project_config).await {
+                self.log(
+                    LogLevel::Error,
+                    &format!("Setup check failed for {}: {}", project_name, e),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// For each project with an OpenCode config: check server health and
+    /// verify required agents are present.
+    pub async fn run_opencode_check(&self) -> Result<(), WorkflowError> {
+        for (project_name, project_config) in &self.deps.config.projects {
+            let Some(opencode) = &project_config.opencode else {
+                continue;
+            };
+            let oc = OpencodeSessionConfig {
+                url: opencode.url.clone(),
+                pw: opencode.pw.clone(),
+                directory: project_config.directory.clone(),
+            };
+            if let Err(e) = self.check_opencode(&oc).await {
+                self.log(
+                    LogLevel::Error,
+                    &format!("OpenCode check failed for {}: {}", project_name, e),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// For each project with an OpenCode config: resolve context, then run
+    /// the triage check (`@ai` issues → project item → triage session).
+    pub async fn run_triage_check(&self) -> Result<(), WorkflowError> {
+        let Some(_github) = self.deps.github.as_ref() else {
+            self.log(
+                LogLevel::Warn,
+                "GitHub client not available — skipping triage check",
+            );
+            return Ok(());
+        };
+
+        for (project_name, project_config) in &self.deps.config.projects {
+            if project_config.opencode.is_none() {
+                continue;
+            }
+            let result = async {
+                let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
+                    .await?;
+                let opencode = project_config.opencode.as_ref().ok_or_else(|| {
+                    WorkflowError::Other(format!(
+                        "project '{}' has no opencode config",
+                        project_name
+                    ))
+                })?;
+                let oc = OpencodeSessionConfig {
+                    url: opencode.url.clone(),
+                    pw: opencode.pw.clone(),
+                    directory: project_config.directory.clone(),
+                };
+                run_triage_check(&self.deps, &ctx, &oc).await
+            }
+            .await;
+            if let Err(e) = result {
+                self.log(
+                    LogLevel::Error,
+                    &format!("Triage check failed for {}: {}", project_name, e),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// For each project with an OpenCode config: resolve context, then run
+    /// the todo check (Todo items → developer session).
+    pub async fn run_todo_check(&self) -> Result<(), WorkflowError> {
+        let Some(_github) = self.deps.github.as_ref() else {
+            self.log(
+                LogLevel::Warn,
+                "GitHub client not available — skipping todo check",
+            );
+            return Ok(());
+        };
+
+        for (project_name, project_config) in &self.deps.config.projects {
+            if project_config.opencode.is_none() {
+                continue;
+            }
+            let result = async {
+                let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
+                    .await?;
+                let opencode = project_config.opencode.as_ref().ok_or_else(|| {
+                    WorkflowError::Other(format!(
+                        "project '{}' has no opencode config",
+                        project_name
+                    ))
+                })?;
+                let oc = OpencodeSessionConfig {
+                    url: opencode.url.clone(),
+                    pw: opencode.pw.clone(),
+                    directory: project_config.directory.clone(),
+                };
+                run_todo_check(&self.deps, &ctx, &oc).await
+            }
+            .await;
+            if let Err(e) = result {
+                self.log(
+                    LogLevel::Error,
+                    &format!("Todo check failed for {}: {}", project_name, e),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// For each project with an OpenCode config: resolve context, then run
+    /// the review check (Review Technical / Review Product / QA → session).
+    pub async fn run_review_check(&self) -> Result<(), WorkflowError> {
+        let Some(_github) = self.deps.github.as_ref() else {
+            self.log(
+                LogLevel::Warn,
+                "GitHub client not available — skipping review check",
+            );
+            return Ok(());
+        };
+
+        for (project_name, project_config) in &self.deps.config.projects {
+            if project_config.opencode.is_none() {
+                continue;
+            }
+            let result = async {
+                let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
+                    .await?;
+                let opencode = project_config.opencode.as_ref().ok_or_else(|| {
+                    WorkflowError::Other(format!(
+                        "project '{}' has no opencode config",
+                        project_name
+                    ))
+                })?;
+                let oc = OpencodeSessionConfig {
+                    url: opencode.url.clone(),
+                    pw: opencode.pw.clone(),
+                    directory: project_config.directory.clone(),
+                };
+                run_review_check(&self.deps, &ctx, &oc).await
+            }
+            .await;
+            if let Err(e) = result {
+                self.log(
+                    LogLevel::Error,
+                    &format!("Review check failed for {}: {}", project_name, e),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // ── Private check implementations ─────────────────────────
+
+    /// Parse the repository URL, create the GitHub project if it doesn't
+    /// exist yet, then ensure status options and the sessionId field.
+    async fn setup_project(&self, name: &str, config: &ProjectConfig) -> Result<(), WorkflowError> {
+        let ParsedRepo { owner, repo } = parse_repository_url(&config.repository)
+            .map_err(|e| WorkflowError::Other(e.to_string()))?;
+
+        let project_id = if let Some(pid) = &config.project_id {
+            pid.clone()
+        } else {
+            self.log(
+                LogLevel::Info,
+                &format!("Creating project {} for {}/{}", name, owner, repo),
+            );
+            let github = self
+                .deps
+                .github
+                .as_ref()
+                .ok_or_else(|| WorkflowError::NoGitHub(name.to_string()))?;
+            let pid = github.create_project(&owner, name).await?;
+            let mut config_clone = self.deps.config.clone();
+            write_project_id(name, &pid, &mut config_clone).await?;
+            pid
+        };
+
+        self.ensure_status_options(&project_id).await?;
+        self.ensure_session_id_field(&project_id).await?;
+        Ok(())
+    }
+
+    /// Ensure the project's "Status" field has all [`STATUS_OPTIONS`].
+    ///
+    /// Returns `WorkflowError::NoStatusField` if the field doesn't exist.
+    async fn ensure_status_options(&self, project_id: &str) -> Result<(), WorkflowError> {
+        let github = self
+            .deps
+            .github
+            .as_ref()
+            .ok_or_else(|| WorkflowError::NoGitHub(project_id.to_string()))?;
+
+        let status_field = github
+            .get_project_status_field(project_id)
+            .await?
+            .ok_or_else(|| WorkflowError::NoStatusField(project_id.to_string()))?;
+
+        let existing: std::collections::HashSet<&str> = status_field
+            .options
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect();
+
+        let missing: Vec<&str> = STATUS_OPTIONS
+            .iter()
+            .copied()
+            .filter(|opt| !existing.contains(opt))
+            .collect();
+
+        if !missing.is_empty() {
+            self.log(
+                LogLevel::Info,
+                &format!("Adding status options: {}", missing.join(", ")),
+            );
+            github
+                .add_project_status_options(project_id, &status_field.id, &missing)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Ensure the project has a `sessionId` text field.
+    async fn ensure_session_id_field(&self, project_id: &str) -> Result<(), WorkflowError> {
+        let github = self
+            .deps
+            .github
+            .as_ref()
+            .ok_or_else(|| WorkflowError::NoGitHub(project_id.to_string()))?;
+
+        let fields = github.get_project_fields(project_id).await?;
+        let has_session_id = fields.iter().any(|f| f.name == SESSION_FIELD_NAME);
+
+        if !has_session_id {
+            self.log(LogLevel::Info, "Adding sessionId field");
+            github
+                .add_project_field(project_id, SESSION_FIELD_NAME, "TEXT")
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Check OpenCode server health and verify all required agents exist.
+    async fn check_opencode(&self, oc: &OpencodeSessionConfig) -> Result<(), WorkflowError> {
+        let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
+
+        if !client.check_health().await {
+            self.log(
+                LogLevel::Warn,
+                &format!("OpenCode server at {} is not healthy", oc.url),
+            );
+            return Ok(());
+        }
+
+        self.log(
+            LogLevel::Info,
+            &format!("OpenCode server at {} is healthy", oc.url),
+        );
+
+        let agents: Vec<AgentInfo> = client
+            .get_agents(oc.directory.as_deref())
+            .await
+            .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
+
+        let agent_names: std::collections::HashSet<&str> =
+            agents.iter().map(|a| a.name.as_str()).collect();
+
+        let missing: Vec<&str> = REQUIRED_AGENTS
+            .iter()
+            .copied()
+            .filter(|a| !agent_names.contains(a))
+            .collect();
+
+        if !missing.is_empty() {
+            self.log(
+                LogLevel::Warn,
+                &format!("Missing required agents: {}", missing.join(", ")),
+            );
+        } else {
+            self.log(LogLevel::Info, "All required agents present");
+        }
+        Ok(())
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig};
+    use crate::github::client::GitHubClient;
+    use crate::shell::{ShellFn, ShellOutput};
+    use crate::workflow::helpers::LogFn;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── Test helpers ──────────────────────────────────────────
+
+    /// Build a `GitHubClient` pointed at a mock server (test helper).
+    async fn gh_client(server: &MockServer) -> GitHubClient {
+        GitHubClient::new_with_base_url("test-token".to_string(), server.uri())
+            .expect("token is non-empty")
+    }
+
+    /// A shell function that always succeeds with empty output.
+    fn mock_shell() -> ShellFn {
+        Arc::new(|_cmd: String| {
+            Box::pin(async move {
+                ShellOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }
+            })
+        })
+    }
+
+    /// A no-op logger.
+    fn noop_log() -> Option<LogFn> {
+        Some(Arc::new(|_level: LogLevel, _msg: &str| {}))
+    }
+
+    /// A capturing logger that records all messages into a shared Vec.
+    fn capturing_log() -> (Option<LogFn>, Arc<Mutex<Vec<(LogLevel, String)>>>) {
+        let messages: Arc<Mutex<Vec<(LogLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_fn: LogFn = {
+            let msgs = Arc::clone(&messages);
+            Arc::new(move |level: LogLevel, msg: &str| {
+                msgs.lock().unwrap().push((level, msg.to_string()));
+            })
+        };
+        (Some(log_fn), messages)
+    }
+
+    /// Build `WorkflowDeps` with the given GitHub client and a no-op logger.
+    fn make_deps(github: Option<GitHubClient>) -> WorkflowDeps {
+        WorkflowDeps {
+            config: GitAutomateConfig {
+                projects: BTreeMap::new(),
+            },
+            github,
+            shell: mock_shell(),
+            on_log: noop_log(),
+        }
+    }
+
+    /// Build a project config without opencode.
+    fn make_project_no_opencode() -> ProjectConfig {
+        ProjectConfig {
+            repository: "https://github.com/owner/repo".to_string(),
+            project_id: Some("PID-123".to_string()),
+            directory: None,
+            opencode: None,
+        }
+    }
+
+    // ── Constants tests ───────────────────────────────────────
+
+    #[test]
+    fn required_agents_matches_ts() {
+        assert_eq!(REQUIRED_AGENTS.len(), 6);
+        assert_eq!(REQUIRED_AGENTS[0], "git-automate-triage");
+        assert_eq!(REQUIRED_AGENTS[1], "git-automate-taskmanager");
+        assert_eq!(REQUIRED_AGENTS[2], "git-automate-developer");
+        assert_eq!(REQUIRED_AGENTS[3], "git-automate-reviewer");
+        assert_eq!(REQUIRED_AGENTS[4], "git-automate-product");
+        assert_eq!(REQUIRED_AGENTS[5], "git-automate-qa");
+    }
+
+    #[test]
+    fn status_options_matches_ts() {
+        assert_eq!(STATUS_OPTIONS.len(), 7);
+        assert_eq!(
+            STATUS_OPTIONS,
+            [
+                "Triage",
+                "Todo",
+                "In Development",
+                "Review Technical",
+                "Review Product",
+                "QA",
+                "Done"
+            ]
+        );
+    }
+
+    // ── run_all ordering (test 1) ─────────────────────────────
+
+    /// Verify run_all calls all 5 checks in order (via log capture).
+    #[tokio::test]
+    async fn run_all_calls_all_checks_in_order() {
+        // One project with opencode config + github=None → all 5 checks log:
+        // setup(skip), opencode(not healthy), triage(skip), todo(skip), review(skip).
+        let oc_mock = MockServer::start().await;
+
+        let project = ProjectConfig {
+            repository: "https://github.com/owner/repo".to_string(),
+            project_id: Some("PID-123".to_string()),
+            directory: None,
+            opencode: Some(OpencodeConfig {
+                url: oc_mock.uri(),
+                pw: "test-pw".to_string(),
+            }),
+        };
+        let mut projects = BTreeMap::new();
+        projects.insert("test-proj".to_string(), project);
+
+        let (log_fn, messages) = capturing_log();
+        let deps = WorkflowDeps {
+            config: GitAutomateConfig { projects },
+            github: None,
+            shell: mock_shell(),
+            on_log: log_fn,
+        };
+
+        let workflow = Workflow::new(deps);
+        workflow.run_all().await.unwrap();
+
+        let msgs = messages.lock().unwrap();
+        assert_eq!(msgs.len(), 5, "expected 5 log messages");
+        assert!(msgs[0].1.contains("skipping setup check"));
+        assert!(msgs[1].1.contains("not healthy") || msgs[1].1.contains("OpenCode server"));
+        assert!(msgs[2].1.contains("skipping triage check"));
+        assert!(msgs[3].1.contains("skipping todo check"));
+        assert!(msgs[4].1.contains("skipping review check"));
+    }
+
+    // ── run_setup_check with github=None (test 2) ─────────────
+
+    #[tokio::test]
+    async fn run_setup_check_with_no_github_logs_warn() {
+        let deps = make_deps(None);
+        let (log_fn, messages) = capturing_log();
+        let mut deps = deps;
+        deps.on_log = log_fn;
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.run_setup_check().await;
+
+        assert!(result.is_ok());
+        let msgs = messages.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, LogLevel::Warn);
+        assert!(msgs[0].1.contains("skipping setup check"));
+    }
+
+    // ── run_setup_check with github iterates projects (test 3) ─
+
+    #[tokio::test]
+    async fn run_setup_check_with_github_iterates_projects() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock).await;
+
+        // Mock: get_owner_id (login)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "user": { "id": "uid" }, "organization": null }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Mock: createProjectV2 → pid (expect 1)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2": { "id": "new-pid" } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Mock: status field with all options
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Mock: fields with sessionId present
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"sessionId","dataType":"TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Project without projectId → triggers create_project
+        let project = ProjectConfig {
+            repository: "https://github.com/owner/repo".to_string(),
+            project_id: None,
+            directory: None,
+            opencode: None,
+        };
+        let mut projects = BTreeMap::new();
+        projects.insert("test-proj".to_string(), project.clone());
+
+        let deps = WorkflowDeps {
+            config: GitAutomateConfig { projects },
+            github: Some(client),
+            shell: mock_shell(),
+            on_log: noop_log(),
+        };
+
+        // Temp dir with git-automate.yml for write_project_id
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n";
+        std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.run_setup_check().await;
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(result.is_ok());
+        mock.verify().await; // create_project called exactly once
+    }
+
+    // ── run_setup_check with one failing project (test 4) ─────
+
+    #[tokio::test]
+    async fn run_setup_check_error_isolation_logs_and_continues() {
+        let mock = MockServer::start().await;
+
+        // Project with projectId → setup_project calls ensure_status_options
+        // which calls get_project_status_field. Return null → NoStatusField error.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "node": { "field": null } }
+            })))
+            .mount(&mock)
+            .await;
+
+        let client = gh_client(&mock).await;
+        let project = ProjectConfig {
+            repository: "https://github.com/owner/repo".to_string(),
+            project_id: Some("PID-1".to_string()),
+            directory: None,
+            opencode: None,
+        };
+        let mut projects = BTreeMap::new();
+        projects.insert("proj-a".to_string(), project);
+
+        let (log_fn, messages) = capturing_log();
+        let deps = WorkflowDeps {
+            config: GitAutomateConfig { projects },
+            github: Some(client),
+            shell: mock_shell(),
+            on_log: log_fn,
+        };
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.run_setup_check().await;
+
+        // Method returns Ok (errors caught internally), but logs the error.
+        assert!(result.is_ok());
+        let msgs = messages.lock().unwrap();
+        let has_error = msgs.iter().any(|(level, msg)| {
+            *level == LogLevel::Error && msg.contains("Setup check failed for proj-a")
+        });
+        assert!(has_error, "expected error log for proj-a: {:?}", msgs);
+    }
+
+    // ── run_triage_check skips project without opencode (test 5) ─
+
+    #[tokio::test]
+    async fn run_triage_check_skips_project_without_opencode() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock).await;
+        let (log_fn, messages) = capturing_log();
+
+        let project = make_project_no_opencode();
+        let mut projects = BTreeMap::new();
+        projects.insert("no-opencode-proj".to_string(), project);
+
+        let deps = WorkflowDeps {
+            config: GitAutomateConfig { projects },
+            github: Some(client),
+            shell: mock_shell(),
+            on_log: log_fn,
+        };
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.run_triage_check().await;
+
+        assert!(result.is_ok());
+        let msgs = messages.lock().unwrap();
+        // No errors — project was skipped, not failed
+        let has_error = msgs.iter().any(|(level, _)| *level == LogLevel::Error);
+        assert!(
+            !has_error,
+            "should not have errors for skipped project: {:?}",
+            msgs
+        );
+    }
+
+    // ── run_triage_check with github=None (test 6) ────────────
+
+    #[tokio::test]
+    async fn run_triage_check_with_no_github_logs_warn() {
+        let deps = make_deps(None);
+        let (log_fn, messages) = capturing_log();
+        let mut deps = deps;
+        deps.on_log = log_fn;
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.run_triage_check().await;
+
+        assert!(result.is_ok());
+        let msgs = messages.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, LogLevel::Warn);
+        assert!(msgs[0].1.contains("skipping triage check"));
+    }
+
+    // ── setup_project without projectId (test 7) ─────────────
+
+    #[tokio::test]
+    async fn setup_project_without_project_id_calls_create_and_write() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock).await;
+
+        // Mock get_owner_id
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "user": { "id": "uid" }, "organization": null }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Mock createProjectV2 (expect 1)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2": { "id": "new-pid" } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Mock status field → all options present (no add needed)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Mock fields → sessionId present (no add needed)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"sessionId","dataType":"TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let project = ProjectConfig {
+            repository: "https://github.com/owner/repo".to_string(),
+            project_id: None,
+            directory: None,
+            opencode: None,
+        };
+
+        let deps = WorkflowDeps {
+            config: GitAutomateConfig {
+                projects: {
+                    let mut m = BTreeMap::new();
+                    m.insert("test-proj".to_string(), project.clone());
+                    m
+                },
+            },
+            github: Some(client),
+            shell: mock_shell(),
+            on_log: noop_log(),
+        };
+
+        // Temp dir with git-automate.yml for write_project_id
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n";
+        std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.setup_project("test-proj", &project).await;
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(result.is_ok());
+        mock.verify().await; // create_project called exactly once
+    }
+
+    // ── setup_project with projectId (test 8) ────────────────
+
+    #[tokio::test]
+    async fn setup_project_with_project_id_skips_create() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock).await;
+
+        // Mock status field → all options
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Mock fields → sessionId present
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"sessionId","dataType":"TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // createProjectV2 should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2": { "id": "should-not-be-called" } }
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let project = ProjectConfig {
+            repository: "https://github.com/owner/repo".to_string(),
+            project_id: Some("PID-123".to_string()),
+            directory: None,
+            opencode: None,
+        };
+
+        let deps = WorkflowDeps {
+            config: GitAutomateConfig {
+                projects: {
+                    let mut m = BTreeMap::new();
+                    m.insert("test-proj".to_string(), project.clone());
+                    m
+                },
+            },
+            github: Some(client),
+            shell: mock_shell(),
+            on_log: noop_log(),
+        };
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.setup_project("test-proj", &project).await;
+
+        assert!(result.is_ok());
+    }
+
+    // ── ensure_status_options with all options (test 9) ──────
+
+    #[tokio::test]
+    async fn ensure_status_options_all_present_no_add() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // addProjectStatusOptions should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "updateProjectV2FieldConfiguration": { "projectV2Field": { "id": "x" } } }
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let deps = make_deps(Some(client));
+        let workflow = Workflow::new(deps);
+        let result = workflow.ensure_status_options("PID-123").await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
+    // ── ensure_status_options with missing options (test 10) ─
+
+    #[tokio::test]
+    async fn ensure_status_options_missing_calls_add() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock).await;
+
+        // Only "Done" present → 6 missing
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // addProjectStatusOptions → expect 1 call
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "updateProjectV2FieldConfiguration": { "projectV2Field": { "id": "x" } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let deps = make_deps(Some(client));
+        let workflow = Workflow::new(deps);
+        let result = workflow.ensure_status_options("PID-123").await;
+
+        assert!(result.is_ok());
+    }
+
+    // ── ensure_session_id_field when exists (test 11) ────────
+
+    #[tokio::test]
+    async fn ensure_session_id_field_exists_no_add() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"sessionId","dataType":"TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // createProjectV2Field should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "should-not" } } }
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let deps = make_deps(Some(client));
+        let workflow = Workflow::new(deps);
+        let result = workflow.ensure_session_id_field("PID-123").await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
+    // ── ensure_session_id_field when missing (test 12) ───────
+
+    #[tokio::test]
+    async fn ensure_session_id_field_missing_calls_add() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // createProjectV2Field → expect 1 call
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "new-field" } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let deps = make_deps(Some(client));
+        let workflow = Workflow::new(deps);
+        let result = workflow.ensure_session_id_field("PID-123").await;
+
+        assert!(result.is_ok());
+    }
+
+    // ── check_opencode when healthy (test 13) ────────────────
+
+    #[tokio::test]
+    async fn check_opencode_healthy_checks_agents() {
+        let mock = MockServer::start().await;
+
+        // Mock health endpoint
+        Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "healthy": true,
+                "version": "1.0.0"
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Mock agent list → all 6 required agents
+        Mock::given(method("GET"))
+            .and(path("/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name":"git-automate-triage","description":"t","mode":"subagent","builtIn":true},
+                {"name":"git-automate-taskmanager","description":"t","mode":"subagent","builtIn":true},
+                {"name":"git-automate-developer","description":"t","mode":"subagent","builtIn":true},
+                {"name":"git-automate-reviewer","description":"t","mode":"subagent","builtIn":true},
+                {"name":"git-automate-product","description":"t","mode":"subagent","builtIn":true},
+                {"name":"git-automate-qa","description":"t","mode":"subagent","builtIn":true},
+            ])))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "test-pw".to_string(),
+            directory: Some("/tmp/work".to_string()),
+        };
+
+        let deps = make_deps(None);
+        let workflow = Workflow::new(deps);
+        let result = workflow.check_opencode(&oc).await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
+    // ── check_opencode when not healthy (test 14) ────────────
+
+    #[tokio::test]
+    async fn check_opencode_unhealthy_returns_early() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "healthy": false,
+                "version": "1.0.0"
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Agent endpoint should NOT be called
+        Mock::given(method("GET"))
+            .and(path("/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "test-pw".to_string(),
+            directory: None,
+        };
+
+        let deps = make_deps(None);
+        let workflow = Workflow::new(deps);
+        let result = workflow.check_opencode(&oc).await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
+    // ── check_opencode with missing agents (test 15) ─────────
+
+    #[tokio::test]
+    async fn check_opencode_missing_agents_warns() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "healthy": true,
+                "version": "1.0.0"
+            })))
+            .mount(&mock)
+            .await;
+
+        // Only 2 agents (missing 4)
+        Mock::given(method("GET"))
+            .and(path("/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name":"git-automate-triage","description":"t","mode":"subagent","builtIn":true},
+                {"name":"git-automate-developer","description":"t","mode":"subagent","builtIn":true},
+            ])))
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "test-pw".to_string(),
+            directory: None,
+        };
+
+        let (log_fn, messages) = capturing_log();
+        let mut deps = make_deps(None);
+        deps.on_log = log_fn;
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.check_opencode(&oc).await;
+
+        assert!(result.is_ok());
+        let msgs = messages.lock().unwrap();
+        let has_warn = msgs.iter().any(|(level, msg)| {
+            *level == LogLevel::Warn && msg.contains("Missing required agents")
+        });
+        assert!(
+            has_warn,
+            "expected 'Missing required agents' warning: {:?}",
+            msgs
+        );
+    }
+
+    // ── check_opencode with all agents present (test 16) ─────
+
+    #[tokio::test]
+    async fn check_opencode_all_agents_logs_info() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "healthy": true,
+                "version": "1.0.0"
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name":"git-automate-triage","mode":"subagent","builtIn":true},
+                {"name":"git-automate-taskmanager","mode":"subagent","builtIn":true},
+                {"name":"git-automate-developer","mode":"subagent","builtIn":true},
+                {"name":"git-automate-reviewer","mode":"subagent","builtIn":true},
+                {"name":"git-automate-product","mode":"subagent","builtIn":true},
+                {"name":"git-automate-qa","mode":"subagent","builtIn":true},
+            ])))
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "test-pw".to_string(),
+            directory: None,
+        };
+
+        let (log_fn, messages) = capturing_log();
+        let mut deps = make_deps(None);
+        deps.on_log = log_fn;
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.check_opencode(&oc).await;
+
+        assert!(result.is_ok());
+        let msgs = messages.lock().unwrap();
+        let has_all_present = msgs.iter().any(|(level, msg)| {
+            *level == LogLevel::Info && msg.contains("All required agents present")
+        });
+        assert!(
+            has_all_present,
+            "expected 'All required agents present' log: {:?}",
+            msgs
+        );
+    }
+
+    // ── run_all with no projects returns Ok ───────────────────
+
+    #[tokio::test]
+    async fn run_all_with_no_projects_returns_ok() {
+        let deps = make_deps(None);
+        let workflow = Workflow::new(deps);
+        let result = workflow.run_all().await;
+        assert!(result.is_ok());
+    }
+}

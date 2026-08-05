@@ -1,0 +1,27 @@
+[package]
+name = "git-automate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+anyhow = "1"
+base64 = "0.22"
+regex = "1"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "git-automate"
+path = "src/main.rs"

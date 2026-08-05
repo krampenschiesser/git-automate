@@ -1,7 +1,11 @@
 /target
 .idea
 .vscode
-node_modules
 .codegraph
 .omo
-dist
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target

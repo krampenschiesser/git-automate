@@ -1,0 +1,538 @@
+use base64::Engine;
+use reqwest::Client;
+use serde_json::json;
+use thiserror::Error;
+
+use crate::opencode::types::{Agent, AgentInfo, HealthResponse, Session};
+
+const OPENCODE_USERNAME: &str = "opencode";
+
+/// Errors that can occur while communicating with the OpenCode HTTP API.
+#[derive(Debug, Error)]
+pub enum OpenCodeError {
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("HTTP status {0}")]
+    HttpStatus(u16),
+    #[error("Failed to fetch agents: {0}")]
+    FetchAgents(String),
+    #[error("Failed to create session: {0}")]
+    CreateSession(String),
+    #[error("Session creation returned no data")]
+    NoSessionData,
+}
+
+/// A minimal HTTP client for the OpenCode server.
+///
+/// Uses HTTP Basic auth with username `"opencode"` and the provided password,
+/// matching the behaviour of the TypeScript `checkOpencodeHealth` /
+/// `startOpencodeSession` helpers.
+pub struct OpenCodeClient {
+    client: Client,
+    base_url: String,
+    auth_header: String,
+}
+
+impl OpenCodeClient {
+    /// Create a new client targeting `url` with the given `password`.
+    ///
+    /// The `Authorization` header is precomputed once as
+    /// `Basic base64("opencode:<password>")`.
+    pub fn new(url: String, password: String) -> Self {
+        let auth_header = encode_basic_auth(OPENCODE_USERNAME, &password);
+        Self {
+            client: Client::new(),
+            base_url: url,
+            auth_header,
+        }
+    }
+
+    /// `GET /global/health` — returns `true` only when the server reports
+    /// `healthy: true`.
+    ///
+    /// Mirrors the TypeScript `catch {}` semantics: on *any* failure (network
+    /// error, non-2xx status, malformed JSON, or a missing `healthy` field)
+    /// the method returns `false` rather than propagating the error.
+    pub async fn check_health(&self) -> bool {
+        self.check_health_inner().await.unwrap_or_default()
+    }
+
+    async fn check_health_inner(&self) -> Result<bool, OpenCodeError> {
+        let response = self
+            .client
+            .get(format!("{}/global/health", self.base_url))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+        let health: HealthResponse = response.json().await?;
+        Ok(health.healthy)
+    }
+
+    /// `GET /agent` — list available agents.
+    ///
+    /// When `directory` is `Some`, it is appended as a `?directory=<dir>` query
+    /// parameter, matching the SDK's `client.app.agents({ directory })`.
+    pub async fn get_agents(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<AgentInfo>, OpenCodeError> {
+        let mut request = self
+            .client
+            .get(format!("{}/agent", self.base_url))
+            .header("Authorization", &self.auth_header);
+        if let Some(dir) = directory {
+            request = request.query(&[("directory", dir)]);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
+        }
+        let agents: Vec<Agent> = response.json().await?;
+        Ok(agents.into_iter().map(AgentInfo::from).collect())
+    }
+
+    /// Create a session and immediately send it a prompt.
+    ///
+    /// 1. `POST /session?directory=<dir>` with body `{"title": <title>}` to
+    ///    obtain a [`Session`]; its `id` is returned on success.
+    /// 2. `POST /session/<id>/prompt_async` with body
+    ///    `{"agent": <agent>, "parts": [{"type": "text", "text": <message>}]}`
+    ///    to deliver the prompt. The 204 response body is ignored.
+    pub async fn start_session(
+        &self,
+        directory: &str,
+        title: &str,
+        agent: &str,
+        message: &str,
+    ) -> Result<String, OpenCodeError> {
+        // Step 1 — create the session.
+        let create_response = self
+            .client
+            .post(format!("{}/session", self.base_url))
+            .query(&[("directory", directory)])
+            .header("Authorization", &self.auth_header)
+            .json(&json!({ "title": title }))
+            .send()
+            .await?;
+
+        if !create_response.status().is_success() {
+            return Err(OpenCodeError::CreateSession(format!(
+                "session creation HTTP status {}",
+                create_response.status().as_u16()
+            )));
+        }
+
+        let session: Session = create_response.json().await?;
+        if session.id.is_empty() {
+            return Err(OpenCodeError::NoSessionData);
+        }
+        let session_id = session.id;
+
+        // Step 2 — send the prompt (fire-and-forget; ignore body).
+        let prompt_response = self
+            .client
+            .post(format!(
+                "{}/session/{}/prompt_async",
+                self.base_url, session_id
+            ))
+            .header("Authorization", &self.auth_header)
+            .json(&json!({
+                "agent": agent,
+                "parts": [{ "type": "text", "text": message }]
+            }))
+            .send()
+            .await?;
+
+        if !prompt_response.status().is_success() {
+            return Err(OpenCodeError::CreateSession(format!(
+                "prompt_async HTTP status {}",
+                prompt_response.status().as_u16()
+            )));
+        }
+
+        Ok(session_id)
+    }
+}
+
+/// Encode credentials for HTTP Basic authentication.
+///
+/// Returns `Basic <base64("username:password")>`, matching
+/// `Buffer.from("opencode:password", "utf-8").toString("base64")` from the
+/// TypeScript port.
+pub fn encode_basic_auth(username: &str, password: &str) -> String {
+    let combined = format!("{}:{}", username, password);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(combined);
+    format!("Basic {}", encoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build a client pointed at a mock server with a known password.
+    fn client(server: &MockServer) -> OpenCodeClient {
+        OpenCodeClient::new(server.uri(), "pw".to_string())
+    }
+
+    // --- encode_basic_auth (test 1) -------------------------------------
+
+    #[test]
+    fn test_encode_basic_auth_basic() {
+        let encoded = encode_basic_auth("opencode", "secret");
+        assert_eq!(encoded, "Basic b3BlbmNvZGU6c2VjcmV0");
+    }
+
+    #[test]
+    fn test_encode_basic_auth_arbitrary_password() {
+        // base64("opencode:mypassword") == b3BlbmNvZGU6bXlwYXNzd29yZA==
+        let encoded = encode_basic_auth("opencode", "mypassword");
+        assert_eq!(encoded, "Basic b3BlbmNvZGU6bXlwYXNzd29yZA==");
+    }
+
+    // --- check_health (tests 2-6) ---------------------------------------
+
+    #[tokio::test]
+    async fn test_check_health_healthy() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "healthy": true, "version": "1.0.0" })),
+            )
+            .expect(1)
+            .named("health");
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        assert!(client.check_health().await);
+    }
+
+    #[tokio::test]
+    async fn test_check_health_unhealthy() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "healthy": false, "version": "1.0.0" })),
+            )
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        assert!(!client.check_health().await);
+    }
+
+    #[tokio::test]
+    async fn test_check_health_500_returns_false() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        assert!(!client.check_health().await);
+    }
+
+    #[tokio::test]
+    async fn test_check_health_malformed_json_returns_false() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("not json", "text/plain"))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        assert!(!client.check_health().await);
+    }
+
+    #[tokio::test]
+    async fn test_check_health_missing_healthy_field_returns_false() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "1.0.0" })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        assert!(!client.check_health().await);
+    }
+
+    #[tokio::test]
+    async fn test_check_health_network_error_returns_false() {
+        // No mocks mounted — every request gets an immediate connection reset.
+        let server = MockServer::start().await;
+        let client = client(&server);
+        assert!(!client.check_health().await);
+    }
+
+    // --- get_agents (tests 7-10) ----------------------------------------
+
+    #[tokio::test]
+    async fn test_get_agents_no_description() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/agent"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "name": "agent1", "mode": "subagent", "builtIn": true }
+            ])))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let agents = client.get_agents(None).await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "agent1");
+        assert_eq!(agents[0].description, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_agents_with_description() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "name": "a",
+                    "mode": "primary",
+                    "builtIn": false,
+                    "description": "test"
+                }
+            ])))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let agents = client.get_agents(None).await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "a");
+        assert_eq!(agents[0].description.as_deref(), Some("test"));
+    }
+
+    #[tokio::test]
+    async fn test_get_agents_with_directory_query_param() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/agent"))
+            .and(query_param("directory", "/path"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let agents = client.get_agents(Some("/path")).await.unwrap();
+        assert!(agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_agents_no_directory_omits_query_param() {
+        // If a `directory` param is present the request must NOT match this mock
+        // (wiremock returns 404 for unmatched requests, surfacing a real error).
+        let mock = Mock::given(method("GET"))
+            .and(path("/agent"))
+            .and(query_param("directory", "/absent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        // Mount a fallback that matches the no-query-param request.
+        let ok = Mock::given(method("GET"))
+            .and(path("/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1);
+        ok.mount(&server).await;
+
+        let client = client(&server);
+        client.get_agents(None).await.unwrap();
+    }
+
+    // --- start_session (tests 11-14) ------------------------------------
+
+    #[tokio::test]
+    async fn test_start_session_returns_id() {
+        // Session creation mock.
+        let create = Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(query_param("directory", "/d"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        create.mount(&server).await;
+
+        // prompt_async mock.
+        let prompt = Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1);
+        prompt.mount(&server).await;
+
+        let client = client(&server);
+        let id = client
+            .start_session("/d", "Session Title", "git-automate-triage", "issue body")
+            .await
+            .unwrap();
+        assert_eq!(id, "sess123");
+    }
+
+    #[tokio::test]
+    async fn test_start_session_500_on_create_returns_error() {
+        let create = Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        create.mount(&server).await;
+
+        let client = client(&server);
+        let result = client
+            .start_session("/d", "t", "git-automate-triage", "m")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_start_session_prompt_async_body() {
+        let create = Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        create.mount(&server).await;
+
+        let prompt = Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(body_json(json!({
+                "agent": "git-automate-triage",
+                "parts": [{ "type": "text", "text": "issue body" }]
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1);
+        prompt.mount(&server).await;
+
+        let client = client(&server);
+        client
+            .start_session("/d", "Session Title", "git-automate-triage", "issue body")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_session_create_body_is_title() {
+        let create = Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(body_json(json!({ "title": "Session Title" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        create.mount(&server).await;
+
+        let prompt = Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1);
+        prompt.mount(&server).await;
+
+        let client = client(&server);
+        client
+            .start_session("/d", "Session Title", "git-automate-triage", "issue body")
+            .await
+            .unwrap();
+    }
+
+    // --- auth header on all requests (test 15) --------------------------
+
+    #[tokio::test]
+    async fn test_auth_header_sent_on_all_requests() {
+        // health
+        let health = Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "healthy": true, "version": "1" })),
+            )
+            .expect(1)
+            .named("health");
+        // agent
+        let agent = Mock::given(method("GET"))
+            .and(path("/agent"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .named("agent");
+        // session create
+        let create = Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess1",
+                "projectID": "p",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(1)
+            .named("create");
+        // prompt_async
+        let prompt = Mock::given(method("POST"))
+            .and(path("/session/sess1/prompt_async"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .named("prompt");
+
+        let server = MockServer::start().await;
+        health.mount(&server).await;
+        agent.mount(&server).await;
+        create.mount(&server).await;
+        prompt.mount(&server).await;
+
+        let client = client(&server);
+        assert!(client.check_health().await);
+        client.get_agents(None).await.unwrap();
+        client
+            .start_session("/d", "t", "git-automate-triage", "m")
+            .await
+            .unwrap();
+
+        server.verify().await;
+    }
+}
