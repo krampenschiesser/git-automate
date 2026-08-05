@@ -9,16 +9,8 @@ use serde::Deserialize;
 
 // ─── Domain types ───────────────────────────────────────────
 
-/// Summary of a GitHub Project V2, returned by `get_project`.
-///
-/// `number` is kept as a `String` to match the TypeScript interface
-/// (`github.ts:16`) where `String(result.node.number)` is used.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct ProjectV2Summary {
-    pub id: String,
-    pub number: String,
-    pub title: String,
-}
+// Re-exported from `project.rs` — moved to match AGENTS.md intent.
+pub use crate::external_issues::project::ProjectV2Summary;
 
 /// A field on a Project V2 board.
 ///
@@ -46,18 +38,8 @@ pub struct StatusFieldInfo {
     pub options: Vec<StatusOption>,
 }
 
-/// A GitHub issue (or PR) as returned by REST endpoints.
-///
-/// `id` corresponds to `node_id` in REST responses and `id` in GraphQL.
-/// `body` is `None` when the issue has no body or the API returns `null`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct IssueInfo {
-    pub id: String,
-    pub number: i64,
-    pub title: String,
-    pub body: Option<String>,
-    pub state: String,
-}
+// Re-exported from `issues.rs` — moved to match AGENTS.md intent.
+pub use crate::external_issues::issues::IssueInfo;
 
 /// Parsed owner/repo extracted from a repository URL or shorthand.
 #[derive(Debug, Clone, PartialEq)]
@@ -301,4 +283,68 @@ pub struct RestIssueNode {
 #[derive(Debug, Deserialize)]
 pub struct IdHolder {
     pub id: String,
+}
+
+// ─── Issue hierarchy (GraphQL) ────────────────────────────────
+
+/// A single issue node with its parent issue number (if any).
+///
+/// Used by [`GitHubClient::list_issues_with_parents`] to build the
+/// parent → children (sub-task) map in `GitHubIssueSource`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct IssueWithParent {
+    pub id: String,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    /// The number of the parent issue, if this is a sub-issue.
+    pub parent_number: Option<i64>,
+}
+
+/// GraphQL response for `list_issues_with_parents`.
+#[derive(Debug, Deserialize)]
+pub struct IssuesWithParentsResult {
+    pub repository: IssuesWithParentsRepo,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IssuesWithParentsRepo {
+    pub issues: IssuesWithParentsList,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IssuesWithParentsList {
+    pub nodes: Vec<IssueWithParentNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IssueWithParentNode {
+    pub id: String,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    #[serde(rename = "parentIssue")]
+    pub parent_issue: Option<IssueParentRef>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IssueParentRef {
+    pub number: i64,
+}
+
+/// Deserialise from [`IssueWithParentNode`] (which has the nested
+/// `parent_issue` field) into the flat [`IssueWithParent`].
+impl From<IssueWithParentNode> for IssueWithParent {
+    fn from(node: IssueWithParentNode) -> Self {
+        IssueWithParent {
+            id: node.id,
+            number: node.number,
+            title: node.title,
+            body: node.body,
+            state: node.state,
+            parent_number: node.parent_issue.map(|p| p.number),
+        }
+    }
 }

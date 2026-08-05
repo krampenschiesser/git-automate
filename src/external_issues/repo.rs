@@ -3,7 +3,7 @@
 //! Mirrors `src/github.ts` lines 53-74 (`parseRepositoryUrl`) and
 //! provides the `ParsedRepo` re-export for convenience.
 
-use crate::github::types::ParsedRepo;
+use crate::external_issues::types::ParsedRepo;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -98,7 +98,7 @@ fn split_owner_repo(s: &str) -> Option<(String, String)> {
 
 // ─── Re-export ParsedRepo for callers that import from this module ───
 
-pub use crate::github::types::ParsedRepo as RepoInfo;
+pub use crate::external_issues::types::ParsedRepo as RepoInfo;
 
 #[cfg(test)]
 mod tests {

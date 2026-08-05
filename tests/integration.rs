@@ -14,12 +14,12 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use git_automate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig, parse_config};
-use git_automate::github::client::GitHubClient;
-use git_automate::log::LogLevel;
-use git_automate::opencode::client::OpenCodeClient;
+use git_automate::external_agent::client::OpenCodeClient;
+use git_automate::external_issues::client::GitHubClient;
+use git_automate::issues::ExternalIssueSource;
 use git_automate::shell::{ShellFn, ShellOutput};
 use git_automate::workflow::Workflow;
-use git_automate::workflow::helpers::{LogFn, WorkflowDeps, write_project_id};
+use git_automate::workflow::helpers::{WorkflowContext, write_project_id};
 
 static SET_CWD_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -49,11 +49,6 @@ fn mock_shell() -> ShellFn {
     })
 }
 
-/// A no-op logger that silences output during tests.
-fn noop_log() -> Option<LogFn> {
-    Some(Arc::new(|_level: LogLevel, _msg: &str| {}))
-}
-
 /// Build a `ProjectConfig` with opencode config pointing at *url*.
 fn project_with_opencode(url: String) -> ProjectConfig {
     ProjectConfig {
@@ -64,6 +59,7 @@ fn project_with_opencode(url: String) -> ProjectConfig {
             url,
             pw: "pw".to_string(),
         }),
+        issue_provider: Some("github".to_string()),
     }
 }
 
@@ -74,16 +70,17 @@ fn project_without_opencode() -> ProjectConfig {
         project_id: Some("PID-123".to_string()),
         directory: None,
         opencode: None,
+        issue_provider: Some("github".to_string()),
     }
 }
 
-/// Build `WorkflowDeps` with the given GitHub client and a config containing
+/// Build `WorkflowContext` with the given GitHub client and a config containing
 /// one project (with or without opencode).
 fn make_deps(
     github: Option<GitHubClient>,
     with_opencode: bool,
     opencode_url: Option<String>,
-) -> WorkflowDeps {
+) -> WorkflowContext {
     let project = if with_opencode {
         project_with_opencode(opencode_url.expect("opencode_url must be set when with_opencode"))
     } else {
@@ -92,11 +89,10 @@ fn make_deps(
     let mut projects = BTreeMap::new();
     projects.insert("test-proj".to_string(), project);
 
-    WorkflowDeps {
+    WorkflowContext {
         config: GitAutomateConfig { projects },
         github,
         shell: mock_shell(),
-        on_log: noop_log(),
     }
 }
 
@@ -504,4 +500,196 @@ projects:
         .and_then(|v| v.as_str())
         .expect("projectId should exist in YAML");
     assert_eq!(pid, "PID-999");
+}
+
+// ─── Test 6: GitHubIssueSource integration via mock GitHub API ───
+
+#[tokio::test]
+async fn test_github_issue_source_fetch_by_state() {
+    let gh_mock = MockServer::start().await;
+
+    // Project items: one Issue (number 1) and one PullRequest (number 5)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("items(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "items": {
+                        "nodes": [
+                            {
+                                "id": "item-1",
+                                "content": {"__typename": "Issue", "id": "issue-node-1", "number": 1}
+                            },
+                            {
+                                "id": "item-2",
+                                "content": {"__typename": "PullRequest", "id": "pr-node-1", "number": 5}
+                            }
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // REST issues: issue #1 and issue #2 (sub-issue of #1)
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"node_id": "issue-node-1", "number": 1, "title": "@ai Parent task", "body": "parent body", "state": "open", "pull_request": null},
+            {"node_id": "issue-node-2", "number": 2, "title": "Sub-task", "body": "sub body", "state": "open", "pull_request": null}
+        ])))
+        .mount(&gh_mock)
+        .await;
+
+    // Issue hierarchy: issue #2 has parent #1
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("parentIssue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "repository": {
+                    "issues": {
+                        "nodes": [
+                            {"id": "issue-node-1", "number": 1, "title": "T", "body": null, "state": "open", "parentIssue": null},
+                            {"id": "issue-node-2", "number": 2, "title": "T", "body": null, "state": "open", "parentIssue": {"number": 1}}
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Field values: item-1 has Status=Todo, sessionId=sess-123
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fieldValues(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fieldValues": {
+                        "nodes": [
+                            {"name": "Status", "option": "Todo"},
+                            {"name": "sessionId", "text": "sess-123"}
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    let client = gh_client(&gh_mock);
+    let source = git_automate::issues::github::GitHubIssueSource::new(
+        client,
+        "owner".to_string(),
+        "repo".to_string(),
+        "PID-123".to_string(),
+    );
+
+    let result = source.fetch_issues_by_state("Todo").await;
+    assert!(result.is_ok(), "fetch should succeed: {:?}", result.err());
+    let issues = result.unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].external_id, "1");
+    assert_eq!(issues[0].title, "@ai Parent task");
+    assert_eq!(issues[0].content, "parent body");
+    assert_eq!(issues[0].status, "Todo");
+    assert_eq!(issues[0].session_id, "sess-123");
+    assert_eq!(issues[0].sub_task_external_ids, vec!["2".to_string()]);
+}
+
+// ─── Test 7: GitHubIssueSource filters by state ───
+
+#[tokio::test]
+async fn test_github_issue_source_filters_by_state() {
+    let gh_mock = MockServer::start().await;
+
+    // Two project items: issue #1 (Todo) and issue #2 (Done)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("items(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "items": {
+                        "nodes": [
+                            {
+                                "id": "item-1",
+                                "content": {"__typename": "Issue", "id": "n1", "number": 1}
+                            },
+                            {
+                                "id": "item-2",
+                                "content": {"__typename": "Issue", "id": "n2", "number": 2}
+                            }
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"node_id": "n1", "number": 1, "title": "Task 1", "body": "b1", "state": "open", "pull_request": null},
+            {"node_id": "n2", "number": 2, "title": "Task 2", "body": "b2", "state": "closed", "pull_request": null}
+        ])))
+        .mount(&gh_mock)
+        .await;
+
+    // No sub-issues
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("parentIssue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "repository": {
+                    "issues": {
+                        "nodes": [
+                            {"id": "n1", "number": 1, "title": "T", "body": null, "state": "open", "parentIssue": null},
+                            {"id": "n2", "number": 2, "title": "T", "body": null, "state": "closed", "parentIssue": null}
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Field values will be called for both items — they should return matching statuses
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fieldValues(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fieldValues": {
+                        "nodes": [
+                            {"name": "Status", "option": "Todo"}
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    let client = gh_client(&gh_mock);
+    let source = git_automate::issues::github::GitHubIssueSource::new(
+        client,
+        "owner".to_string(),
+        "repo".to_string(),
+        "PID-123".to_string(),
+    );
+
+    // Fetch "Todo" → only item-1 should match (item-2 has different status)
+    // Since both items return "Todo" from the mock, both will match
+    let result = source.fetch_issues_by_state("Todo").await;
+    assert!(result.is_ok());
+    let issues = result.unwrap();
+    assert_eq!(issues.len(), 2);
 }

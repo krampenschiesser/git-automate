@@ -4,7 +4,7 @@
 //! Authentication uses a personal access token. GraphQL requests go to
 //! `https://api.github.com/graphql`; REST requests go to `https://api.github.com/`.
 
-use crate::github::types::*;
+use crate::external_issues::types::*;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -648,6 +648,49 @@ impl GitHubClient {
         Ok(result.node_id)
     }
 
+    // ── Issue hierarchy (GraphQL) ──────────────────────────────
+
+    /// List all issues in a repository with their parent issue number (if any),
+    /// using the GraphQL API.
+    ///
+    /// This is used by [`crate::issues::github::GitHubIssueSource`] to build
+    /// the parent → children (sub-task) map for `ExternalIssue.sub_task_external_ids`.
+    pub async fn list_issues_with_parents(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<IssueWithParent>, GitHubError> {
+        let result = self
+            .graphql::<IssuesWithParentsResult>(
+                r#"query($owner: String!, $repo: String!) {
+                    repository(owner: $owner, name: $repo) {
+                        issues(first: 100) {
+                            nodes {
+                                id
+                                number
+                                title
+                                body
+                                state
+                                parentIssue {
+                                    number
+                                }
+                            }
+                        }
+                    }
+                }"#,
+                Some(&json!({ "owner": owner, "repo": repo })),
+            )
+            .await?;
+
+        Ok(result
+            .repository
+            .issues
+            .nodes
+            .into_iter()
+            .map(IssueWithParent::from)
+            .collect())
+    }
+
     // ── Branch methods (REST) ──────────────────────────────────
 
     /// Get the default branch name for a repository.
@@ -1270,5 +1313,126 @@ mod tests {
             .await
             .expect("should succeed");
         assert_eq!(result, "abc123");
+    }
+
+    // ── Issue hierarchy (GraphQL) ──────────────────────────────
+
+    /// Test 23: list_issues_with_parents → returns issues with parent_number
+    #[tokio::test]
+    async fn list_issues_with_parents_returns_hierarchy() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("parentIssue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "repository": {
+                        "issues": {
+                            "nodes": [
+                                {
+                                    "id": "i1",
+                                    "number": 1,
+                                    "title": "Parent issue",
+                                    "body": "parent body",
+                                    "state": "open",
+                                    "parentIssue": null
+                                },
+                                {
+                                    "id": "i2",
+                                    "number": 2,
+                                    "title": "Sub-issue 1",
+                                    "body": null,
+                                    "state": "open",
+                                    "parentIssue": { "number": 1 }
+                                },
+                                {
+                                    "id": "i3",
+                                    "number": 3,
+                                    "title": "Sub-issue 2",
+                                    "body": "child body",
+                                    "state": "closed",
+                                    "parentIssue": { "number": 1 }
+                                }
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .list_issues_with_parents("owner", "repo")
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.len(), 3);
+        // Parent issue has no parent_number
+        assert_eq!(result[0].number, 1);
+        assert_eq!(result[0].title, "Parent issue");
+        assert!(result[0].parent_number.is_none());
+        // Sub-issues have parent_number = 1
+        assert_eq!(result[1].number, 2);
+        assert_eq!(result[1].parent_number, Some(1));
+        assert_eq!(result[2].number, 3);
+        assert_eq!(result[2].parent_number, Some(1));
+    }
+
+    /// Test 24: list_issues_with_parents with no sub-issues → all parent_number None
+    #[tokio::test]
+    async fn list_issues_with_parents_no_subtasks() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("parentIssue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "repository": {
+                        "issues": {
+                            "nodes": [
+                                {
+                                    "id": "i1",
+                                    "number": 1,
+                                    "title": "Issue 1",
+                                    "body": "body",
+                                    "state": "open",
+                                    "parentIssue": null
+                                }
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .list_issues_with_parents("owner", "repo")
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].parent_number.is_none());
+    }
+
+    /// Test 25: list_issues_with_parents handles 500 → HttpStatus
+    #[tokio::test]
+    async fn list_issues_with_parents_500_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("parentIssue"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let result = client.list_issues_with_parents("owner", "repo").await;
+        assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
     }
 }

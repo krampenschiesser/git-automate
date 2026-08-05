@@ -2,11 +2,11 @@
 //! via OpenCode agent sessions.
 
 pub mod config;
-pub mod log;
+pub mod issues;
 pub mod shell;
 
-pub mod github;
-pub mod opencode;
+pub mod external_agent;
+pub mod external_issues;
 pub mod workflow;
 
 #[cfg(test)]

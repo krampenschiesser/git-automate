@@ -11,12 +11,11 @@
 
 use std::collections::HashMap;
 
-use crate::github::types::IssueInfo;
-use crate::log::LogLevel;
-use crate::opencode::client::OpenCodeClient;
+use crate::external_agent::client::OpenCodeClient;
+use crate::external_issues::types::IssueInfo;
 
 use super::helpers::{
-    ProjectContext, WorkflowDeps, WorkflowError, clone_repo_if_needed, fill_prompt,
+    ProjectContext, WorkflowContext, WorkflowError, clone_repo_if_needed, fill_prompt,
     get_issue_body_map, issue_body_or_title, load_prompt_template, resolve_field_ids,
     resolve_status_option_and_session,
 };
@@ -26,10 +25,37 @@ use super::helpers::{
 /// Descriptor for a review workflow state.
 ///
 /// Mirrors the TypeScript `ReviewState` interface from `workflow-checks.ts:17`.
-pub struct ReviewState {
-    pub status: &'static str,
-    pub agent: &'static str,
-    pub prompt: &'static str,
+#[derive(Clone, Copy)]
+pub enum ReviewState {
+    Technical,
+    Product,
+    Qa,
+}
+
+impl ReviewState {
+    pub fn status(&self) -> &'static str {
+        match self {
+            ReviewState::Technical => "Review Technical",
+            ReviewState::Product => "Review Product",
+            ReviewState::Qa => "QA",
+        }
+    }
+
+    pub fn agent(&self) -> crate::workflow::AgentName {
+        match self {
+            ReviewState::Technical => crate::workflow::AgentName::Reviewer,
+            ReviewState::Product => crate::workflow::AgentName::Product,
+            ReviewState::Qa => crate::workflow::AgentName::QA,
+        }
+    }
+
+    pub fn prompt(&self) -> &'static str {
+        match self {
+            ReviewState::Technical => "reviewer",
+            ReviewState::Product => "product",
+            ReviewState::Qa => "qa",
+        }
+    }
 }
 
 /// The three review states, in order.
@@ -37,21 +63,9 @@ pub struct ReviewState {
 /// Equivalent to the TypeScript `REVIEW_STATES` constant
 /// (`workflow-checks.ts:23-27`).
 pub const REVIEW_STATES: [ReviewState; 3] = [
-    ReviewState {
-        status: "Review Technical",
-        agent: "git-automate-reviewer",
-        prompt: "reviewer",
-    },
-    ReviewState {
-        status: "Review Product",
-        agent: "git-automate-product",
-        prompt: "product",
-    },
-    ReviewState {
-        status: "QA",
-        agent: "git-automate-qa",
-        prompt: "qa",
-    },
+    ReviewState::Technical,
+    ReviewState::Product,
+    ReviewState::Qa,
 ];
 
 // ─── OpenCode session config ───────────────────────────────────
@@ -82,7 +96,7 @@ impl OpencodeSessionConfig {
 /// Creates a new [`OpenCodeClient`] per call (matching the TypeScript
 /// `createOpencodeClient` usage in `startOpencodeSession`).
 ///
-/// Maps [`crate::opencode::client::OpenCodeError`] to `WorkflowError::Other`.
+/// Maps [`crate::external_agent::client::OpenCodeError`] to `WorkflowError::Other`.
 async fn start_opencode_session(
     oc: &OpencodeSessionConfig,
     directory: &str,
@@ -97,22 +111,6 @@ async fn start_opencode_session(
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))
 }
 
-// ─── Logging helper ───────────────────────────────────────────
-
-/// Log an info message if a logger is configured.
-fn log_info(deps: &WorkflowDeps, ctx_name: &str, msg: &str) {
-    if let Some(log) = &deps.on_log {
-        log(LogLevel::Info, &format!("{}: {}", ctx_name, msg));
-    }
-}
-
-/// Log a warning message if a logger is configured.
-fn log_warn(deps: &WorkflowDeps, ctx_name: &str, msg: &str) {
-    if let Some(log) = &deps.on_log {
-        log(LogLevel::Warn, &format!("{}: {}", ctx_name, msg));
-    }
-}
-
 // ── Triage Check ──
 
 /// Find issues with titles starting `@ai `, add them to the project, set
@@ -120,7 +118,7 @@ fn log_warn(deps: &WorkflowDeps, ctx_name: &str, msg: &str) {
 ///
 /// Equivalent to `runTriageCheck` in `src/workflow-checks.ts:35-83`.
 pub async fn run_triage_check(
-    deps: &WorkflowDeps,
+    deps: &WorkflowContext,
     ctx: &ProjectContext,
     oc: &OpencodeSessionConfig,
 ) -> Result<(), WorkflowError> {
@@ -139,7 +137,7 @@ pub async fn run_triage_check(
         .collect();
 
     if ai_issues.is_empty() {
-        log_info(deps, &ctx.name, "no @ai issues found");
+        tracing::info!("{}: no @ai issues found", ctx.name);
         return Ok(());
     }
 
@@ -155,11 +153,7 @@ pub async fn run_triage_check(
         let item_id = if let Some(id) = existing_items.get(&issue.number) {
             id.clone()
         } else {
-            log_info(
-                deps,
-                &ctx.name,
-                &format!("adding issue #{} to project", issue.number),
-            );
+            tracing::info!("{}: adding issue #{} to project", ctx.name, issue.number);
             github
                 .add_issue_to_project(&issue.id, &ctx.project_id)
                 .await?
@@ -182,10 +176,10 @@ pub async fn run_triage_check(
             .and_then(|v| v.as_deref())
             .unwrap_or("");
         if session_text.is_empty() {
-            log_info(
-                deps,
-                &ctx.name,
-                &format!("starting triage session for #{}", issue.number),
+            tracing::info!(
+                "{}: starting triage session for #{}",
+                ctx.name,
+                issue.number
             );
             let session_id = start_opencode_session(
                 oc,
@@ -216,7 +210,7 @@ pub async fn run_triage_check(
 ///
 /// Equivalent to `runTodoCheck` in `src/workflow-checks.ts:91-151`.
 pub async fn run_todo_check(
-    deps: &WorkflowDeps,
+    deps: &WorkflowContext,
     ctx: &ProjectContext,
     oc: &OpencodeSessionConfig,
 ) -> Result<(), WorkflowError> {
@@ -252,7 +246,7 @@ pub async fn run_todo_check(
     }
 
     if todo_items.is_empty() {
-        log_info(deps, &ctx.name, "no Todo items without sessions found");
+        tracing::info!("{}: no Todo items without sessions found", ctx.name);
         return Ok(());
     }
 
@@ -264,7 +258,7 @@ pub async fn run_todo_check(
             .branch_exists(&ctx.owner, &ctx.repo, &branch_name)
             .await?;
         if !exists {
-            log_info(deps, &ctx.name, &format!("creating branch {}", branch_name));
+            tracing::info!("{}: creating branch {}", ctx.name, branch_name);
             let default_branch = github
                 .get_repo_default_branch(&ctx.owner, &ctx.repo)
                 .await?;
@@ -289,10 +283,10 @@ pub async fn run_todo_check(
             format!("Issue #{}", issue_number)
         };
 
-        log_info(
-            deps,
-            &ctx.name,
-            &format!("starting developer session for #{}", issue_number),
+        tracing::info!(
+            "{}: starting developer session for #{}",
+            ctx.name,
+            issue_number
         );
         let session_id = start_opencode_session(
             oc,
@@ -323,7 +317,7 @@ pub async fn run_todo_check(
 ///
 /// Equivalent to `runReviewCheck` in `src/workflow-checks.ts:159-220`.
 pub async fn run_review_check(
-    deps: &WorkflowDeps,
+    deps: &WorkflowContext,
     ctx: &ProjectContext,
     oc: &OpencodeSessionConfig,
 ) -> Result<(), WorkflowError> {
@@ -351,13 +345,13 @@ pub async fn run_review_check(
         let state_option_id = status_field
             .options
             .iter()
-            .find(|o| o.name == state.status)
+            .find(|o| o.name == state.status())
             .map(|o| o.id.clone());
         let Some(_state_option_id) = state_option_id else {
-            log_warn(
-                deps,
-                &ctx.name,
-                &format!("status option \"{}\" not found", state.status),
+            tracing::warn!(
+                "{}: status option \"{}\" not found",
+                ctx.name,
+                state.status()
             );
             continue;
         };
@@ -367,7 +361,7 @@ pub async fn run_review_check(
                 .get_project_item_values(&ctx.project_id, &item.id)
                 .await?;
             let current_status = item_values.get("Status").and_then(|v| v.as_deref());
-            if current_status != Some(state.status) {
+            if current_status != Some(state.status()) {
                 continue;
             }
             let session_text = item_values
@@ -382,7 +376,7 @@ pub async fn run_review_check(
             let issue_number = item.content_number;
             let branch_name = format!("issue-{}", issue_number);
 
-            let template = load_prompt_template(state.prompt)?;
+            let template = load_prompt_template(state.prompt())?;
             let filled_prompt = fill_prompt(
                 &template,
                 &HashMap::from([
@@ -409,23 +403,24 @@ pub async fn run_review_check(
 
             let title = format!(
                 "{}: {}",
-                state.status,
+                state.status(),
                 issue
                     .as_ref()
                     .map(|i| i.title.as_str())
                     .unwrap_or(&format!("#{}", issue_number))
             );
 
-            log_info(
-                deps,
-                &ctx.name,
-                &format!("starting {} session for #{}", state.agent, issue_number),
+            tracing::info!(
+                "{}: starting {} session for #{}",
+                ctx.name,
+                state.agent().as_str(),
+                issue_number
             );
             let session_id = start_opencode_session(
                 oc,
                 oc.directory_or(&work_dir),
                 &title,
-                state.agent,
+                state.agent().as_str(),
                 &filled_prompt,
             )
             .await?;
@@ -450,7 +445,7 @@ pub async fn run_review_check(
 mod tests {
     use super::*;
     use crate::config::{GitAutomateConfig, ProjectConfig};
-    use crate::github::client::GitHubClient;
+    use crate::external_issues::client::GitHubClient;
     use crate::shell::ShellFn;
     use crate::shell::ShellOutput;
     use crate::workflow::helpers::ProjectContext;
@@ -480,15 +475,13 @@ mod tests {
         })
     }
 
-    /// Build `WorkflowDeps` with the given GitHub client and mock shell.
-    fn make_deps(github: Option<GitHubClient>) -> WorkflowDeps {
-        WorkflowDeps {
+    fn make_deps(github: Option<GitHubClient>) -> WorkflowContext {
+        WorkflowContext {
             config: GitAutomateConfig {
                 projects: std::collections::BTreeMap::new(),
             },
             github,
             shell: mock_shell(),
-            on_log: Some(Arc::new(|_level: LogLevel, _msg: &str| {})),
         }
     }
 
@@ -501,6 +494,7 @@ mod tests {
                 project_id: Some("PID-123".to_string()),
                 directory: None,
                 opencode: None,
+                issue_provider: Some("github".to_string()),
             },
             owner: "owner".to_string(),
             repo: "repo".to_string(),
@@ -895,15 +889,15 @@ mod tests {
     #[test]
     fn review_states_constant_matches_ts() {
         assert_eq!(REVIEW_STATES.len(), 3);
-        assert_eq!(REVIEW_STATES[0].status, "Review Technical");
-        assert_eq!(REVIEW_STATES[0].agent, "git-automate-reviewer");
-        assert_eq!(REVIEW_STATES[0].prompt, "reviewer");
-        assert_eq!(REVIEW_STATES[1].status, "Review Product");
-        assert_eq!(REVIEW_STATES[1].agent, "git-automate-product");
-        assert_eq!(REVIEW_STATES[1].prompt, "product");
-        assert_eq!(REVIEW_STATES[2].status, "QA");
-        assert_eq!(REVIEW_STATES[2].agent, "git-automate-qa");
-        assert_eq!(REVIEW_STATES[2].prompt, "qa");
+        assert_eq!(REVIEW_STATES[0].status(), "Review Technical");
+        assert_eq!(REVIEW_STATES[0].agent().as_str(), "git-automate-reviewer");
+        assert_eq!(REVIEW_STATES[0].prompt(), "reviewer");
+        assert_eq!(REVIEW_STATES[1].status(), "Review Product");
+        assert_eq!(REVIEW_STATES[1].agent().as_str(), "git-automate-product");
+        assert_eq!(REVIEW_STATES[1].prompt(), "product");
+        assert_eq!(REVIEW_STATES[2].status(), "QA");
+        assert_eq!(REVIEW_STATES[2].agent().as_str(), "git-automate-qa");
+        assert_eq!(REVIEW_STATES[2].prompt(), "qa");
     }
 
     // Test: OpencodeSessionConfig::directory_or returns directory when set
@@ -1057,7 +1051,7 @@ mod tests {
         let issue_number: i64 = 7;
         let title = format!(
             "{}: {}",
-            state.status,
+            state.status(),
             issue_opt
                 .map(|i| i.title.as_str())
                 .unwrap_or(&format!("#{}", issue_number))
@@ -1073,7 +1067,7 @@ mod tests {
         let issue_number: i64 = 7;
         let title = format!(
             "{}: {}",
-            state.status,
+            state.status(),
             issue_opt
                 .map(|i| i.title.as_str())
                 .unwrap_or(&format!("#{}", issue_number))

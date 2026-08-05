@@ -37,7 +37,7 @@ pub struct ShellOutput {
 
 // ─── ShellFn ───────────────────────────────────────────────────
 
-/// Type alias for the shell function used in `WorkflowDeps`.
+/// Type alias for the shell function used in `WorkflowContext`.
 ///
 /// Takes a command string, returns [`ShellOutput`] asynchronously.
 /// Wrapped in `Arc` so it can be shared across async tasks.
@@ -77,7 +77,7 @@ pub async fn execute_shell(command: &str) -> ShellOutput {
 ///
 /// This is the Rust equivalent of `buildShellFn` in `src/plugin.ts` — it
 /// returns a clonable, shareable shell function matching the `shell` field
-/// of `WorkflowDeps`.
+/// of `WorkflowContext`.
 pub fn create_shell_fn() -> ShellFn {
     Arc::new(|command: String| Box::pin(async move { execute_shell(&command).await }))
 }

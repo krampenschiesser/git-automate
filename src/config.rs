@@ -30,6 +30,12 @@ pub struct ProjectConfig {
     pub project_id: Option<String>,
     pub directory: Option<String>,
     pub opencode: Option<OpencodeConfig>,
+    #[serde(rename = "issueProvider", default = "default_issue_provider")]
+    pub issue_provider: Option<String>,
+}
+
+fn default_issue_provider() -> Option<String> {
+    Some("github".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -90,7 +96,14 @@ fn validate_project(data: &Value, name: &str) -> Result<ProjectConfig, ConfigErr
         project_id: None,
         directory: None,
         opencode: None,
+        issue_provider: Some("github".to_string()),
     };
+
+    if let Some(provider) = mapping.get("issueProvider")
+        && let Some(s) = provider.as_str()
+    {
+        config.issue_provider = Some(s.to_string());
+    }
 
     if let Some(raw_id) = mapping.get("projectId") {
         if let Some(s) = raw_id.as_str() {
@@ -431,5 +444,75 @@ projects:
         let project = config.projects.get("cwd-repo").unwrap();
         assert_eq!(project.repository, "https://github.com/cwd/repo");
         assert_eq!(project.opencode.as_ref().unwrap().pw, "testpassword");
+    }
+
+    // --- issueProvider config tests ---
+
+    // Test 15: parse_config with issueProvider: github → issue_provider = Some("github")
+    #[test]
+    fn parse_config_with_issue_provider_github() {
+        let yaml = r#"
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+    issueProvider: github
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let project = config.projects.get("my-repo").unwrap();
+        assert_eq!(project.issue_provider.as_deref(), Some("github"));
+    }
+
+    // Test 16: parse_config without issueProvider → defaults to Some("github")
+    #[test]
+    fn parse_config_without_issue_provider_defaults_to_github() {
+        let yaml = r#"
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let project = config.projects.get("my-repo").unwrap();
+        assert_eq!(project.issue_provider.as_deref(), Some("github"));
+    }
+
+    // Test 17: parse_config with custom issueProvider → stored correctly
+    #[test]
+    fn parse_config_with_custom_issue_provider() {
+        let yaml = r#"
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+    issueProvider: jira
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let project = config.projects.get("my-repo").unwrap();
+        assert_eq!(project.issue_provider.as_deref(), Some("jira"));
+    }
+
+    // Test 18: ProjectConfig serde round-trip preserves issueProvider
+    #[test]
+    fn project_config_serde_round_trip_issue_provider() {
+        let pc = ProjectConfig {
+            repository: "https://github.com/user/repo".to_string(),
+            project_id: None,
+            directory: None,
+            opencode: None,
+            issue_provider: Some("github".to_string()),
+        };
+        let yaml = serde_yaml::to_string(&pc).unwrap();
+        let parsed: ProjectConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.issue_provider.as_deref(), Some("github"));
     }
 }

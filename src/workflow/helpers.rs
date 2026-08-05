@@ -5,15 +5,13 @@
 //! context + field resolution used by every workflow check.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use regex::Regex;
 
 use crate::config::{GitAutomateConfig, ProjectConfig};
-use crate::github::client::{GitHubClient, GitHubError};
-use crate::github::repo::parse_repository_url;
-use crate::github::types::{IssueInfo, ParsedRepo, StatusOption};
-use crate::log::LogLevel;
+use crate::external_issues::client::{GitHubClient, GitHubError};
+use crate::external_issues::repo::parse_repository_url;
+use crate::external_issues::types::{IssueInfo, ParsedRepo, StatusOption};
 use crate::shell::{ShellFn, ShellOutput};
 
 // ─── Constants ────────────────────────────────────────────────
@@ -26,11 +24,6 @@ pub const STATUS_FIELD_NAME: &str = "Status";
 
 /// Name of the custom text field that stores the OpenCode session ID.
 pub const SESSION_FIELD_NAME: &str = "sessionId";
-
-// ─── LogFn type alias ─────────────────────────────────────────
-
-/// Injectable logger closure — equivalent to TS `LogFn`.
-pub type LogFn = Arc<dyn Fn(LogLevel, &str) + Send + Sync>;
 
 // ─── Error type ───────────────────────────────────────────────
 
@@ -83,7 +76,6 @@ pub struct FieldIds {
 #[derive(Clone)]
 pub struct ShellDeps {
     pub shell: ShellFn,
-    pub on_log: Option<LogFn>,
 }
 
 /// Dependencies for context resolution (`resolve_context`).
@@ -91,25 +83,22 @@ pub struct ShellDeps {
 pub struct ContextDeps {
     pub github: Option<GitHubClient>,
     pub config: GitAutomateConfig,
-    pub on_log: Option<LogFn>,
 }
 
 /// Full dependency set for workflow checks and the orchestrator
-/// (equivalent to `WorkflowDeps` from `src/workflow.ts`).
+/// (equivalent to `WorkflowContext` from `src/workflow.ts`).
 #[derive(Clone)]
-pub struct WorkflowDeps {
+pub struct WorkflowContext {
     pub config: GitAutomateConfig,
     pub github: Option<GitHubClient>,
     pub shell: ShellFn,
-    pub on_log: Option<LogFn>,
 }
 
-impl WorkflowDeps {
+impl WorkflowContext {
     /// Convenience: extract the shell-related dependencies.
     pub fn shell_deps(&self) -> ShellDeps {
         ShellDeps {
             shell: self.shell.clone(),
-            on_log: self.on_log.clone(),
         }
     }
 
@@ -118,7 +107,6 @@ impl WorkflowDeps {
         ContextDeps {
             github: self.github.clone(),
             config: self.config.clone(),
-            on_log: self.on_log.clone(),
         }
     }
 }
@@ -184,12 +172,7 @@ pub async fn clone_repo_if_needed(
     let clone_path = format!("{}/{}-{}", WORK_DIR, owner, repo);
 
     if std::path::Path::new(&clone_path).exists() {
-        if let Some(log) = &deps.on_log {
-            log(
-                LogLevel::Info,
-                &format!("Repo already cloned at {}", clone_path),
-            );
-        }
+        tracing::info!("Repo already cloned at {}", clone_path);
         return Ok(clone_path);
     }
 
@@ -218,12 +201,7 @@ pub async fn clone_repo_if_needed(
         )));
     }
 
-    if let Some(log) = &deps.on_log {
-        log(
-            LogLevel::Info,
-            &format!("Cloned {}/{} to {}", owner, repo, clone_path),
-        );
-    }
+    tracing::info!("Cloned {}/{} to {}", owner, repo, clone_path);
     Ok(clone_path)
 }
 
@@ -347,12 +325,7 @@ pub async fn resolve_context(
     let project_id = if let Some(pid) = &project_config.project_id {
         pid.clone()
     } else {
-        if let Some(log) = &deps.on_log {
-            log(
-                LogLevel::Info,
-                &format!("Creating project {} for {}/{}", project_name, owner, repo),
-            );
-        }
+        tracing::info!("Creating project {} for {}/{}", project_name, owner, repo);
         let pid = github.create_project(&owner, project_name).await?;
         write_project_id(project_name, &pid, &mut config).await?;
         pid
@@ -707,44 +680,38 @@ mod tests {
         }
     }
 
-    // ── WorkflowDeps::shell_deps / context_deps tests ──────────
+    use std::sync::Arc;
 
     #[tokio::test]
-    async fn shell_deps_returns_shell_and_log() {
+    async fn shell_deps_returns_shell() {
         let shell = create_test_shell();
-        let log: LogFn = Arc::new(|_level, _msg| {});
-        let deps = WorkflowDeps {
+        let deps = WorkflowContext {
             config: GitAutomateConfig {
                 projects: std::collections::BTreeMap::new(),
             },
             github: None,
             shell: shell.clone(),
-            on_log: Some(log.clone()),
         };
         let sd = deps.shell_deps();
-        assert!(sd.on_log.is_some());
         // shell is an Arc<dyn Fn>, just verify it's the same by calling it
         let result = (sd.shell)("echo test".to_string()).await;
         assert_eq!(result.exit_code, 0);
     }
 
     #[tokio::test]
-    async fn context_deps_returns_github_config_and_log() {
+    async fn context_deps_returns_github_and_config() {
         let shell = create_test_shell();
-        let log: LogFn = Arc::new(|_level, _msg| {});
         let config = GitAutomateConfig {
             projects: std::collections::BTreeMap::new(),
         };
-        let deps = WorkflowDeps {
+        let deps = WorkflowContext {
             config: config.clone(),
             github: None,
             shell,
-            on_log: Some(log),
         };
         let cd = deps.context_deps();
         assert!(cd.github.is_none());
         assert_eq!(cd.config.projects.len(), 0);
-        assert!(cd.on_log.is_some());
     }
 
     fn create_test_shell() -> ShellFn {
@@ -753,3 +720,89 @@ mod tests {
         })
     }
 }
+
+#[cfg(test)]
+mod log_capture_test {
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use tracing::Subscriber;
+    use tracing::field::Visit;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    pub struct SharedBuffer(pub Arc<StdMutex<Vec<String>>>);
+
+    pub struct CapturingLayer {
+        buffer: SharedBuffer,
+    }
+
+    impl<S> Layer<S> for CapturingLayer
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            let level_str = match *event.metadata().level() {
+                tracing::Level::ERROR => "ERROR",
+                tracing::Level::WARN => "WARN",
+                tracing::Level::INFO => "INFO",
+                tracing::Level::DEBUG => "DEBUG",
+                tracing::Level::TRACE => "TRACE",
+            };
+
+            let mut collector = FieldCollector {
+                message: String::new(),
+            };
+            event.record(&mut collector);
+
+            self.buffer.0.lock().unwrap().push(format!(
+                "[git-automate][{}] {}",
+                level_str, collector.message
+            ));
+        }
+    }
+
+    struct FieldCollector {
+        message: String,
+    }
+
+    impl Visit for FieldCollector {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{:?}", value);
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            }
+        }
+    }
+
+    pub struct LogCapture {
+        buffer: SharedBuffer,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        pub fn install() -> Self {
+            let buffer = SharedBuffer::default();
+            let layer = CapturingLayer {
+                buffer: buffer.clone(),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            Self {
+                buffer,
+                _guard: guard,
+            }
+        }
+
+        pub fn messages(&self) -> Vec<String> {
+            self.buffer.0.lock().unwrap().clone()
+        }
+    }
+}
+
+#[cfg(test)]
+pub use log_capture_test::LogCapture;

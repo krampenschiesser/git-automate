@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-08-05
-**Commit:** 24b6fd6 (main)
+**Commit:** d56f333 (main)
 
 ## OVERVIEW
 
@@ -78,6 +78,8 @@ Standalone Rust daemon that automates GitHub issue workflows via a polling loop 
 - **`GITHUB_TOKEN` optional**: if unset, `github` is `None` — checks fail gracefully
 - **`catch {}` without binding**: `check_opencode_health` swallows network errors — returns `false` intentionally
 - **Assets embedded**: `include_str!` at compile time — no runtime file access for prompts/agents
+- **No unit tests on check functions**: `run_triage_check`, `run_todo_check`, `run_review_check` have no covering unit tests — only integration tests via `wiremock`
+- **No coverage reporting**: no `cargo tarpaulin`, `cargo-llvm-cov`, or `grcov` configured
 
 ## UNIQUE STYLES
 
@@ -106,3 +108,4 @@ cargo run -- serve --config git-automate.yml  # Run the daemon
 - Repos cloned to `/tmp/git-automate-work/{owner}-{repo}` with `--depth 1`
 - No barrel exports (`lib.rs`); every module uses direct file paths via `mod` declarations
 - `bun.lock` was a stale artifact — removed; `pnpm-lock.yaml`, `package.json`, `tsconfig.json` all removed
+- **CI gaps**: no dependency caching, no cross-platform matrix, no `cargo audit` security check, no `serve()` polling-loop tests

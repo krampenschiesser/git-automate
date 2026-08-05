@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::json;
 use thiserror::Error;
 
-use crate::opencode::types::{Agent, AgentInfo, HealthResponse, Session};
+use crate::external_agent::types::{Agent, AgentInfo, HealthResponse, Session};
 
 const OPENCODE_USERNAME: &str = "opencode";
 
@@ -29,22 +29,36 @@ pub enum OpenCodeError {
 /// `startOpencodeSession` helpers.
 pub struct OpenCodeClient {
     client: Client,
-    base_url: String,
-    auth_header: String,
+    pub(crate) base_url: String,
+    pub(crate) auth_header: String,
+    /// Optional default agent name (e.g. `"git-automate-triage"`).
+    pub(crate) agent: Option<String>,
 }
 
 impl OpenCodeClient {
     /// Create a new client targeting `url` with the given `password`.
     ///
     /// The `Authorization` header is precomputed once as
-    /// `Basic base64("opencode:<password>")`.
+    /// `Basic base64("opencode:<password>")`. The `agent` field is initialised
+    /// to `None`; use [`set_agent`](Self::set_agent) to specify a default agent.
     pub fn new(url: String, password: String) -> Self {
         let auth_header = encode_basic_auth(OPENCODE_USERNAME, &password);
         Self {
             client: Client::new(),
             base_url: url,
             auth_header,
+            agent: None,
         }
+    }
+
+    pub fn set_agent(&mut self, agent: &str) {
+        self.agent = Some(agent.to_string());
+    }
+
+    pub fn with_agent(url: String, password: String, agent: &str) -> Self {
+        let mut client = Self::new(url, password);
+        client.set_agent(agent);
+        client
     }
 
     /// `GET /global/health` — returns `true` only when the server reports

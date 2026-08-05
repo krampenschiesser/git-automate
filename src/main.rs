@@ -6,24 +6,24 @@
 //! Behaviour mirrors `plugin.ts`:
 //!   - Config failure → **exit** (daemon mode is stricter than the TS plugin).
 //!   - `GITHUB_TOKEN` unset/empty → log error, `github: None`, continue.
-//!   - `on_log` callback routes workflow messages through `log()`.
+//!   - Logging goes through `tracing` with `[git-automate][LEVEL] message` format.
 //!   - Startup `run_all()` → catch + log `"Startup runAll failed: {e}"`.
 //!   - Polling `run_all()` → catch + log `"Polling runAll failed: {e}"`.
 //!   - SIGINT/SIGTERM → `"Received shutdown signal, exiting"`, break.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::layer::Layer;
+use tracing_subscriber::prelude::*;
 
 use git_automate::config::parse_config;
-use git_automate::github::client::GitHubClient;
-use git_automate::log::{LogLevel, log};
-use git_automate::opencode::client::OpenCodeClient;
+use git_automate::external_agent::client::OpenCodeClient;
+use git_automate::external_issues::client::GitHubClient;
 use git_automate::shell::create_shell_fn;
 use git_automate::workflow::Workflow;
-use git_automate::workflow::helpers::{LogFn, WorkflowDeps};
+use git_automate::workflow::helpers::WorkflowContext;
 
 // ─── CLI ─────────────────────────────────────────────────────
 
@@ -55,10 +55,70 @@ enum Commands {
     },
 }
 
+// ─── Tracing setup ───────────────────────────────────────────
+
+struct FieldVisitor {
+    message: String,
+}
+
+impl tracing::field::Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        }
+    }
+}
+
+struct GitAutomateFormatLayer;
+
+impl<S> Layer<S> for GitAutomateFormatLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let level_str = match *event.metadata().level() {
+            tracing::Level::ERROR => "ERROR",
+            tracing::Level::WARN => "WARN",
+            tracing::Level::INFO => "INFO",
+            tracing::Level::DEBUG => "DEBUG",
+            tracing::Level::TRACE => "TRACE",
+        };
+
+        let mut visitor = FieldVisitor {
+            message: String::new(),
+        };
+        event.record(&mut visitor);
+
+        let line = format!("[git-automate][{}] {}", level_str, visitor.message);
+
+        if *event.metadata().level() == tracing::Level::ERROR {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+}
+
+fn init_tracing() {
+    let subscriber = tracing_subscriber::registry().with(GitAutomateFormatLayer);
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
 // ─── Entry point ─────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve { config } => serve(&config).await,
@@ -79,9 +139,8 @@ async fn setup(config_path: &Path) -> Result<(Workflow, bool), Box<dyn std::erro
     let github = match std::env::var("GITHUB_TOKEN") {
         Ok(token) if !token.is_empty() => Some(GitHubClient::new(token)?),
         _ => {
-            log(
-                LogLevel::Error,
-                "GITHUB_TOKEN environment variable is not set — GitHub operations are skipped",
+            tracing::error!(
+                "GITHUB_TOKEN environment variable is not set — GitHub operations are skipped"
             );
             None
         }
@@ -90,14 +149,10 @@ async fn setup(config_path: &Path) -> Result<(Workflow, bool), Box<dyn std::erro
     let github_was_some = github.is_some();
 
     let shell = create_shell_fn();
-    let on_log: LogFn = Arc::new(|level: LogLevel, msg: &str| {
-        log(level, msg);
-    });
-    let deps = WorkflowDeps {
+    let deps = WorkflowContext {
         config,
         github,
         shell,
-        on_log: Some(on_log),
     };
     let workflow = Workflow::new(deps);
 
@@ -107,11 +162,12 @@ async fn setup(config_path: &Path) -> Result<(Workflow, bool), Box<dyn std::erro
 // ─── serve ───────────────────────────────────────────────────
 
 async fn serve(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let (workflow, _) = setup(config_path).await?;
 
-    log(LogLevel::Info, "Starting git-automate daemon");
+    tracing::info!("Starting git-automate daemon");
     if let Err(e) = workflow.run_all().await {
-        log(LogLevel::Error, &format!("Startup runAll failed: {}", e));
+        tracing::error!("Startup runAll failed: {}", e);
     }
 
     let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -122,14 +178,11 @@ async fn serve(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = interval.tick() => {
                 if let Err(e) = workflow.run_all().await {
-                    log(
-                        LogLevel::Error,
-                        &format!("Polling runAll failed: {}", e),
-                    );
+                    tracing::error!("Polling runAll failed: {}", e);
                 }
             }
             _ = &mut ctrl_c => {
-                log(LogLevel::Info, "Received shutdown signal, exiting");
+                tracing::info!("Received shutdown signal, exiting");
                 break;
             }
         }
@@ -157,8 +210,6 @@ async fn check_health(url: &str, pw: &str) -> Result<(), Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::Mutex;
 
     use serde_json::json;
@@ -285,10 +336,10 @@ mod tests {
     // T9: [git-automate][INFO] format on stdout
     #[test]
     fn info_log_format_matches_prefix() {
-        let captured = capture_log(LogLevel::Info, "Starting git-automate daemon");
+        let captured = capture_log(tracing::Level::INFO, "Starting git-automate daemon");
         assert_eq!(
             captured,
-            "[git-automate][INFO] Starting git-automate daemon\n"
+            "[git-automate][INFO] Starting git-automate daemon"
         );
     }
 
@@ -296,7 +347,7 @@ mod tests {
     #[test]
     fn error_log_format_matches_prefix() {
         let captured = capture_log(
-            LogLevel::Error,
+            tracing::Level::ERROR,
             "GITHUB_TOKEN environment variable is not set — GitHub operations are skipped",
         );
         assert!(
@@ -312,20 +363,73 @@ mod tests {
     // T10 (cont): error_log routes to stderr (via the sink)
     #[test]
     fn error_log_routes_to_stderr() {
-        let captured = capture_log(LogLevel::Error, "something broke");
-        assert_eq!(captured.trim_end(), "[git-automate][ERROR] something broke");
+        let captured = capture_log(tracing::Level::ERROR, "something broke");
+        assert_eq!(captured, "[git-automate][ERROR] something broke");
     }
 
-    fn capture_log(level: LogLevel, msg: &str) -> String {
-        let buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let buf_clone = Rc::clone(&buf);
-        let sink: Box<dyn Fn(LogLevel, &str) + 'static> = Box::new(move |_lvl, m| {
-            buf_clone.borrow_mut().push_str(m);
-            buf_clone.borrow_mut().push('\n');
-        });
-        git_automate::log::set_test_sink(sink);
-        log(level, msg);
-        git_automate::log::clear_test_sink();
-        buf.borrow().clone()
+    struct FieldVisitor {
+        message: String,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            }
+        }
+    }
+
+    struct CaptureLayer {
+        buffer: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S> tracing_subscriber::layer::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let level_str = match *event.metadata().level() {
+                tracing::Level::ERROR => "ERROR",
+                tracing::Level::WARN => "WARN",
+                tracing::Level::INFO => "INFO",
+                tracing::Level::DEBUG => "DEBUG",
+                tracing::Level::TRACE => "TRACE",
+            };
+            let mut visitor = FieldVisitor {
+                message: String::new(),
+            };
+            event.record(&mut visitor);
+            self.buffer
+                .lock()
+                .unwrap()
+                .push(format!("[git-automate][{}] {}", level_str, visitor.message));
+        }
+    }
+
+    fn capture_log(level: tracing::Level, msg: &str) -> String {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            buffer: buffer.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        match level {
+            tracing::Level::ERROR => tracing::error!("{}", msg),
+            tracing::Level::WARN => tracing::warn!("{}", msg),
+            tracing::Level::INFO => tracing::info!("{}", msg),
+            tracing::Level::DEBUG => tracing::debug!("{}", msg),
+            tracing::Level::TRACE => tracing::trace!("{}", msg),
+        }
+        buffer.lock().unwrap()[0].clone()
     }
 }

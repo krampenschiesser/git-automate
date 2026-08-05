@@ -9,43 +9,92 @@ pub mod checks;
 pub mod helpers;
 
 use crate::config::ProjectConfig;
-use crate::github::repo::parse_repository_url;
-use crate::github::types::ParsedRepo;
-use crate::log::LogLevel;
-use crate::opencode::client::OpenCodeClient;
-use crate::opencode::types::AgentInfo;
+use crate::external_agent::client::OpenCodeClient;
+use crate::external_agent::types::AgentInfo;
+use crate::external_issues::repo::parse_repository_url;
+use crate::external_issues::types::ParsedRepo;
 
 use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
 use self::helpers::{
-    SESSION_FIELD_NAME, WorkflowDeps, WorkflowError, resolve_context, write_project_id,
+    SESSION_FIELD_NAME, WorkflowContext, WorkflowError, resolve_context, write_project_id,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
+pub enum AgentName {
+    Triage,
+    TaskManager,
+    Developer,
+    Reviewer,
+    Product,
+    QA,
+}
+
+impl AgentName {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentName::Triage => "git-automate-triage",
+            AgentName::TaskManager => "git-automate-taskmanager",
+            AgentName::Developer => "git-automate-developer",
+            AgentName::Reviewer => "git-automate-reviewer",
+            AgentName::Product => "git-automate-product",
+            AgentName::QA => "git-automate-qa",
+        }
+    }
+}
+
 /// The six required OpenCode agents that must be installed.
 ///
 /// Equivalent to `REQUIRED_AGENTS` in `src/workflow.ts`.
-pub const REQUIRED_AGENTS: [&str; 6] = [
-    "git-automate-triage",
-    "git-automate-taskmanager",
-    "git-automate-developer",
-    "git-automate-reviewer",
-    "git-automate-product",
-    "git-automate-qa",
+pub const REQUIRED_AGENTS: [AgentName; 6] = [
+    AgentName::Triage,
+    AgentName::TaskManager,
+    AgentName::Developer,
+    AgentName::Reviewer,
+    AgentName::Product,
+    AgentName::QA,
 ];
 
-/// The seven status options that must exist on the project's Status field.
+/// The seven workflow status options.
 ///
-/// Equivalent to `STATUS_OPTIONS` in `src/workflow.ts`.
-pub const STATUS_OPTIONS: [&str; 7] = [
-    "Triage",
-    "Todo",
-    "In Development",
-    "Review Technical",
-    "Review Product",
-    "QA",
-    "Done",
-];
+/// Equivalent to `STATUS_OPTIONS` in `src/workflow.ts` (now an enum).
+#[derive(Clone, Copy)]
+pub enum WorkflowStatus {
+    Triage,
+    Todo,
+    InDevelopment,
+    ReviewTechnical,
+    ReviewProduct,
+    QA,
+    Done,
+}
+
+impl WorkflowStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkflowStatus::Triage => "Triage",
+            WorkflowStatus::Todo => "Todo",
+            WorkflowStatus::InDevelopment => "In Development",
+            WorkflowStatus::ReviewTechnical => "Review Technical",
+            WorkflowStatus::ReviewProduct => "Review Product",
+            WorkflowStatus::QA => "QA",
+            WorkflowStatus::Done => "Done",
+        }
+    }
+
+    pub fn all() -> [WorkflowStatus; 7] {
+        [
+            WorkflowStatus::Triage,
+            WorkflowStatus::Todo,
+            WorkflowStatus::InDevelopment,
+            WorkflowStatus::ReviewTechnical,
+            WorkflowStatus::ReviewProduct,
+            WorkflowStatus::QA,
+            WorkflowStatus::Done,
+        ]
+    }
+}
 
 // ─── Workflow ──────────────────────────────────────────────────
 
@@ -53,22 +102,47 @@ pub const STATUS_OPTIONS: [&str; 7] = [
 ///
 /// Equivalent to the `Workflow` class from `src/workflow.ts`.
 pub struct Workflow {
-    deps: WorkflowDeps,
+    deps: WorkflowContext,
+}
+
+/// A single step in the workflow sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStep {
+    Setup,
+    OpencodeCheck,
+    Triage,
+    Todo,
+    Review,
+}
+
+impl WorkflowStep {
+    /// All workflow steps in execution order.
+    pub fn all() -> [WorkflowStep; 5] {
+        [
+            WorkflowStep::Setup,
+            WorkflowStep::OpencodeCheck,
+            WorkflowStep::Triage,
+            WorkflowStep::Todo,
+            WorkflowStep::Review,
+        ]
+    }
+
+    /// Run this step against the given workflow.
+    pub async fn run(&self, workflow: &Workflow) -> Result<(), WorkflowError> {
+        match self {
+            WorkflowStep::Setup => workflow.run_setup_check().await,
+            WorkflowStep::OpencodeCheck => workflow.run_opencode_check().await,
+            WorkflowStep::Triage => workflow.run_triage_check().await,
+            WorkflowStep::Todo => workflow.run_todo_check().await,
+            WorkflowStep::Review => workflow.run_review_check().await,
+        }
+    }
 }
 
 impl Workflow {
     /// Create a new `Workflow` with the given dependencies.
-    pub fn new(deps: WorkflowDeps) -> Self {
+    pub fn new(deps: WorkflowContext) -> Self {
         Self { deps }
-    }
-
-    // ── Logging helper ──────────────────────────────────────────
-
-    /// Call the injected logger, if any.
-    fn log(&self, level: LogLevel, msg: &str) {
-        if let Some(log) = &self.deps.on_log {
-            log(level, msg);
-        }
     }
 
     // ── Public API ─────────────────────────────────────────────
@@ -78,11 +152,9 @@ impl Workflow {
     /// Each sub-check catches and logs its own errors internally, so this
     /// method always returns `Ok(())`.
     pub async fn run_all(&self) -> Result<(), WorkflowError> {
-        let _ = self.run_setup_check().await;
-        let _ = self.run_opencode_check().await;
-        let _ = self.run_triage_check().await;
-        let _ = self.run_todo_check().await;
-        let _ = self.run_review_check().await;
+        for step in WorkflowStep::all() {
+            let _ = step.run(self).await;
+        }
         Ok(())
     }
 
@@ -90,19 +162,13 @@ impl Workflow {
     /// missing, ensure status options, and ensure the sessionId field.
     pub async fn run_setup_check(&self) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
-            self.log(
-                LogLevel::Warn,
-                "GitHub client not available — skipping setup check",
-            );
+            tracing::warn!("GitHub client not available — skipping setup check");
             return Ok(());
         };
 
         for (project_name, project_config) in &self.deps.config.projects {
             if let Err(e) = self.setup_project(project_name, project_config).await {
-                self.log(
-                    LogLevel::Error,
-                    &format!("Setup check failed for {}: {}", project_name, e),
-                );
+                tracing::error!("Setup check failed for {}: {}", project_name, e);
             }
         }
         Ok(())
@@ -121,10 +187,7 @@ impl Workflow {
                 directory: project_config.directory.clone(),
             };
             if let Err(e) = self.check_opencode(&oc).await {
-                self.log(
-                    LogLevel::Error,
-                    &format!("OpenCode check failed for {}: {}", project_name, e),
-                );
+                tracing::error!("OpenCode check failed for {}: {}", project_name, e);
             }
         }
         Ok(())
@@ -134,10 +197,7 @@ impl Workflow {
     /// the triage check (`@ai` issues → project item → triage session).
     pub async fn run_triage_check(&self) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
-            self.log(
-                LogLevel::Warn,
-                "GitHub client not available — skipping triage check",
-            );
+            tracing::warn!("GitHub client not available — skipping triage check");
             return Ok(());
         };
 
@@ -163,10 +223,7 @@ impl Workflow {
             }
             .await;
             if let Err(e) = result {
-                self.log(
-                    LogLevel::Error,
-                    &format!("Triage check failed for {}: {}", project_name, e),
-                );
+                tracing::error!("Triage check failed for {}: {}", project_name, e);
             }
         }
         Ok(())
@@ -176,10 +233,7 @@ impl Workflow {
     /// the todo check (Todo items → developer session).
     pub async fn run_todo_check(&self) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
-            self.log(
-                LogLevel::Warn,
-                "GitHub client not available — skipping todo check",
-            );
+            tracing::warn!("GitHub client not available — skipping todo check");
             return Ok(());
         };
 
@@ -205,10 +259,7 @@ impl Workflow {
             }
             .await;
             if let Err(e) = result {
-                self.log(
-                    LogLevel::Error,
-                    &format!("Todo check failed for {}: {}", project_name, e),
-                );
+                tracing::error!("Todo check failed for {}: {}", project_name, e);
             }
         }
         Ok(())
@@ -218,10 +269,7 @@ impl Workflow {
     /// the review check (Review Technical / Review Product / QA → session).
     pub async fn run_review_check(&self) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
-            self.log(
-                LogLevel::Warn,
-                "GitHub client not available — skipping review check",
-            );
+            tracing::warn!("GitHub client not available — skipping review check");
             return Ok(());
         };
 
@@ -247,10 +295,7 @@ impl Workflow {
             }
             .await;
             if let Err(e) = result {
-                self.log(
-                    LogLevel::Error,
-                    &format!("Review check failed for {}: {}", project_name, e),
-                );
+                tracing::error!("Review check failed for {}: {}", project_name, e);
             }
         }
         Ok(())
@@ -267,10 +312,7 @@ impl Workflow {
         let project_id = if let Some(pid) = &config.project_id {
             pid.clone()
         } else {
-            self.log(
-                LogLevel::Info,
-                &format!("Creating project {} for {}/{}", name, owner, repo),
-            );
+            tracing::info!("Creating project {} for {}/{}", name, owner, repo);
             let github = self
                 .deps
                 .github
@@ -287,7 +329,7 @@ impl Workflow {
         Ok(())
     }
 
-    /// Ensure the project's "Status" field has all [`STATUS_OPTIONS`].
+    /// Ensure the project's "Status" field has all [`WorkflowStatus`].
     ///
     /// Returns `WorkflowError::NoStatusField` if the field doesn't exist.
     async fn ensure_status_options(&self, project_id: &str) -> Result<(), WorkflowError> {
@@ -308,17 +350,14 @@ impl Workflow {
             .map(|o| o.name.as_str())
             .collect();
 
-        let missing: Vec<&str> = STATUS_OPTIONS
+        let missing: Vec<&str> = WorkflowStatus::all()
             .iter()
-            .copied()
+            .map(|s| s.as_str())
             .filter(|opt| !existing.contains(opt))
             .collect();
 
         if !missing.is_empty() {
-            self.log(
-                LogLevel::Info,
-                &format!("Adding status options: {}", missing.join(", ")),
-            );
+            tracing::info!("Adding status options: {}", missing.join(", "));
             github
                 .add_project_status_options(project_id, &status_field.id, &missing)
                 .await?;
@@ -338,7 +377,7 @@ impl Workflow {
         let has_session_id = fields.iter().any(|f| f.name == SESSION_FIELD_NAME);
 
         if !has_session_id {
-            self.log(LogLevel::Info, "Adding sessionId field");
+            tracing::info!("Adding sessionId field");
             github
                 .add_project_field(project_id, SESSION_FIELD_NAME, "TEXT")
                 .await?;
@@ -351,17 +390,11 @@ impl Workflow {
         let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
 
         if !client.check_health().await {
-            self.log(
-                LogLevel::Warn,
-                &format!("OpenCode server at {} is not healthy", oc.url),
-            );
+            tracing::warn!("OpenCode server at {} is not healthy", oc.url);
             return Ok(());
         }
 
-        self.log(
-            LogLevel::Info,
-            &format!("OpenCode server at {} is healthy", oc.url),
-        );
+        tracing::info!("OpenCode server at {} is healthy", oc.url);
 
         let agents: Vec<AgentInfo> = client
             .get_agents(oc.directory.as_deref())
@@ -373,17 +406,14 @@ impl Workflow {
 
         let missing: Vec<&str> = REQUIRED_AGENTS
             .iter()
-            .copied()
+            .map(|a| a.as_str())
             .filter(|a| !agent_names.contains(a))
             .collect();
 
         if !missing.is_empty() {
-            self.log(
-                LogLevel::Warn,
-                &format!("Missing required agents: {}", missing.join(", ")),
-            );
+            tracing::warn!("Missing required agents: {}", missing.join(", "));
         } else {
-            self.log(LogLevel::Info, "All required agents present");
+            tracing::info!("All required agents present");
         }
         Ok(())
     }
@@ -395,11 +425,11 @@ impl Workflow {
 mod tests {
     use super::*;
     use crate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig};
-    use crate::github::client::GitHubClient;
+    use crate::external_issues::client::GitHubClient;
     use crate::shell::{ShellFn, ShellOutput};
-    use crate::workflow::helpers::LogFn;
+    use crate::workflow::helpers::LogCapture;
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -424,32 +454,13 @@ mod tests {
         })
     }
 
-    /// A no-op logger.
-    fn noop_log() -> Option<LogFn> {
-        Some(Arc::new(|_level: LogLevel, _msg: &str| {}))
-    }
-
-    /// A capturing logger that records all messages into a shared Vec.
-    fn capturing_log() -> (Option<LogFn>, Arc<Mutex<Vec<(LogLevel, String)>>>) {
-        let messages: Arc<Mutex<Vec<(LogLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let log_fn: LogFn = {
-            let msgs = Arc::clone(&messages);
-            Arc::new(move |level: LogLevel, msg: &str| {
-                msgs.lock().unwrap().push((level, msg.to_string()));
-            })
-        };
-        (Some(log_fn), messages)
-    }
-
-    /// Build `WorkflowDeps` with the given GitHub client and a no-op logger.
-    fn make_deps(github: Option<GitHubClient>) -> WorkflowDeps {
-        WorkflowDeps {
+    fn make_deps(github: Option<GitHubClient>) -> WorkflowContext {
+        WorkflowContext {
             config: GitAutomateConfig {
                 projects: BTreeMap::new(),
             },
             github,
             shell: mock_shell(),
-            on_log: noop_log(),
         }
     }
 
@@ -460,6 +471,7 @@ mod tests {
             project_id: Some("PID-123".to_string()),
             directory: None,
             opencode: None,
+            issue_provider: Some("github".to_string()),
         }
     }
 
@@ -468,19 +480,20 @@ mod tests {
     #[test]
     fn required_agents_matches_ts() {
         assert_eq!(REQUIRED_AGENTS.len(), 6);
-        assert_eq!(REQUIRED_AGENTS[0], "git-automate-triage");
-        assert_eq!(REQUIRED_AGENTS[1], "git-automate-taskmanager");
-        assert_eq!(REQUIRED_AGENTS[2], "git-automate-developer");
-        assert_eq!(REQUIRED_AGENTS[3], "git-automate-reviewer");
-        assert_eq!(REQUIRED_AGENTS[4], "git-automate-product");
-        assert_eq!(REQUIRED_AGENTS[5], "git-automate-qa");
+        assert_eq!(REQUIRED_AGENTS[0].as_str(), "git-automate-triage");
+        assert_eq!(REQUIRED_AGENTS[1].as_str(), "git-automate-taskmanager");
+        assert_eq!(REQUIRED_AGENTS[2].as_str(), "git-automate-developer");
+        assert_eq!(REQUIRED_AGENTS[3].as_str(), "git-automate-reviewer");
+        assert_eq!(REQUIRED_AGENTS[4].as_str(), "git-automate-product");
+        assert_eq!(REQUIRED_AGENTS[5].as_str(), "git-automate-qa");
     }
 
     #[test]
     fn status_options_matches_ts() {
-        assert_eq!(STATUS_OPTIONS.len(), 7);
+        let statuses = WorkflowStatus::all();
+        assert_eq!(statuses.len(), 7);
         assert_eq!(
-            STATUS_OPTIONS,
+            statuses.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             [
                 "Triage",
                 "Todo",
@@ -510,28 +523,43 @@ mod tests {
                 url: oc_mock.uri(),
                 pw: "test-pw".to_string(),
             }),
+            issue_provider: Some("github".to_string()),
         };
         let mut projects = BTreeMap::new();
         projects.insert("test-proj".to_string(), project);
 
-        let (log_fn, messages) = capturing_log();
-        let deps = WorkflowDeps {
+        let capture = LogCapture::install();
+        let deps = WorkflowContext {
             config: GitAutomateConfig { projects },
             github: None,
             shell: mock_shell(),
-            on_log: log_fn,
         };
 
         let workflow = Workflow::new(deps);
         workflow.run_all().await.unwrap();
 
-        let msgs = messages.lock().unwrap();
-        assert_eq!(msgs.len(), 5, "expected 5 log messages");
-        assert!(msgs[0].1.contains("skipping setup check"));
-        assert!(msgs[1].1.contains("not healthy") || msgs[1].1.contains("OpenCode server"));
-        assert!(msgs[2].1.contains("skipping triage check"));
-        assert!(msgs[3].1.contains("skipping todo check"));
-        assert!(msgs[4].1.contains("skipping review check"));
+        let msgs = capture.messages();
+        let filtered: Vec<&String> = msgs
+            .iter()
+            .filter(|m| {
+                m.contains("skipping setup check")
+                    || m.contains("not healthy")
+                    || m.contains("OpenCode server")
+                    || m.contains("skipping triage check")
+                    || m.contains("skipping todo check")
+                    || m.contains("skipping review check")
+            })
+            .collect();
+        assert_eq!(filtered.len(), 5, "expected 5 relevant log messages");
+        assert!(filtered[0].contains("skipping setup check"));
+        assert!(
+            filtered[1].contains("not healthy") || filtered[1].contains("OpenCode server"),
+            "expected health-related message, got: {}",
+            filtered[1]
+        );
+        assert!(filtered[2].contains("skipping triage check"));
+        assert!(filtered[3].contains("skipping todo check"));
+        assert!(filtered[4].contains("skipping review check"));
     }
 
     // ── run_setup_check with github=None (test 2) ─────────────
@@ -539,18 +567,16 @@ mod tests {
     #[tokio::test]
     async fn run_setup_check_with_no_github_logs_warn() {
         let deps = make_deps(None);
-        let (log_fn, messages) = capturing_log();
-        let mut deps = deps;
-        deps.on_log = log_fn;
+        let capture = LogCapture::install();
 
         let workflow = Workflow::new(deps);
         let result = workflow.run_setup_check().await;
 
         assert!(result.is_ok());
-        let msgs = messages.lock().unwrap();
+        let msgs = capture.messages();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].0, LogLevel::Warn);
-        assert!(msgs[0].1.contains("skipping setup check"));
+        assert!(msgs[0].contains("[WARN]"));
+        assert!(msgs[0].contains("skipping setup check"));
     }
 
     // ── run_setup_check with github iterates projects (test 3) ─
@@ -627,18 +653,17 @@ mod tests {
             project_id: None,
             directory: None,
             opencode: None,
+            issue_provider: Some("github".to_string()),
         };
         let mut projects = BTreeMap::new();
         projects.insert("test-proj".to_string(), project.clone());
 
-        let deps = WorkflowDeps {
+        let deps = WorkflowContext {
             config: GitAutomateConfig { projects },
             github: Some(client),
             shell: mock_shell(),
-            on_log: noop_log(),
         };
 
-        // Temp dir with git-automate.yml for write_project_id
         let tmp = tempfile::tempdir().unwrap();
         let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n";
         std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
@@ -658,7 +683,7 @@ mod tests {
     // ── run_setup_check with one failing project (test 4) ─────
 
     #[tokio::test]
-    async fn run_setup_check_error_isolation_logs_and_continues() {
+    async fn run_setup_check_survives_project_error() {
         let mock = MockServer::start().await;
 
         // Project with projectId → setup_project calls ensure_status_options
@@ -678,27 +703,26 @@ mod tests {
             project_id: Some("PID-1".to_string()),
             directory: None,
             opencode: None,
+            issue_provider: Some("github".to_string()),
         };
         let mut projects = BTreeMap::new();
         projects.insert("proj-a".to_string(), project);
 
-        let (log_fn, messages) = capturing_log();
-        let deps = WorkflowDeps {
+        let capture = LogCapture::install();
+        let deps = WorkflowContext {
             config: GitAutomateConfig { projects },
             github: Some(client),
             shell: mock_shell(),
-            on_log: log_fn,
         };
 
         let workflow = Workflow::new(deps);
         let result = workflow.run_setup_check().await;
 
-        // Method returns Ok (errors caught internally), but logs the error.
         assert!(result.is_ok());
-        let msgs = messages.lock().unwrap();
-        let has_error = msgs.iter().any(|(level, msg)| {
-            *level == LogLevel::Error && msg.contains("Setup check failed for proj-a")
-        });
+        let msgs = capture.messages();
+        let has_error = msgs
+            .iter()
+            .any(|m| m.contains("[ERROR]") && m.contains("Setup check failed for proj-a"));
         assert!(has_error, "expected error log for proj-a: {:?}", msgs);
     }
 
@@ -708,26 +732,25 @@ mod tests {
     async fn run_triage_check_skips_project_without_opencode() {
         let mock = MockServer::start().await;
         let client = gh_client(&mock).await;
-        let (log_fn, messages) = capturing_log();
+        let capture = LogCapture::install();
 
         let project = make_project_no_opencode();
         let mut projects = BTreeMap::new();
         projects.insert("no-opencode-proj".to_string(), project);
 
-        let deps = WorkflowDeps {
+        let deps = WorkflowContext {
             config: GitAutomateConfig { projects },
             github: Some(client),
             shell: mock_shell(),
-            on_log: log_fn,
         };
 
         let workflow = Workflow::new(deps);
         let result = workflow.run_triage_check().await;
 
         assert!(result.is_ok());
-        let msgs = messages.lock().unwrap();
+        let msgs = capture.messages();
         // No errors — project was skipped, not failed
-        let has_error = msgs.iter().any(|(level, _)| *level == LogLevel::Error);
+        let has_error = msgs.iter().any(|m| m.contains("[ERROR]"));
         assert!(
             !has_error,
             "should not have errors for skipped project: {:?}",
@@ -740,18 +763,16 @@ mod tests {
     #[tokio::test]
     async fn run_triage_check_with_no_github_logs_warn() {
         let deps = make_deps(None);
-        let (log_fn, messages) = capturing_log();
-        let mut deps = deps;
-        deps.on_log = log_fn;
+        let capture = LogCapture::install();
 
         let workflow = Workflow::new(deps);
         let result = workflow.run_triage_check().await;
 
         assert!(result.is_ok());
-        let msgs = messages.lock().unwrap();
+        let msgs = capture.messages();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].0, LogLevel::Warn);
-        assert!(msgs[0].1.contains("skipping triage check"));
+        assert!(msgs[0].contains("[WARN]"));
+        assert!(msgs[0].contains("skipping triage check"));
     }
 
     // ── setup_project without projectId (test 7) ─────────────
@@ -827,9 +848,10 @@ mod tests {
             project_id: None,
             directory: None,
             opencode: None,
+            issue_provider: Some("github".to_string()),
         };
 
-        let deps = WorkflowDeps {
+        let deps = WorkflowContext {
             config: GitAutomateConfig {
                 projects: {
                     let mut m = BTreeMap::new();
@@ -839,10 +861,8 @@ mod tests {
             },
             github: Some(client),
             shell: mock_shell(),
-            on_log: noop_log(),
         };
 
-        // Temp dir with git-automate.yml for write_project_id
         let tmp = tempfile::tempdir().unwrap();
         let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n";
         std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
@@ -922,9 +942,10 @@ mod tests {
             project_id: Some("PID-123".to_string()),
             directory: None,
             opencode: None,
+            issue_provider: Some("github".to_string()),
         };
 
-        let deps = WorkflowDeps {
+        let deps = WorkflowContext {
             config: GitAutomateConfig {
                 projects: {
                     let mut m = BTreeMap::new();
@@ -934,7 +955,6 @@ mod tests {
             },
             github: Some(client),
             shell: mock_shell(),
-            on_log: noop_log(),
         };
 
         let workflow = Workflow::new(deps);
@@ -1234,18 +1254,17 @@ mod tests {
             directory: None,
         };
 
-        let (log_fn, messages) = capturing_log();
-        let mut deps = make_deps(None);
-        deps.on_log = log_fn;
+        let capture = LogCapture::install();
+        let deps = make_deps(None);
 
         let workflow = Workflow::new(deps);
         let result = workflow.check_opencode(&oc).await;
 
         assert!(result.is_ok());
-        let msgs = messages.lock().unwrap();
-        let has_warn = msgs.iter().any(|(level, msg)| {
-            *level == LogLevel::Warn && msg.contains("Missing required agents")
-        });
+        let msgs = capture.messages();
+        let has_warn = msgs
+            .iter()
+            .any(|m| m.contains("[WARN]") && m.contains("Missing required agents"));
         assert!(
             has_warn,
             "expected 'Missing required agents' warning: {:?}",
@@ -1287,18 +1306,17 @@ mod tests {
             directory: None,
         };
 
-        let (log_fn, messages) = capturing_log();
-        let mut deps = make_deps(None);
-        deps.on_log = log_fn;
+        let capture = LogCapture::install();
+        let deps = make_deps(None);
 
         let workflow = Workflow::new(deps);
         let result = workflow.check_opencode(&oc).await;
 
         assert!(result.is_ok());
-        let msgs = messages.lock().unwrap();
-        let has_all_present = msgs.iter().any(|(level, msg)| {
-            *level == LogLevel::Info && msg.contains("All required agents present")
-        });
+        let msgs = capture.messages();
+        let has_all_present = msgs
+            .iter()
+            .any(|m| m.contains("[INFO]") && m.contains("All required agents present"));
         assert!(
             has_all_present,
             "expected 'All required agents present' log: {:?}",
