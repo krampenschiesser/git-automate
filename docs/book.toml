@@ -1,0 +1,9 @@
+[book]
+authors = ["git-automate contributors"]
+language = "en"
+src = "src"
+title = "git-automate Documentation"
+
+[output.html]
+smart-punctuation = true
+mathjax-support = false
