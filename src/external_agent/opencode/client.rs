@@ -8,10 +8,10 @@ use crate::external_agent::opencode::types::{Agent, AgentInfo, HealthResponse, S
 const OPENCODE_USERNAME: &str = "opencode";
 
 /// Errors that can occur while communicating with the OpenCode HTTP API.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum OpenCodeError {
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
     #[error("HTTP status {0}")]
     HttpStatus(u16),
     #[error("Failed to fetch agents: {0}")]
@@ -22,11 +22,18 @@ pub enum OpenCodeError {
     NoSessionData,
 }
 
+impl From<reqwest::Error> for OpenCodeError {
+    fn from(err: reqwest::Error) -> Self {
+        OpenCodeError::Http(err.to_string())
+    }
+}
+
 /// A minimal HTTP client for the OpenCode server.
 ///
 /// Uses HTTP Basic auth with username `"opencode"` and the provided password.
+#[derive(Debug, Clone)]
 pub struct OpenCodeClient {
-    client: Client,
+    pub(crate) client: Client,
     pub(crate) base_url: String,
     pub(crate) auth_header: String,
     /// Optional default agent name (e.g. `"git-automate-triage"`).
@@ -41,8 +48,12 @@ impl OpenCodeClient {
     /// to `None`; use [`set_agent`](Self::set_agent) to specify a default agent.
     pub fn new(url: String, password: String) -> Self {
         let auth_header = encode_basic_auth(OPENCODE_USERNAME, &password);
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build reqwest client with valid timeout");
         Self {
-            client: Client::new(),
+            client,
             base_url: url,
             auth_header,
             agent: None,
@@ -120,52 +131,19 @@ impl OpenCodeClient {
         agent: &str,
         message: &str,
     ) -> Result<String, OpenCodeError> {
-        // Step 1 — create the session.
-        let create_response = self
-            .client
-            .post(format!("{}/session", self.base_url))
-            .query(&[("directory", directory)])
-            .header("Authorization", &self.auth_header)
-            .json(&json!({ "title": title }))
-            .send()
-            .await?;
-
-        if !create_response.status().is_success() {
-            return Err(OpenCodeError::CreateSession(format!(
-                "session creation HTTP status {}",
-                create_response.status().as_u16()
-            )));
-        }
-
-        let session: Session = create_response.json().await?;
-        if session.id.is_empty() {
-            return Err(OpenCodeError::NoSessionData);
-        }
-        let session_id = session.id;
-
-        // Step 2 — send the prompt (fire-and-forget; ignore body).
-        let prompt_response = self
-            .client
-            .post(format!(
-                "{}/session/{}/prompt_async",
-                self.base_url, session_id
-            ))
-            .header("Authorization", &self.auth_header)
-            .json(&json!({
-                "agent": agent,
-                "parts": [{ "type": "text", "text": message }]
-            }))
-            .send()
-            .await?;
-
-        if !prompt_response.status().is_success() {
-            return Err(OpenCodeError::CreateSession(format!(
-                "prompt_async HTTP status {}",
-                prompt_response.status().as_u16()
-            )));
-        }
-
-        Ok(session_id)
+        let prompt_body = json!({
+            "agent": agent,
+            "parts": [{ "type": "text", "text": message }]
+        });
+        start_session_http(
+            &self.client,
+            &self.base_url,
+            &self.auth_header,
+            directory,
+            title,
+            prompt_body,
+        )
+        .await
     }
 
     /// `GET /session/status` — count active (non-Done) sessions.
@@ -185,6 +163,54 @@ impl OpenCodeClient {
             response.json().await?;
         Ok(statuses.len())
     }
+}
+
+/// Shared two-step HTTP flow used by [`OpenCodeClient::start_session`] and the
+/// `ExternalAgent` trait impl to create a session and deliver a prompt.
+pub(crate) async fn start_session_http(
+    client: &Client,
+    base_url: &str,
+    auth_header: &str,
+    directory: &str,
+    title: &str,
+    prompt_body: serde_json::Value,
+) -> Result<String, OpenCodeError> {
+    let create_response = client
+        .post(format!("{}/session", base_url))
+        .query(&[("directory", directory)])
+        .header("Authorization", auth_header)
+        .json(&json!({ "title": title }))
+        .send()
+        .await?;
+
+    if !create_response.status().is_success() {
+        return Err(OpenCodeError::CreateSession(format!(
+            "session creation HTTP status {}",
+            create_response.status().as_u16()
+        )));
+    }
+
+    let session: Session = create_response.json().await?;
+    if session.id.is_empty() {
+        return Err(OpenCodeError::NoSessionData);
+    }
+    let session_id = session.id;
+
+    let prompt_response = client
+        .post(format!("{}/session/{}/prompt_async", base_url, session_id))
+        .header("Authorization", auth_header)
+        .json(&prompt_body)
+        .send()
+        .await?;
+
+    if !prompt_response.status().is_success() {
+        return Err(OpenCodeError::CreateSession(format!(
+            "prompt_async HTTP status {}",
+            prompt_response.status().as_u16()
+        )));
+    }
+
+    Ok(session_id)
 }
 
 /// Encode credentials for HTTP Basic authentication.

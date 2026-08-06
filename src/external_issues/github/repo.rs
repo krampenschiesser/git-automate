@@ -95,10 +95,6 @@ fn split_owner_repo(s: &str) -> Option<(String, String)> {
     Some((owner.to_string(), rest.to_string()))
 }
 
-// ─── Re-export ParsedRepo for callers that import from this module ───
-
-pub use super::types::ParsedRepo as RepoInfo;
-
 #[cfg(test)]
 mod tests {
     use super::*;

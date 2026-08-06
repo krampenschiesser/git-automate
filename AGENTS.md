@@ -3,6 +3,8 @@
 **Generated:** 2026-08-05
 **Commit:** 3bcfa39 (main)
 
+use the `sks-rust-basic` skill for writing code, tests or reviewing those.
+
 ## OVERVIEW
 
 Standalone Rust daemon that automates GitHub issue workflows via a polling loop — finds `@ai`-tagged issues, assigns them to project boards, and starts OpenCode agent sessions (triage → developer → review → QA).

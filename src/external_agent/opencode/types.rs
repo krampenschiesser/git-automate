@@ -1,17 +1,28 @@
 use serde::Deserialize;
 
+/// Agent mode as reported by the OpenCode `/agent` endpoint.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    Subagent,
+    Primary,
+    All,
+    #[serde(other)]
+    Other,
+}
+
 /// An agent descriptor returned by the OpenCode `/agent` endpoint.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
 pub struct Agent {
     pub name: String,
     pub description: Option<String>,
-    pub mode: String, // "subagent" | "primary" | "all"
+    pub mode: AgentMode,
     #[serde(rename = "builtIn")]
     pub built_in: bool,
 }
 
 /// Timestamps associated with a session.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
 pub struct SessionTime {
     pub created: u64,
     pub updated: u64,
@@ -40,7 +51,7 @@ pub struct HealthResponse {
 ///
 /// Strips the `mode` and `built_in` fields, projecting an [`Agent`] down to
 /// just the user-facing `name` and `description`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgentInfo {
     pub name: String,
     pub description: Option<String>,

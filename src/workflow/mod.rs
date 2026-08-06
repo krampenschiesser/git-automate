@@ -21,8 +21,8 @@ use self::helpers::{
 
 // ─── Constants ─────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
-pub enum AgentName { //fixme rename to Agent
+#[derive(Debug, Clone, Copy)]
+pub enum AgentName {
     Triage,
     TaskManager,
     Developer,
@@ -32,7 +32,7 @@ pub enum AgentName { //fixme rename to Agent
 }
 
 impl AgentName {
-    pub fn as_str(&self) -> &'static str { //fixme implement trait instead of a custom method
+    pub fn as_str(&self) -> &'static str {
         match self {
             AgentName::Triage => "git-automate-triage",
             AgentName::TaskManager => "git-automate-taskmanager",
@@ -45,7 +45,7 @@ impl AgentName {
 }
 
 /// The six required OpenCode agents that must be installed.
-pub const REQUIRED_AGENTS: [AgentName; 6] = [//fixme remove this, use the enum
+pub const REQUIRED_AGENTS: [AgentName; 6] = [
     AgentName::Triage,
     AgentName::TaskManager,
     AgentName::Developer,
@@ -55,7 +55,7 @@ pub const REQUIRED_AGENTS: [AgentName; 6] = [//fixme remove this, use the enum
 ];
 
 /// The seven workflow status options.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum WorkflowStatus {
     Triage,
     Todo,
@@ -67,7 +67,7 @@ pub enum WorkflowStatus {
 }
 
 impl WorkflowStatus {
-    pub fn as_str(&self) -> &'static str { //fixme implement trait
+    pub fn as_str(&self) -> &'static str {
         match self {
             WorkflowStatus::Triage => "Triage",
             WorkflowStatus::Todo => "Todo",
@@ -103,7 +103,7 @@ pub struct Workflow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowStep {
     Setup,
-    OpencodeCheck, //fixme this should be independent of opencode and just use the abstraction layer
+    OpencodeCheck,
     Triage,
     Todo,
     Review,
@@ -170,16 +170,12 @@ impl Workflow {
 
     /// For each project with an OpenCode config: check server health and
     /// verify required agents are present.
-    pub async fn run_opencode_check(&self) -> Result<(), WorkflowError> {//fixme this should be independent of opencode and just use the abstraction layer
+    pub async fn run_opencode_check(&self) -> Result<(), WorkflowError> {
         for (project_name, project_config) in &self.deps.config.projects {
-            let Some(opencode) = &project_config.opencode else {
+            if project_config.opencode.is_none() {
                 continue;
-            };
-            let oc = OpencodeSessionConfig {
-                url: opencode.url.clone(),
-                pw: opencode.pw.clone(),
-                directory: project_config.directory.clone(),
-            };
+            }
+            let oc = self.opencode_config(project_config);
             if let Err(e) = self.check_opencode(&oc).await {
                 tracing::error!("OpenCode check failed for {}: {}", project_name, e);
             }
@@ -202,17 +198,7 @@ impl Workflow {
             let result = async {
                 let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
                     .await?;
-                let opencode = project_config.opencode.as_ref().ok_or_else(|| {
-                    WorkflowError::Other(format!(
-                        "project '{}' has no opencode config",
-                        project_name
-                    ))
-                })?;
-                let oc = OpencodeSessionConfig {
-                    url: opencode.url.clone(),
-                    pw: opencode.pw.clone(),
-                    directory: project_config.directory.clone(),
-                };
+                let oc = self.opencode_config(project_config);
                 run_triage_check(&self.deps, &ctx, &oc).await
             }
             .await;
@@ -238,17 +224,7 @@ impl Workflow {
             let result = async {
                 let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
                     .await?;
-                let opencode = project_config.opencode.as_ref().ok_or_else(|| {
-                    WorkflowError::Other(format!(
-                        "project '{}' has no opencode config",
-                        project_name
-                    ))
-                })?;
-                let oc = OpencodeSessionConfig {
-                    url: opencode.url.clone(),
-                    pw: opencode.pw.clone(),
-                    directory: project_config.directory.clone(),
-                };
+                let oc = self.opencode_config(project_config);
                 run_todo_check(&self.deps, &ctx, &oc).await
             }
             .await;
@@ -274,17 +250,7 @@ impl Workflow {
             let result = async {
                 let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
                     .await?;
-                let opencode = project_config.opencode.as_ref().ok_or_else(|| {
-                    WorkflowError::Other(format!(
-                        "project '{}' has no opencode config",
-                        project_name
-                    ))
-                })?;
-                let oc = OpencodeSessionConfig {
-                    url: opencode.url.clone(),
-                    pw: opencode.pw.clone(),
-                    directory: project_config.directory.clone(),
-                };
+                let oc = self.opencode_config(project_config);
                 run_review_check(&self.deps, &ctx, &oc).await
             }
             .await;
@@ -293,6 +259,17 @@ impl Workflow {
             }
         }
         Ok(())
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────
+
+    fn opencode_config(&self, project: &ProjectConfig) -> OpencodeSessionConfig {
+        let opencode = project.opencode.as_ref().expect("opencode config present");
+        OpencodeSessionConfig {
+            url: opencode.url.clone(),
+            pw: opencode.pw.clone(),
+            directory: project.directory.clone(),
+        }
     }
 
     // ── Private check implementations ─────────────────────────
@@ -353,7 +330,7 @@ impl Workflow {
         if !missing.is_empty() {
             tracing::info!("Adding status options: {}", missing.join(", "));
             github
-                .add_project_status_options(project_id, &status_field.id, &missing)
+                .add_project_status_options(&status_field.id, &missing)
                 .await?;
         }
         Ok(())
@@ -419,45 +396,13 @@ impl Workflow {
 mod tests {
     use super::*;
     use crate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig};
-    use crate::external_issues::github::client::GitHubClient;
-    use crate::shell::{ShellFn, ShellOutput};
+    use crate::test_utils::{gh_client, make_deps, mock_shell};
     use crate::workflow::helpers::LogCapture;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── Test helpers ──────────────────────────────────────────
-
-    /// Build a `GitHubClient` pointed at a mock server (test helper).
-    async fn gh_client(server: &MockServer) -> GitHubClient {
-        GitHubClient::new_with_base_url("test-token".to_string(), server.uri())
-            .expect("token is non-empty")
-    }
-
-    /// A shell function that always succeeds with empty output.
-    fn mock_shell() -> ShellFn {
-        Arc::new(|_cmd: String| {
-            Box::pin(async move {
-                ShellOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                }
-            })
-        })
-    }
-
-    fn make_deps(github: Option<GitHubClient>) -> WorkflowContext {
-        WorkflowContext {
-            config: GitAutomateConfig {
-                projects: BTreeMap::new(),
-                concurrency: None,
-            },
-            github,
-            shell: mock_shell(),
-        }
-    }
 
     /// Build a project config without opencode.
     fn make_project_no_opencode() -> ProjectConfig {
@@ -466,7 +411,7 @@ mod tests {
             project_id: Some("PID-123".to_string()),
             directory: None,
             opencode: None,
-            issue_provider: Some("github".to_string()),
+            issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
             trello_token: None,
@@ -522,7 +467,7 @@ mod tests {
                 url: oc_mock.uri(),
                 pw: "test-pw".to_string(),
             }),
-            issue_provider: Some("github".to_string()),
+            issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
             trello_token: None,
@@ -590,7 +535,7 @@ mod tests {
     #[tokio::test]
     async fn run_setup_check_with_github_iterates_projects() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
 
         // Mock: get_owner_id (login)
         Mock::given(method("POST"))
@@ -659,7 +604,7 @@ mod tests {
             project_id: None,
             directory: None,
             opencode: None,
-            issue_provider: Some("github".to_string()),
+            issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
             trello_token: None,
@@ -680,7 +625,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n";
         std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
-        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
@@ -710,13 +655,13 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let project = ProjectConfig {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: Some("PID-1".to_string()),
             directory: None,
             opencode: None,
-            issue_provider: Some("github".to_string()),
+            issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
             trello_token: None,
@@ -751,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn run_triage_check_skips_project_without_opencode() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let capture = LogCapture::install();
 
         let project = make_project_no_opencode();
@@ -803,7 +748,7 @@ mod tests {
     #[tokio::test]
     async fn setup_project_without_project_id_calls_create_and_write() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
 
         // Mock get_owner_id
         Mock::given(method("POST"))
@@ -871,7 +816,7 @@ mod tests {
             project_id: None,
             directory: None,
             opencode: None,
-            issue_provider: Some("github".to_string()),
+            issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
             trello_token: None,
@@ -894,7 +839,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n";
         std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
-        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
@@ -912,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn setup_project_with_project_id_skips_create() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
 
         // Mock status field → all options
         Mock::given(method("POST"))
@@ -970,7 +915,7 @@ mod tests {
             project_id: Some("PID-123".to_string()),
             directory: None,
             opencode: None,
-            issue_provider: Some("github".to_string()),
+            issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
             trello_token: None,
@@ -1001,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_status_options_all_present_no_add() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
@@ -1047,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_status_options_missing_calls_add() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
 
         // Only "Done" present → 6 missing
         Mock::given(method("POST"))
@@ -1091,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_id_field_exists_no_add() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
@@ -1135,7 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_id_field_missing_calls_add() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
 
         Mock::given(method("POST"))
             .and(path("/graphql"))

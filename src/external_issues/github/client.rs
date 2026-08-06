@@ -37,7 +37,7 @@ impl From<serde_json::Error> for GitHubError {
 
 // ─── Client ───────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct GitHubClient {
     client: Client,
     token: String,
@@ -53,8 +53,12 @@ impl GitHubClient {
         if token.is_empty() {
             return Err(GitHubError::EmptyToken);
         }
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| GitHubError::Other(e.to_string()))?;
         Ok(Self {
-            client: Client::new(),
+            client,
             token,
             base_url: "https://api.github.com".to_string(),
         })
@@ -65,14 +69,30 @@ impl GitHubClient {
         if token.is_empty() {
             return Err(GitHubError::EmptyToken);
         }
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| GitHubError::Other(e.to_string()))?;
         Ok(Self {
-            client: Client::new(),
+            client,
             token,
             base_url,
         })
     }
 
     // ── Core transport ──────────────────────────────────────────
+
+    fn authenticated_request(
+        &self,
+        method: reqwest::Method,
+        url: String,
+    ) -> reqwest::RequestBuilder {
+        self.client
+            .request(method, url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("User-Agent", "git-automate")
+            .header("Accept", "application/vnd.github+json")
+    }
 
     /// Execute a GraphQL query or mutation.
     ///
@@ -93,11 +113,7 @@ impl GitHubClient {
         });
 
         let request = self
-            .client
-            .post(format!("{}/graphql", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "git-automate")
-            .header("Accept", "application/vnd.github+json")
+            .authenticated_request(reqwest::Method::POST, format!("{}/graphql", self.base_url))
             .json(&payload);
 
         let response = request.send().await?;
@@ -137,11 +153,7 @@ impl GitHubClient {
         };
 
         let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "git-automate")
-            .header("Accept", "application/vnd.github+json")
+            .authenticated_request(reqwest::Method::GET, url)
             .send()
             .await?;
 
@@ -161,11 +173,7 @@ impl GitHubClient {
         let url = format!("{}{}", self.base_url, path);
 
         let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "git-automate")
-            .header("Accept", "application/vnd.github+json")
+            .authenticated_request(reqwest::Method::POST, url)
             .json(body)
             .send()
             .await?;
@@ -353,7 +361,6 @@ impl GitHubClient {
     /// Add new options to a single-select field's configuration.
     pub async fn add_project_status_options(
         &self,
-        _project_id: &str,
         field_id: &str,
         options: &[&str],
     ) -> Result<(), GitHubError> {
@@ -530,7 +537,6 @@ impl GitHubClient {
     /// For each field, `text` takes priority over `option`.
     pub async fn get_project_item_values(
         &self,
-        _project_id: &str,
         item_id: &str,
     ) -> Result<BTreeMap<String, Option<String>>, GitHubError> {
         let result = self
@@ -651,8 +657,7 @@ impl GitHubClient {
     /// List all issues in a repository with their parent issue number (if any),
     /// using the GraphQL API.
     ///
-    /// This is used by [`crate::external_issues::github::GitHubIssueSource`] to build
-    /// the parent → children (sub-task) map for `ExternalIssue.sub_task_external_ids`.
+    /// This can be used to build a parent → children (sub-task) map.
     pub async fn list_issues_with_parents(
         &self,
         owner: &str,
@@ -1103,7 +1108,7 @@ mod tests {
             .await;
 
         let result = client
-            .get_project_item_values("p1", "item1")
+            .get_project_item_values("item1")
             .await
             .expect("should succeed");
 

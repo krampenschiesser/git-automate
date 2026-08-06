@@ -15,12 +15,6 @@ use std::sync::Arc;
 
 use tokio::process::Command;
 
-// ─── BoxFuture ─────────────────────────────────────────────────
-//
-// `std::future::BoxFuture` is not yet stabilised in this toolchain, so we
-// provide the canonical alias (the same definition used by the `futures`
-// crate).
-
 /// A pinned, boxed, sendable future owned for `'a`.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -62,11 +56,14 @@ pub async fn execute_shell(command: &str) -> ShellOutput {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             exit_code: output.status.code().unwrap_or(-1),
         },
-        Err(_) => ShellOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: -1,
-        },
+        Err(e) => {
+            tracing::error!("Failed to spawn shell command: {}", e);
+            ShellOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: -1,
+            }
+        }
     }
 }
 

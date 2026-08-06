@@ -5,7 +5,6 @@
 //! (`SessionStatusMap`, `OpenCodeSessionStatus`), and the `From<Session> for
 //! SessionInfo` projection. All tests for the trait implementation live here.
 
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -117,36 +116,11 @@ impl ExternalAgent for OpenCodeClient {
         let base_url = self.base_url.clone();
         let auth_header = self.auth_header.clone();
         let agent = self.agent.clone();
-        let http = Client::new();
+        let http = self.client.clone();
 
         async move {
-            // Step 1 — create the session via POST /session?directory=<dir>.
-            let create_resp = http
-                .post(format!("{}/session", base_url))
-                .query(&[("directory", project_key)])
-                .header("Authorization", &auth_header)
-                .json(&json!({ "title": user_prompt.lines().next().unwrap_or("Session").to_string() }))
-                .send()
-                .await?;
+            let title = user_prompt.lines().next().unwrap_or("Session").to_string();
 
-            if !create_resp.status().is_success() {
-                return Err(ExternalAgentError::StartSession(format!(
-                    "session creation HTTP status {}",
-                    create_resp.status().as_u16()
-                )));
-            }
-
-            let session: Session = create_resp.json().await?;
-
-            if session.id.is_empty() {
-                return Err(ExternalAgentError::StartSession(
-                    "session creation returned no ID".to_string(),
-                ));
-            }
-
-            let session_id = session.id;
-
-            // Build the prompt_async payload — include system prompt if non-empty.
             let mut prompt_body = json!({
                 "parts": [{ "type": "text", "text": user_prompt }]
             });
@@ -159,22 +133,16 @@ impl ExternalAgent for OpenCodeClient {
                 prompt_body["agent"] = json!(agent_name);
             }
 
-            // Step 2 — send the prompt via POST /session/{id}/prompt_async.
-            let prompt_resp = http
-                .post(format!("{}/session/{}/prompt_async", base_url, session_id))
-                .header("Authorization", &auth_header)
-                .json(&prompt_body)
-                .send()
-                .await?;
-
-            if !prompt_resp.status().is_success() {
-                return Err(ExternalAgentError::StartSession(format!(
-                    "prompt_async HTTP status {}",
-                    prompt_resp.status().as_u16()
-                )));
-            }
-
-            Ok(session_id)
+            crate::external_agent::opencode::client::start_session_http(
+                &http,
+                &base_url,
+                &auth_header,
+                project_key,
+                &title,
+                prompt_body,
+            )
+            .await
+            .map_err(|e| ExternalAgentError::StartSession(e.to_string()))
         }
     }
 
@@ -185,7 +153,7 @@ impl ExternalAgent for OpenCodeClient {
     ) -> impl std::future::Future<Output = Result<String, ExternalAgentError>> + Send {
         let base_url = self.base_url.clone();
         let auth_header = self.auth_header.clone();
-        let http = Client::new();
+        let http = self.client.clone();
 
         async move {
             let resp = http
@@ -218,7 +186,7 @@ impl ExternalAgent for OpenCodeClient {
     {
         let base_url = self.base_url.clone();
         let auth_header = self.auth_header.clone();
-        let http = Client::new();
+        let http = self.client.clone();
         let session_id_owned = session_id.to_string();
 
         async move {
@@ -255,7 +223,7 @@ impl ExternalAgent for OpenCodeClient {
     ) -> impl std::future::Future<Output = Result<(), ExternalAgentError>> + Send {
         let base_url = self.base_url.clone();
         let auth_header = self.auth_header.clone();
-        let http = Client::new();
+        let http = self.client.clone();
         let session_id_owned = session_id.to_string();
 
         async move {
@@ -274,9 +242,7 @@ impl ExternalAgent for OpenCodeClient {
             let status = resp.status();
             if !status.is_success() {
                 if status.as_u16() == 404 {
-                    return Err(ExternalAgentError::SessionNotFound(
-                        session_id_owned.clone(),
-                    ));
+                    return Err(ExternalAgentError::SessionNotFound(session_id_owned));
                 }
                 return Err(ExternalAgentError::Nudge(format!(
                     "nudge HTTP status {}",
@@ -295,7 +261,7 @@ impl ExternalAgent for OpenCodeClient {
     {
         let base_url = self.base_url.clone();
         let auth_header = self.auth_header.clone();
-        let http = Client::new();
+        let http = self.client.clone();
         let session_id_owned = session_id.to_string();
 
         async move {
@@ -327,7 +293,7 @@ impl ExternalAgent for OpenCodeClient {
     {
         let base_url = self.base_url.clone();
         let auth_header = self.auth_header.clone();
-        let http = Client::new();
+        let http = self.client.clone();
 
         async move {
             let resp = http
@@ -489,12 +455,6 @@ mod tests {
     // Test 4: start_session 500 on create returns error
     #[tokio::test]
     async fn start_session_create_500_returns_error() {
-        Mock::given(method("POST"))
-            .and(path("/session"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&MockServer::start().await)
-            .await;
-
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/session"))

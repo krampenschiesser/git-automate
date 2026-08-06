@@ -1,4 +1,5 @@
 use regex::Regex;
+use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
@@ -24,15 +25,24 @@ pub struct OpencodeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub repository: String,
-    #[serde(rename = "projectId")]
+    #[serde(
+        rename = "projectId",
+        default,
+        deserialize_with = "deserialize_project_id"
+    )]
     pub project_id: Option<String>,
     pub directory: Option<String>,
     pub opencode: Option<OpencodeConfig>,
     #[serde(rename = "issueProvider", default = "default_issue_provider")]
-    pub issue_provider: Option<String>,
-    #[serde(rename = "titlePattern", default = "default_title_pattern")]
+    pub issue_provider: String,
+    #[serde(
+        rename = "titlePattern",
+        default = "default_title_pattern",
+        deserialize_with = "deserialize_title_pattern"
+    )]
     pub title_pattern: String,
     #[serde(rename = "trelloApiKey")]
     pub trello_api_key: Option<String>,
@@ -42,8 +52,8 @@ pub struct ProjectConfig {
     pub trello_board_id: Option<String>,
 }
 
-fn default_issue_provider() -> Option<String> {
-    Some("github".to_string())
+fn default_issue_provider() -> String {
+    "github".to_string()
 }
 
 fn default_title_pattern() -> String {
@@ -51,6 +61,7 @@ fn default_title_pattern() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitAutomateConfig {
     pub projects: BTreeMap<String, ProjectConfig>,
     #[serde(default)]
@@ -90,151 +101,38 @@ pub fn substitute_env(value: &Value) -> Value {
     }
 }
 
-fn validate_project(data: &Value, name: &str) -> Result<ProjectConfig, ConfigError> {
-    let mapping = data
-        .as_mapping()
-        .ok_or_else(|| ConfigError::InvalidConfig {
-            message: format!("project '{}' must be a mapping", name),
-        })?;
-
-    let repository = mapping
-        .get("repository")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ConfigError::InvalidConfig {
-            message: format!("project '{}' requires a string 'repository' field", name),
-        })?
-        .to_string();
-
-    let mut config = ProjectConfig {
-        repository,
-        project_id: None,
-        directory: None,
-        opencode: None,
-        issue_provider: Some("github".to_string()),
-        title_pattern: default_title_pattern(),
-        trello_api_key: None,
-        trello_token: None,
-        trello_board_id: None,
-    };
-
-    if let Some(provider) = mapping.get("issueProvider")
-        && let Some(s) = provider.as_str()
-    {
-        config.issue_provider = Some(s.to_string());
+/// Custom deserializer for `projectId` that accepts a string, integer, or float
+/// and returns the value as an `Option<String>`, or `None` for null/missing.
+///
+/// Equivalent to the manual coercion logic previously in `validate_project`
+/// (lines 151-163 of the old implementation).
+fn deserialize_project_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        Ok(None)
+    } else if let Some(s) = value.as_str() {
+        Ok(Some(s.to_string()))
+    } else if let Some(i) = value.as_i64() {
+        Ok(Some(i.to_string()))
+    } else if let Some(f) = value.as_f64() {
+        Ok(Some(f.to_string()))
+    } else {
+        Err(DeError::custom("projectId must be a string or number"))
     }
-
-    if let Some(pattern) = mapping.get("titlePattern")
-        && let Some(s) = pattern.as_str()
-    {
-        config.title_pattern = s.to_string();
-    }
-
-    // Trello credentials (optional — only needed when issueProvider is "trello")
-    if let Some(key) = mapping.get("trelloApiKey")
-        && let Some(s) = key.as_str()
-    {
-        config.trello_api_key = Some(s.to_string());
-    }
-
-    if let Some(token) = mapping.get("trelloToken")
-        && let Some(s) = token.as_str()
-    {
-        config.trello_token = Some(s.to_string());
-    }
-
-    if let Some(board_id) = mapping.get("trelloBoardId")
-        && let Some(s) = board_id.as_str()
-    {
-        config.trello_board_id = Some(s.to_string());
-    }
-
-    if let Some(raw_id) = mapping.get("projectId") {
-        if let Some(s) = raw_id.as_str() {
-            config.project_id = Some(s.to_string());
-        } else if let Some(i) = raw_id.as_i64() {
-            config.project_id = Some(i.to_string());
-        } else if let Some(u) = raw_id.as_u64() {
-            config.project_id = Some(u.to_string());
-        } else if let Some(f) = raw_id.as_f64() {
-            config.project_id = Some(f.to_string());
-        } else {
-            return Err(ConfigError::InvalidConfig {
-                message: format!("project '{}' 'projectId' must be a string or number", name),
-            });
-        }
-    }
-
-    if let Some(dir) = mapping.get("directory") {
-        if let Some(s) = dir.as_str() {
-            config.directory = Some(s.to_string());
-        } else {
-            return Err(ConfigError::InvalidConfig {
-                message: format!("project '{}' 'directory' must be a string", name),
-            });
-        }
-    }
-
-    if let Some(oc) = mapping.get("opencode") {
-        let oc_mapping = oc.as_mapping().ok_or_else(|| ConfigError::InvalidConfig {
-            message: format!("project '{}' 'opencode' must be a mapping", name),
-        })?;
-
-        let url = oc_mapping
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ConfigError::InvalidConfig {
-                message: format!("project '{}' 'opencode.url' must be a string", name),
-            })?
-            .to_string();
-
-        let pw = oc_mapping
-            .get("pw")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ConfigError::InvalidConfig {
-                message: format!("project '{}' 'opencode.pw' must be a string", name),
-            })?
-            .to_string();
-
-        config.opencode = Some(OpencodeConfig { url, pw });
-    }
-
-    Ok(config)
 }
 
-fn validate_config(data: &Value) -> Result<GitAutomateConfig, ConfigError> {
-    let mapping = data
-        .as_mapping()
-        .ok_or_else(|| ConfigError::InvalidConfig {
-            message: "expected a top-level mapping".to_string(),
-        })?;
-
-    let projects_map = match mapping.get("projects") {
-        Some(Value::Mapping(m)) => m,
-        _ => {
-            return Err(ConfigError::InvalidConfig {
-                message: "'projects' must be a mapping".to_string(),
-            });
-        }
-    };
-
-    let mut projects = BTreeMap::new();
-    for (name, raw) in projects_map.iter() {
-        let name_str = name.as_str().ok_or_else(|| ConfigError::InvalidConfig {
-            message: "project name must be a string".to_string(),
-        })?;
-        let project = validate_project(raw, name_str)?;
-        projects.insert(name_str.to_string(), project);
-    }
-
-    let concurrency = mapping
-        .get("concurrency")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize);
-
-    Ok(GitAutomateConfig {
-        projects,
-        concurrency,
-    })
+/// Custom deserializer for `titlePattern` that validates the value compiles
+/// as a [`Regex`], returning a deserialization error if it does not.
+fn deserialize_title_pattern<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Regex::new(&s).map_err(|e| DeError::custom(format!("invalid title_pattern '{s}': {e}")))?;
+    Ok(s)
 }
 
 pub fn parse_config(file_path: &Path) -> Result<GitAutomateConfig, ConfigError> {
@@ -249,12 +147,16 @@ pub fn parse_config(file_path: &Path) -> Result<GitAutomateConfig, ConfigError> 
     })?;
     let parsed: Value = serde_yaml::from_str(&content)?;
     let substituted = substitute_env(&parsed);
-    validate_config(&substituted)
+    let config: GitAutomateConfig = serde_yaml::from_value(substituted)?;
+    Ok(config)
 }
+
+/// Default config file name used by [`load_config`].
+pub const DEFAULT_CONFIG_FILE: &str = "git-automate.yml";
 
 pub fn load_config() -> Result<GitAutomateConfig, ConfigError> {
     let cwd = std::env::current_dir().map_err(ConfigError::Io)?;
-    let file_path = cwd.join("git-automate.yml");
+    let file_path = cwd.join(DEFAULT_CONFIG_FILE);
     parse_config(&file_path)
 }
 
@@ -264,15 +166,27 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    // Env var names used in substitution tests (GA_TEST_* prefix).
+    const ENV_HELLO: &str = "GA_TEST_HELLO";
+    const ENV_UNSET_VAR: &str = "GA_TEST_UNSET_VAR";
+    const ENV_NESTED: &str = "GA_TEST_NESTED";
+    const ENV_ARR: &str = "GA_TEST_ARR";
+    const ENV_MULTI_A: &str = "GA_TEST_MULTI_A";
+    const ENV_MULTI_B: &str = "GA_TEST_MULTI_B";
+    const ENV_UNDERSCORE_VAR: &str = "GA_TEST_UNDERSCORE_VAR";
+    const ENV_PW: &str = "GA_TEST_PW";
+    const ENV_TRELLO_KEY: &str = "GA_TEST_TRELLO_KEY";
+    const ENV_TRELLO_TOKEN: &str = "GA_TEST_TRELLO_TOKEN";
+
     // --- substitute_env tests ---
 
     // Test 1: substitute_env with ${env:VAR} where VAR="hello" → "hello"
     #[test]
     fn substitute_env_replaces_existing_var() {
         unsafe {
-            std::env::set_var("GA_TEST_HELLO", "hello");
+            std::env::set_var(ENV_HELLO, "hello");
         }
-        let input = Value::String("${env:GA_TEST_HELLO}".to_string());
+        let input = Value::String(format!("${{env:{}}}", ENV_HELLO));
         let result = substitute_env(&input);
         assert_eq!(result, Value::String("hello".to_string()));
     }
@@ -281,9 +195,9 @@ mod tests {
     #[test]
     fn substitute_env_unset_var_becomes_empty() {
         unsafe {
-            std::env::remove_var("GA_TEST_UNSET_VAR");
+            std::env::remove_var(ENV_UNSET_VAR);
         }
-        let input = Value::String("${env:GA_TEST_UNSET_VAR}".to_string());
+        let input = Value::String(format!("${{env:{}}}", ENV_UNSET_VAR));
         let result = substitute_env(&input);
         assert_eq!(result, Value::String(String::new()));
     }
@@ -300,9 +214,10 @@ mod tests {
     #[test]
     fn substitute_env_mapping_recursive() {
         unsafe {
-            std::env::set_var("GA_TEST_NESTED", "deep_value");
+            std::env::set_var(ENV_NESTED, "deep_value");
         }
-        let mapping = serde_yaml::from_str::<Value>("key: ${env:GA_TEST_NESTED}\n").unwrap();
+        let mapping =
+            serde_yaml::from_str::<Value>(&format!("key: ${{env:{}}}\n", ENV_NESTED)).unwrap();
         let result = substitute_env(&mapping);
         let expected = serde_yaml::from_str::<Value>("key: deep_value\n").unwrap();
         assert_eq!(result, expected);
@@ -312,10 +227,10 @@ mod tests {
     #[test]
     fn substitute_env_array_recursive() {
         unsafe {
-            std::env::set_var("GA_TEST_ARR", "arr_val");
+            std::env::set_var(ENV_ARR, "arr_val");
         }
         let seq = Value::Sequence(vec![
-            Value::String("${env:GA_TEST_ARR}".to_string()),
+            Value::String(format!("${{env:{}}}", ENV_ARR)),
             Value::String("literal".to_string()),
         ]);
         let result = substitute_env(&seq);
@@ -330,12 +245,15 @@ mod tests {
     #[test]
     fn substitute_env_multiple_in_string() {
         unsafe {
-            std::env::set_var("GA_TEST_MULTI_A", "A");
+            std::env::set_var(ENV_MULTI_A, "A");
         }
         unsafe {
-            std::env::set_var("GA_TEST_MULTI_B", "B");
+            std::env::set_var(ENV_MULTI_B, "B");
         }
-        let input = Value::String("${env:GA_TEST_MULTI_A} and ${env:GA_TEST_MULTI_B}".to_string());
+        let input = Value::String(format!(
+            "${{env:{}}} and ${{env:{}}}",
+            ENV_MULTI_A, ENV_MULTI_B
+        ));
         let result = substitute_env(&input);
         assert_eq!(result, Value::String("A and B".to_string()));
     }
@@ -344,9 +262,9 @@ mod tests {
     #[test]
     fn substitute_env_underscore_var_name() {
         unsafe {
-            std::env::set_var("GA_TEST_UNDERSCORE_VAR", "underscored");
+            std::env::set_var(ENV_UNDERSCORE_VAR, "underscored");
         }
-        let input = Value::String("${env:GA_TEST_UNDERSCORE_VAR}".to_string());
+        let input = Value::String(format!("${{env:{}}}", ENV_UNDERSCORE_VAR));
         let result = substitute_env(&input);
         assert_eq!(result, Value::String("underscored".to_string()));
     }
@@ -390,7 +308,7 @@ projects:
         assert!(matches!(result, Err(ConfigError::FileNotFound { .. })));
     }
 
-    // Test 12: parse_config with config missing opencode.url → InvalidConfig error
+    // Test 12: parse_config with config missing opencode.url → YamlParse error
     #[test]
     fn parse_config_missing_opencode_url() {
         let yaml = r#"
@@ -405,12 +323,12 @@ projects:
         tmp.flush().unwrap();
 
         let result = parse_config(tmp.path());
-        assert!(matches!(result, Err(ConfigError::InvalidConfig { .. })));
+        assert!(matches!(result, Err(ConfigError::YamlParse { .. })));
     }
 
-    // --- validate_project tests (via parse_config) ---
+    // --- parse_config error tests ---
 
-    // Test 9: validate_project with non-string repository → ConfigError::InvalidConfig
+    // Test 9: parse_config with non-string repository → ConfigError::YamlParse
     #[test]
     fn validate_project_non_string_repository() {
         let yaml = r#"
@@ -423,10 +341,10 @@ projects:
         tmp.flush().unwrap();
 
         let result = parse_config(tmp.path());
-        assert!(matches!(result, Err(ConfigError::InvalidConfig { .. })));
+        assert!(matches!(result, Err(ConfigError::YamlParse { .. })));
     }
 
-    // Test 10: validate_project with projectId as number (e.g. 42) → coerced to String("42")
+    // Test 10: parse_config with projectId as number (e.g. 42) → coerced to String("42")
     #[test]
     fn validate_project_number_project_id_coerced() {
         let yaml = r#"
@@ -444,7 +362,7 @@ projects:
         assert_eq!(project.project_id.as_deref(), Some("42"));
     }
 
-    // Test 11: validate_project with projectId as string → stays as string
+    // Test 11: parse_config with projectId as string → stays as string
     #[test]
     fn validate_project_string_project_id_preserved() {
         let yaml = r#"
@@ -465,8 +383,8 @@ projects:
     // --- load_config tests ---
 
     // Test 13: load_config reads from cwd's git-automate.yml → returns config
-    #[test]
-    fn load_config_reads_from_cwd() {
+    #[tokio::test]
+    async fn load_config_reads_from_cwd() {
         let yaml = r#"
 projects:
   cwd-repo:
@@ -480,11 +398,11 @@ projects:
         std::fs::write(&config_path, yaml).unwrap();
 
         unsafe {
-            std::env::set_var("GA_TEST_PW", "testpassword");
+            std::env::set_var(ENV_PW, "testpassword");
         }
 
         // Change to the temp directory so load_config finds git-automate.yml
-        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp_dir.path()).unwrap();
         let result = load_config();
@@ -499,7 +417,7 @@ projects:
 
     // --- issueProvider config tests ---
 
-    // Test 15: parse_config with issueProvider: github → issue_provider = Some("github")
+    // Test 15: parse_config with issueProvider: github → issue_provider = "github"
     #[test]
     fn parse_config_with_issue_provider_github() {
         let yaml = r#"
@@ -514,10 +432,10 @@ projects:
 
         let config = parse_config(tmp.path()).unwrap();
         let project = config.projects.get("my-repo").unwrap();
-        assert_eq!(project.issue_provider.as_deref(), Some("github"));
+        assert_eq!(project.issue_provider, "github");
     }
 
-    // Test 16: parse_config without issueProvider → defaults to Some("github")
+    // Test 16: parse_config without issueProvider → defaults to "github"
     #[test]
     fn parse_config_without_issue_provider_defaults_to_github() {
         let yaml = r#"
@@ -531,7 +449,7 @@ projects:
 
         let config = parse_config(tmp.path()).unwrap();
         let project = config.projects.get("my-repo").unwrap();
-        assert_eq!(project.issue_provider.as_deref(), Some("github"));
+        assert_eq!(project.issue_provider, "github");
     }
 
     // Test 17: parse_config with custom issueProvider → stored correctly
@@ -549,7 +467,7 @@ projects:
 
         let config = parse_config(tmp.path()).unwrap();
         let project = config.projects.get("my-repo").unwrap();
-        assert_eq!(project.issue_provider.as_deref(), Some("jira"));
+        assert_eq!(project.issue_provider, "jira");
     }
 
     // Test 18: ProjectConfig serde round-trip preserves issueProvider
@@ -560,7 +478,7 @@ projects:
             project_id: None,
             directory: None,
             opencode: None,
-            issue_provider: Some("github".to_string()),
+            issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
             trello_token: None,
@@ -568,33 +486,36 @@ projects:
         };
         let yaml = serde_yaml::to_string(&pc).unwrap();
         let parsed: ProjectConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed.issue_provider.as_deref(), Some("github"));
+        assert_eq!(parsed.issue_provider, "github");
     }
 
     // Test: parse_config with issueProvider: trello + trello fields + env var substitution
     #[test]
     fn parse_config_with_trello_provider_and_credentials() {
         unsafe {
-            std::env::set_var("GA_TEST_TRELLO_KEY", "secret-key");
-            std::env::set_var("GA_TEST_TRELLO_TOKEN", "secret-token");
+            std::env::set_var(ENV_TRELLO_KEY, "secret-key");
+            std::env::set_var(ENV_TRELLO_TOKEN, "secret-token");
         }
-        let yaml = r#"
+        let yaml = format!(
+            "
 projects:
   trello-board:
     repository: https://github.com/user/repo
     issueProvider: trello
-    titlePattern: "@ai.*"
-    trelloApiKey: ${env:GA_TEST_TRELLO_KEY}
-    trelloToken: ${env:GA_TEST_TRELLO_TOKEN}
+    titlePattern: \"@ai.*\"
+    trelloApiKey: ${{env:{}}}
+    trelloToken: ${{env:{}}}
     trelloBoardId: BRD-123
-"#;
+",
+            ENV_TRELLO_KEY, ENV_TRELLO_TOKEN
+        );
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
         let project = config.projects.get("trello-board").unwrap();
-        assert_eq!(project.issue_provider.as_deref(), Some("trello"));
+        assert_eq!(project.issue_provider, "trello");
         assert_eq!(project.trello_api_key.as_deref(), Some("secret-key"));
         assert_eq!(project.trello_token.as_deref(), Some("secret-token"));
         assert_eq!(project.trello_board_id.as_deref(), Some("BRD-123"));

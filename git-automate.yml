@@ -7,5 +7,3 @@ projects:
     opencode:
       url: http://localhost:8081
       pw: ${env:OPENCODE_PW}
-  test-proj:
-    projectId: new-pid

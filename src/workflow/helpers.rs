@@ -4,7 +4,7 @@
 //! prompt template loading/filling, repo cloning, config writing, and
 //! context + field resolution used by every workflow check.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use regex::Regex;
 
@@ -78,8 +78,16 @@ pub struct ShellDeps {
     pub shell: ShellFn,
 }
 
+impl std::fmt::Debug for ShellDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellDeps")
+            .field("shell", &"<shell_fn>")
+            .finish()
+    }
+}
+
 /// Dependencies for context resolution (`resolve_context`).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ContextDeps {
     pub github: Option<GitHubClient>,
     pub config: GitAutomateConfig,
@@ -91,6 +99,16 @@ pub struct WorkflowContext {
     pub config: GitAutomateConfig,
     pub github: Option<GitHubClient>,
     pub shell: ShellFn,
+}
+
+impl std::fmt::Debug for WorkflowContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowContext")
+            .field("config", &self.config)
+            .field("github", &self.github)
+            .field("shell", &"<shell_fn>")
+            .finish()
+    }
 }
 
 impl WorkflowContext {
@@ -156,6 +174,20 @@ pub fn fill_prompt(template: &str, values: &HashMap<String, String>) -> String {
     filled.into_owned()
 }
 
+// ─── Session ID extraction ────────────────────────────────────
+
+/// Extract the `sessionId` value from a project field-value map, returning
+/// `None` when the key is absent or not a string.
+///
+/// Equivalent to the repeated pattern:
+/// `map.get("sessionId").and_then(|v| v.as_deref())`.
+pub fn extract_session_id(field_values: &BTreeMap<String, Option<String>>) -> Option<String> {
+    field_values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .map(String::from)
+}
+
 // ─── Repo & config helpers ────────────────────────────────────
 
 /// Clone a repository to [`WORK_DIR`] if not already present.
@@ -214,7 +246,7 @@ pub async fn write_project_id(
     project_id: &str,
     config: &mut GitAutomateConfig,
 ) -> Result<(), WorkflowError> {
-    let config_path = std::env::current_dir()?.join("git-automate.yml");
+    let config_path = std::env::current_dir()?.join(crate::config::DEFAULT_CONFIG_FILE);
     if !config_path.exists() {
         return Err(WorkflowError::ConfigNotFound(
             config_path.display().to_string(),
@@ -557,7 +589,7 @@ mod tests {
             .unwrap();
         assert_eq!(config.projects.get("my-repo").unwrap().project_id, None);
 
-        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = env::current_dir().unwrap();
         env::set_current_dir(tmp_dir.path()).unwrap();
 
@@ -598,7 +630,7 @@ mod tests {
             concurrency: None,
         };
 
-        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = env::current_dir().unwrap();
         env::set_current_dir(tmp_dir.path()).unwrap();
 
@@ -619,9 +651,9 @@ mod tests {
         let mut config = crate::config::parse_config(&config_path)
             .map_err(|e| format!("parse failed: {}", e))
             .unwrap();
-        assert!(config.projects.get("new-project").is_none());
+        assert!(!config.projects.contains_key("new-project"));
 
-        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = env::current_dir().unwrap();
         env::set_current_dir(tmp_dir.path()).unwrap();
 
@@ -678,6 +710,421 @@ mod tests {
             let result = load_prompt_template(name);
             assert!(result.is_ok(), "template '{}' should load", name);
         }
+    }
+
+    // ── resolve_context / resolve_field_ids / resolve_status_option_and_session tests ──
+
+    use serde_json::json;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::test_utils::gh_client;
+
+    fn test_project_config(project_id: Option<&str>) -> ProjectConfig {
+        ProjectConfig {
+            repository: "https://github.com/owner/repo".to_string(),
+            project_id: project_id.map(String::from),
+            directory: None,
+            opencode: None,
+            issue_provider: "github".to_string(),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
+        }
+    }
+
+    fn test_config(project_id: Option<&str>) -> GitAutomateConfig {
+        let mut projects = std::collections::BTreeMap::new();
+        projects.insert("test-project".to_string(), test_project_config(project_id));
+        GitAutomateConfig {
+            projects,
+            concurrency: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_context_with_existing_project_id() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+        let deps = ContextDeps {
+            github: Some(client),
+            config: test_config(Some("PID-123")),
+        };
+        let project_config = test_project_config(Some("PID-123"));
+
+        let ctx = resolve_context(&deps, "test-project", &project_config)
+            .await
+            .expect("resolve_context should succeed with existing projectId");
+        assert_eq!(ctx.name, "test-project");
+        assert_eq!(ctx.owner, "owner");
+        assert_eq!(ctx.repo, "repo");
+        assert_eq!(ctx.project_id, "PID-123");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_context_without_project_id_creates_and_writes() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        // body_string_contains differentiates the get_owner_id query and createProjectV2 mutation
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("user(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "user": { "id": "U123" }, "organization": null }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "createProjectV2": { "id": "NEW_PID" } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let deps = ContextDeps {
+            github: Some(client),
+            config: test_config(None),
+        };
+        let project_config = test_project_config(None);
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let config_path = tmp_dir.path().join("git-automate.yml");
+        std::fs::write(
+            &config_path,
+            "projects:\n  test-project:\n    repository: https://github.com/owner/repo\n",
+        )
+        .unwrap();
+
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp_dir.path()).unwrap();
+
+        let ctx = resolve_context(&deps, "test-project", &project_config)
+            .await
+            .expect("resolve_context should succeed");
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert_eq!(ctx.project_id, "NEW_PID");
+        assert_eq!(ctx.owner, "owner");
+        assert_eq!(ctx.repo, "repo");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let data: serde_yaml::Value = serde_yaml::from_str(&written).unwrap();
+        let pid = data
+            .get("projects")
+            .and_then(|p| p.get("test-project"))
+            .and_then(|p| p.get("projectId"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(pid, "NEW_PID");
+    }
+
+    #[tokio::test]
+    async fn resolve_context_no_github_returns_error() {
+        let deps = ContextDeps {
+            github: None,
+            config: test_config(Some("PID-123")),
+        };
+        let result =
+            resolve_context(&deps, "test-project", &test_project_config(Some("PID-123"))).await;
+        assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    #[tokio::test]
+    async fn resolve_context_invalid_repository_returns_error() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+        let deps = ContextDeps {
+            github: Some(client),
+            config: test_config(Some("PID-123")),
+        };
+        let project_config = ProjectConfig {
+            repository: "invalid-no-slash".to_string(),
+            project_id: Some("PID-123".to_string()),
+            directory: None,
+            opencode: None,
+            issue_provider: "github".to_string(),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
+        };
+
+        let result = resolve_context(&deps, "test-project", &project_config).await;
+        assert!(matches!(result, Err(WorkflowError::Other(_))));
+    }
+
+    #[tokio::test]
+    async fn resolve_field_ids_resolves_correctly() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        // body_string_contains differentiates get_project_status_field and get_project_fields queries
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "o1", "name": "Triage"},
+                                {"id": "o2", "name": "Todo"}
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"}
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ids = resolve_field_ids(&client, "PID-123")
+            .await
+            .expect("resolve_field_ids should succeed");
+        assert_eq!(ids.status_field_id, "status-field-id");
+        assert_eq!(ids.session_field_id.as_deref(), Some("session-field-id"));
+    }
+
+    #[tokio::test]
+    async fn resolve_field_ids_no_status_field_returns_error() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "field": null } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = resolve_field_ids(&client, "PID-123").await;
+        assert!(matches!(result, Err(WorkflowError::NoStatusField(_))));
+    }
+
+    #[tokio::test]
+    async fn resolve_field_ids_no_session_field_returns_none() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [{"id": "o1", "name": "Triage"}]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"}
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ids = resolve_field_ids(&client, "PID-123")
+            .await
+            .expect("resolve_field_ids should succeed");
+        assert_eq!(ids.status_field_id, "status-field-id");
+        assert!(ids.session_field_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_status_option_and_session_extracts_correctly() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "triage-opt-id", "name": "Triage"},
+                                {"id": "todo-opt-id", "name": "Todo"}
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"}
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (status_field_id, option_id, session_field_id) =
+            resolve_status_option_and_session(&client, "PID-123", "Triage")
+                .await
+                .expect("resolve_status_option_and_session should succeed");
+        assert_eq!(status_field_id, "status-field-id");
+        assert_eq!(option_id, "triage-opt-id");
+        assert_eq!(session_field_id, "session-field-id");
+    }
+
+    #[tokio::test]
+    async fn resolve_status_option_and_session_option_not_found() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "triage-opt-id", "name": "Triage"},
+                                {"id": "todo-opt-id", "name": "Todo"}
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = resolve_status_option_and_session(&client, "PID-123", "Done").await;
+        assert!(matches!(
+            result,
+            Err(WorkflowError::StatusOptionNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_status_option_and_session_no_session_field() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [{"id": "triage-opt-id", "name": "Triage"}]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"}
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = resolve_status_option_and_session(&client, "PID-123", "Triage").await;
+        assert!(matches!(result, Err(WorkflowError::NoSessionField(_))));
+    }
+
+    #[tokio::test]
+    async fn resolve_field_ids_github_http_error() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = resolve_field_ids(&client, "PID-123").await;
+        assert!(matches!(result.unwrap_err(), WorkflowError::GitHub(_)));
     }
 
     use std::sync::Arc;

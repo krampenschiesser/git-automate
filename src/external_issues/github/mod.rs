@@ -1,12 +1,10 @@
-//! GitHub-based implementation of external issue sources.
+//! GitHub API client implementation (GraphQL + REST).
 
 pub mod client;
 pub mod issues;
 pub mod project;
 pub mod repo;
-pub mod source;
 pub mod types;
 
 // Convenience re-exports
 pub use client::{GitHubClient, GitHubError};
-pub use source::GitHubIssueSource;

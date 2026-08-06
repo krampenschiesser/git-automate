@@ -145,7 +145,7 @@ projects:
     assert_eq!(config.projects.get("my-proj").unwrap().project_id, None);
 
     // write_project_id uses current_dir to find git-automate.yml.
-    let _guard = SET_CWD_MUTEX.lock().unwrap();
+    let _guard = SET_CWD_MUTEX.lock().await;
     let original_dir = std::env::current_dir().expect("current_dir should succeed");
     std::env::set_current_dir(tmp.path()).expect("set_current_dir should succeed");
 
@@ -312,7 +312,7 @@ projects:
     };
 
     // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
-    let _guard = SET_CWD_MUTEX.lock().unwrap();
+    let _guard = SET_CWD_MUTEX.lock().await;
     let original_dir = std::env::current_dir().expect("current_dir should succeed");
     std::env::set_current_dir(tmp.path()).expect("set_current_dir should succeed");
 

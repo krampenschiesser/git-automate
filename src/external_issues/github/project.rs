@@ -6,7 +6,7 @@ use serde::Deserialize;
 ///
 /// `number` is kept as a `String` because the GitHub GraphQL API returns it
 /// as an integer, and string formatting normalizes it for comparison.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ProjectV2Summary {
     pub id: String,
     pub number: String,

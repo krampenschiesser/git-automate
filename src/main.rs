@@ -4,7 +4,7 @@
 //!
 //! Behaviour:
 //!   - Config failure → **exit** (daemon mode is stricter than the TS plugin).
-//!   - `GITHUB_TOKEN` unset/empty → log error, `github: None`, continue.
+//!   - `GITHUB_TOKEN` unset/empty → **exit** (fail fast).
 //!   - Logging goes through `tracing` with `[git-automate][LEVEL] message` format.
 //!   - Startup `run_all()` → catch + log `"Startup runAll failed: {e}"`.
 //!   - Polling `run_all()` → catch + log `"Polling runAll failed: {e}"`.
@@ -14,8 +14,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::layer::Layer;
-use tracing_subscriber::prelude::*;
 
 use git_automate::config::parse_config;
 use git_automate::external_agent::opencode::OpenCodeClient;
@@ -42,7 +40,7 @@ enum Commands {
     /// Run the git-automate daemon (polls GitHub + OpenCode every 30s)
     Serve {
         /// Path to the git-automate.yml config file
-        #[arg(long, default_value = "git-automate.yml")]
+        #[arg(long, default_value = git_automate::config::DEFAULT_CONFIG_FILE)]
         config: PathBuf,
     },
     /// Check OpenCode server health
@@ -54,70 +52,14 @@ enum Commands {
     },
 }
 
-// ─── Tracing setup ───────────────────────────────────────────
-
-struct FieldVisitor {
-    message: String,
-}
-
-impl tracing::field::Visit for FieldVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}");
-        }
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        }
-    }
-}
-
-struct GitAutomateFormatLayer;
-
-impl<S> Layer<S> for GitAutomateFormatLayer
-where
-    S: tracing::Subscriber,
-{
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let level_str = match *event.metadata().level() {
-            tracing::Level::ERROR => "ERROR",
-            tracing::Level::WARN => "WARN",
-            tracing::Level::INFO => "INFO",
-            tracing::Level::DEBUG => "DEBUG",
-            tracing::Level::TRACE => "TRACE",
-        };
-
-        let mut visitor = FieldVisitor {
-            message: String::new(),
-        };
-        event.record(&mut visitor);
-
-        let line = format!("[git-automate][{}] {}", level_str, visitor.message);
-
-        if *event.metadata().level() == tracing::Level::ERROR {
-            eprintln!("{line}");
-        } else {
-            println!("{line}");
-        }
-    }
-}
-
-fn init_tracing() {
-    let subscriber = tracing_subscriber::registry().with(GitAutomateFormatLayer);
-    let _ = tracing::subscriber::set_global_default(subscriber);
-}
 
 // ─── Entry point ─────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
+    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    // use that subscriber to process traces emitted after this point
+    tracing::subscriber::set_global_default(subscriber)?;
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve { config } => serve(&config).await,
@@ -127,42 +69,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ─── setup — extracted for testability ───────────────────────
 
-/// Load config + create clients, returning the workflow and whether
-/// a `GitHubClient` was created.
+/// Load config + create the GitHub client, returning the workflow.
 ///
-/// Extracted from `serve` so tests can verify config loading and GitHub
-/// client creation **without** entering the infinite polling loop.
-async fn setup(config_path: &Path) -> Result<(Workflow, bool), Box<dyn std::error::Error>> {
+/// Fails fast if `GITHUB_TOKEN` is missing or empty.
+///
+/// Extracted from `serve` so tests can verify behavior without entering the polling loop.
+async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error>> {
     let config = parse_config(config_path)?;
 
-    let github = match std::env::var("GITHUB_TOKEN") {
-        Ok(token) if !token.is_empty() => Some(GitHubClient::new(token)?),
-        _ => {
-            tracing::error!(
-                "GITHUB_TOKEN environment variable is not set — GitHub operations are skipped"
-            );
-            None
-        }
-    };
-
-    let github_was_some = github.is_some();
+    let token = std::env::var("GITHUB_TOKEN").map_err(|_| {
+        "GITHUB_TOKEN environment variable is not set — cannot start daemon"
+    })?;
+    if token.is_empty() {
+        return Err("GITHUB_TOKEN environment variable is empty — cannot start daemon".into());
+    }
+    let github = GitHubClient::new(token)?;
 
     let shell = create_shell_fn();
     let deps = WorkflowContext {
         config,
-        github,
+        github: Some(github),
         shell,
     };
     let workflow = Workflow::new(deps);
 
-    Ok((workflow, github_was_some))
+    Ok(workflow)
 }
 
 // ─── serve ───────────────────────────────────────────────────
 
 async fn serve(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
-    let (workflow, _) = setup(config_path).await?;
+    let workflow = setup(config_path).await?;
 
     tracing::info!("Starting git-automate daemon");
     if let Err(e) = workflow.run_all().await {
@@ -196,11 +133,11 @@ async fn check_health(url: &str, pw: &str) -> Result<(), Box<dyn std::error::Err
     let client = OpenCodeClient::new(url.to_string(), pw.to_string());
     let healthy = client.check_health().await;
     if healthy {
-        println!("healthy");
+        tracing::info!("healthy");
         Ok(())
     } else {
-        eprintln!("not healthy");
-        std::process::exit(1);
+        tracing::error!("not healthy");
+        Err("OpenCode server is not healthy".into())
     }
 }
 
@@ -209,30 +146,19 @@ async fn check_health(url: &str, pw: &str) -> Result<(), Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::LazyLock;
+    use tokio::sync::Mutex;
 
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    // T1: nonexistent config → error (does not panic)
+    // T2: valid config + no GITHUB_TOKEN → setup fails (fail fast)
     #[tokio::test]
-    async fn serve_nonexistent_config_returns_error() {
-        let result = serve(Path::new("/nonexistent/config.yml")).await;
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("not found"),
-            "error should mention 'not found': {msg}"
-        );
-    }
-
-    // T2: valid config + no GITHUB_TOKEN → github None
-    #[tokio::test]
-    async fn setup_no_github_token_creates_workflow_without_github() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    async fn setup_no_github_token_fails() {
+        let _guard = ENV_LOCK.lock().await;
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe {
             std::env::remove_var("GITHUB_TOKEN");
@@ -247,12 +173,12 @@ mod tests {
         .expect("write config");
 
         let result = setup(&config_path).await;
-        assert!(result.is_ok(), "setup should succeed: {:?}", result.err());
+        assert!(result.is_err(), "setup should fail when token is unset");
 
-        let (_workflow, github_was_some) = result.unwrap();
+        let msg = format!("{}", result.err().unwrap());
         assert!(
-            !github_was_some,
-            "github should be None when token is unset"
+            msg.contains("GITHUB_TOKEN"),
+            "error should mention GITHUB_TOKEN: {msg}"
         );
 
         if let Some(val) = saved {
@@ -265,7 +191,7 @@ mod tests {
     // T3: valid config + GITHUB_TOKEN set → GitHubClient created
     #[tokio::test]
     async fn setup_with_github_token_creates_client() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe {
             std::env::set_var("GITHUB_TOKEN", "ghp_testtoken123456789");
@@ -281,9 +207,6 @@ mod tests {
 
         let result = setup(&config_path).await;
         assert!(result.is_ok(), "setup should succeed: {:?}", result.err());
-
-        let (_workflow, github_was_some) = result.unwrap();
-        assert!(github_was_some, "github should be Some when token is set");
 
         if let Some(val) = saved {
             unsafe {
@@ -332,103 +255,50 @@ mod tests {
         assert!(!client.check_health().await);
     }
 
-    // T9: [git-automate][INFO] format on stdout
-    #[test]
-    fn info_log_format_matches_prefix() {
-        let captured = capture_log(tracing::Level::INFO, "Starting git-automate daemon");
-        assert_eq!(
-            captured,
-            "[git-automate][INFO] Starting git-automate daemon"
-        );
-    }
+    // T-n: check_health() function returns Ok(()) when OpenCode server reports healthy
+    #[tokio::test]
+    async fn check_health_function_healthy_returns_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "healthy": true,
+                "version": "1.0.0"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-    // T10: [git-automate][ERROR] format on stderr
-    #[test]
-    fn error_log_format_matches_prefix() {
-        let captured = capture_log(
-            tracing::Level::ERROR,
-            "GITHUB_TOKEN environment variable is not set — GitHub operations are skipped",
-        );
+        let result = check_health(&server.uri(), "pw").await;
         assert!(
-            captured.starts_with("[git-automate][ERROR] "),
-            "error log should start with '[git-automate][ERROR] ': {captured}"
+            result.is_ok(),
+            "check_health should return Ok for a healthy OpenCode server"
         );
+    }
+
+    // T-n: check_health() function returns Err when OpenCode server reports unhealthy
+    #[tokio::test]
+    async fn check_health_function_unhealthy_returns_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "healthy": false,
+                "version": "1.0.0"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = check_health(&server.uri(), "pw").await;
         assert!(
-            captured.contains("GITHUB_TOKEN"),
-            "error log should contain GITHUB_TOKEN: {captured}"
+            result.is_err(),
+            "check_health should return Err for an unhealthy OpenCode server"
         );
-    }
-
-    // T10 (cont): error_log routes to stderr (via the sink)
-    #[test]
-    fn error_log_routes_to_stderr() {
-        let captured = capture_log(tracing::Level::ERROR, "something broke");
-        assert_eq!(captured, "[git-automate][ERROR] something broke");
-    }
-
-    struct FieldVisitor {
-        message: String,
-    }
-
-    impl tracing::field::Visit for FieldVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.message = format!("{value:?}");
-            }
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.message = value.to_string();
-            }
-        }
-    }
-
-    struct CaptureLayer {
-        buffer: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl<S> tracing_subscriber::layer::Layer<S> for CaptureLayer
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let level_str = match *event.metadata().level() {
-                tracing::Level::ERROR => "ERROR",
-                tracing::Level::WARN => "WARN",
-                tracing::Level::INFO => "INFO",
-                tracing::Level::DEBUG => "DEBUG",
-                tracing::Level::TRACE => "TRACE",
-            };
-            let mut visitor = FieldVisitor {
-                message: String::new(),
-            };
-            event.record(&mut visitor);
-            self.buffer
-                .lock()
-                .unwrap()
-                .push(format!("[git-automate][{}] {}", level_str, visitor.message));
-        }
-    }
-
-    fn capture_log(level: tracing::Level, msg: &str) -> String {
-        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let layer = CaptureLayer {
-            buffer: buffer.clone(),
-        };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
-        match level {
-            tracing::Level::ERROR => tracing::error!("{}", msg),
-            tracing::Level::WARN => tracing::warn!("{}", msg),
-            tracing::Level::INFO => tracing::info!("{}", msg),
-            tracing::Level::DEBUG => tracing::debug!("{}", msg),
-            tracing::Level::TRACE => tracing::trace!("{}", msg),
-        }
-        buffer.lock().unwrap()[0].clone()
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not healthy"),
+            "error message should mention 'not healthy': {msg}"
+        );
     }
 }

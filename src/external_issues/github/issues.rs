@@ -6,7 +6,7 @@ use serde::Deserialize;
 ///
 /// `id` corresponds to `node_id` in REST responses and `id` in GraphQL.
 /// `body` is `None` when the issue has no body or the API returns `null`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
 pub struct IssueInfo {
     pub id: String,
     pub number: i64,

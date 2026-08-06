@@ -15,8 +15,8 @@ use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::types::IssueInfo;
 
 use super::helpers::{
-    ProjectContext, WorkflowContext, WorkflowError, clone_repo_if_needed, fill_prompt,
-    get_issue_body_map, issue_body_or_title, load_prompt_template, resolve_field_ids,
+    ProjectContext, WorkflowContext, WorkflowError, clone_repo_if_needed, extract_session_id,
+    fill_prompt, get_issue_body_map, issue_body_or_title, load_prompt_template, resolve_field_ids,
     resolve_status_option_and_session,
 };
 
@@ -188,14 +188,9 @@ pub async fn run_triage_check(
             )
             .await?;
 
-        let item_values = github
-            .get_project_item_values(&ctx.project_id, &item_id)
-            .await?;
-        let session_text = item_values
-            .get("sessionId")
-            .and_then(|v| v.as_deref())
-            .unwrap_or("");
-        if session_text.is_empty() {
+        let item_values = github.get_project_item_values(&item_id).await?;
+        let session_text = extract_session_id(&item_values);
+        if session_text.is_none() {
             tracing::info!(
                 "{}: starting triage session for #{}",
                 ctx.name,
@@ -249,16 +244,11 @@ pub async fn run_todo_check(
     // Collect items that are "Todo" and have no session yet.
     let mut todo_items: Vec<(String, i64)> = Vec::new();
     for item in &project_items {
-        let item_values = github
-            .get_project_item_values(&ctx.project_id, &item.id)
-            .await?;
+        let item_values = github.get_project_item_values(&item.id).await?;
         let status = item_values.get("Status").and_then(|v| v.as_deref());
         if status == Some("Todo") {
-            let session_text = item_values
-                .get("sessionId")
-                .and_then(|v| v.as_deref())
-                .unwrap_or("");
-            if session_text.is_empty() {
+            let session_text = extract_session_id(&item_values);
+            if session_text.is_none() {
                 todo_items.push((item.id.clone(), item.content_number));
             }
         }
@@ -269,6 +259,14 @@ pub async fn run_todo_check(
         return Ok(());
     }
 
+    let work_dir = clone_repo_if_needed(&deps.shell_deps(), &ctx.owner, &ctx.repo).await?;
+    let default_branch = github
+        .get_repo_default_branch(&ctx.owner, &ctx.repo)
+        .await?;
+    let commit_sha = github
+        .get_repo_commit_sha(&ctx.owner, &ctx.repo, &default_branch)
+        .await?;
+
     for (item_id, issue_number) in &todo_items {
         let issue = issue_map.get(issue_number);
         let branch_name = format!("issue-{}", issue_number);
@@ -278,18 +276,10 @@ pub async fn run_todo_check(
             .await?;
         if !exists {
             tracing::info!("{}: creating branch {}", ctx.name, branch_name);
-            let default_branch = github
-                .get_repo_default_branch(&ctx.owner, &ctx.repo)
-                .await?;
-            let commit_sha = github
-                .get_repo_commit_sha(&ctx.owner, &ctx.repo, &default_branch)
-                .await?;
             github
                 .create_branch_ref(&ctx.owner, &ctx.repo, &branch_name, &commit_sha)
                 .await?;
         }
-
-        let work_dir = clone_repo_if_needed(&deps.shell_deps(), &ctx.owner, &ctx.repo).await?;
 
         let title = if let Some(issue) = issue {
             issue.title.clone()
@@ -348,13 +338,17 @@ pub async fn run_review_check(
     let session_field_id = field_ids
         .session_field_id
         .ok_or_else(|| WorkflowError::NoSessionField(ctx.project_id.clone()))?;
-
     let project_items = github.list_project_items(&ctx.project_id).await?;
     let issue_map = get_issue_body_map(github, &ctx.owner, &ctx.repo).await?;
 
     let work_dir = clone_repo_if_needed(&deps.shell_deps(), &ctx.owner, &ctx.repo).await?;
 
     let status_field = github.get_project_status_field(&ctx.project_id).await?;
+
+    let mut item_values = Vec::new();
+    for item in &project_items {
+        item_values.push(github.get_project_item_values(&item.id).await?);
+    }
 
     for state in &REVIEW_STATES {
         let Some(status_field) = &status_field else {
@@ -374,19 +368,15 @@ pub async fn run_review_check(
             continue;
         };
 
-        for item in &project_items {
-            let item_values = github
-                .get_project_item_values(&ctx.project_id, &item.id)
-                .await?;
-            let current_status = item_values.get("Status").and_then(|v| v.as_deref());
+        let template = load_prompt_template(state.prompt())?;
+
+        for (item, values) in project_items.iter().zip(&item_values) {
+            let current_status = values.get("Status").and_then(|v| v.as_deref());
             if current_status != Some(state.status()) {
                 continue;
             }
-            let session_text = item_values
-                .get("sessionId")
-                .and_then(|v| v.as_deref())
-                .unwrap_or("");
-            if !session_text.is_empty() {
+            let session_text = extract_session_id(values);
+            if session_text.is_some() {
                 continue;
             }
 
@@ -394,7 +384,6 @@ pub async fn run_review_check(
             let issue_number = item.content_number;
             let branch_name = format!("issue-{}", issue_number);
 
-            let template = load_prompt_template(state.prompt())?;
             let filled_prompt = fill_prompt(
                 &template,
                 &HashMap::from([
@@ -434,6 +423,7 @@ pub async fn run_review_check(
                 state.agent().as_str(),
                 issue_number
             );
+
             let session_id = start_opencode_session(
                 oc,
                 oc.directory_or(&work_dir),
@@ -463,47 +453,14 @@ pub async fn run_review_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GitAutomateConfig, ProjectConfig};
-    use crate::external_issues::github::client::GitHubClient;
-    use crate::shell::ShellFn;
-    use crate::shell::ShellOutput;
+    use crate::config::ProjectConfig;
+    use crate::test_utils::{gh_client, make_deps};
     use crate::workflow::helpers::ProjectContext;
     use serde_json::json;
-    use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ─── Test helpers ────────────────────────────────────────
-
-    /// Build a [`GitHubClient`] pointed at a mock server.
-    async fn gh_client(server: &MockServer) -> GitHubClient {
-        GitHubClient::new_with_base_url("test-token".to_string(), server.uri())
-            .expect("token is non-empty")
-    }
-
-    /// A shell function that always succeeds with empty output.
-    fn mock_shell() -> ShellFn {
-        Arc::new(|_cmd: String| {
-            Box::pin(async move {
-                ShellOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                }
-            })
-        })
-    }
-
-    fn make_deps(github: Option<GitHubClient>) -> WorkflowContext {
-        WorkflowContext {
-            config: GitAutomateConfig {
-                projects: std::collections::BTreeMap::new(),
-                concurrency: None,
-            },
-            github,
-            shell: mock_shell(),
-        }
-    }
 
     /// Build a [`ProjectContext`] for testing.
     fn make_context() -> ProjectContext {
@@ -514,7 +471,7 @@ mod tests {
                 project_id: Some("PID-123".to_string()),
                 directory: None,
                 opencode: None,
-                issue_provider: Some("github".to_string()),
+                issue_provider: "github".to_string(),
                 title_pattern: "@ai.*".to_string(),
                 trello_api_key: None,
                 trello_token: None,
@@ -676,26 +633,26 @@ mod tests {
             .mount(server)
             .await;
 
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "default_branch": default_branch
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/owner/repo/commits/{}",
+                default_branch
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": commit_sha
+            })))
+            .mount(server)
+            .await;
+
         if !exists {
-            Mock::given(method("GET"))
-                .and(path("/repos/owner/repo"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "default_branch": default_branch
-                })))
-                .mount(server)
-                .await;
-
-            Mock::given(method("GET"))
-                .and(path(format!(
-                    "/repos/owner/repo/commits/{}",
-                    default_branch
-                )))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "sha": commit_sha
-                })))
-                .mount(server)
-                .await;
-
             Mock::given(method("POST"))
                 .and(path("/repos/owner/repo/git/refs"))
                 .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
@@ -1011,8 +968,8 @@ mod tests {
     fn todo_message_fallback_when_issue_not_in_map() {
         let issue_number: i64 = 42;
         let issue: Option<&IssueInfo> = None;
-        let message = if issue.is_some() {
-            issue_body_or_title(issue.unwrap())
+        let message = if let Some(issue) = issue {
+            issue_body_or_title(issue)
         } else {
             format!("Issue #{}", issue_number)
         };
@@ -1136,7 +1093,7 @@ mod tests {
     async fn triage_no_ai_issues_early_return() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1165,7 +1122,7 @@ mod tests {
     async fn triage_ai_issue_not_in_project_calls_all() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1193,7 +1150,7 @@ mod tests {
     async fn triage_ai_issue_already_in_project_skips_add() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1234,7 +1191,7 @@ mod tests {
     async fn triage_ai_issue_with_session_skips_start() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1289,7 +1246,7 @@ mod tests {
     async fn todo_no_todo_items_early_return() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1321,7 +1278,7 @@ mod tests {
     async fn todo_existing_branch_skips_create() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1355,7 +1312,7 @@ mod tests {
     async fn todo_no_branch_calls_create() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1388,7 +1345,7 @@ mod tests {
     async fn todo_branch_name_is_issue_number() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1446,7 +1403,7 @@ mod tests {
     async fn todo_issue_not_in_map_fallback_title_and_message() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1502,7 +1459,7 @@ mod tests {
     async fn review_no_matching_items_early_return() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1545,7 +1502,7 @@ mod tests {
     async fn review_item_in_review_technical_starts_reviewer() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1604,7 +1561,7 @@ mod tests {
     async fn review_fill_prompt_values_verified() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1663,7 +1620,7 @@ mod tests {
     async fn review_title_format_verified() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1723,7 +1680,7 @@ mod tests {
     async fn review_status_option_not_found_skips() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1765,7 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn todo_no_session_field_errors() {
         let mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config("http://localhost:8081".to_string());
@@ -1935,7 +1892,7 @@ mod tests {
     async fn review_item_with_session_skips() {
         let mock = MockServer::start().await;
         let oc_mock = MockServer::start().await;
-        let client = gh_client(&mock).await;
+        let client = gh_client(&mock);
         let deps = make_deps(Some(client));
         let ctx = make_context();
         let oc = make_oc_config(oc_mock.uri());
@@ -1976,5 +1933,331 @@ mod tests {
 
         let result = run_review_check(&deps, &ctx, &oc).await;
         assert!(result.is_ok());
+    }
+
+    // ── Error-path tests ──────────────────────────────────────
+
+    // Test: run_triage_check with invalid title_pattern regex → returns Other error
+    #[tokio::test]
+    async fn triage_invalid_title_pattern_returns_error() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let mut ctx = make_context();
+        ctx.config.title_pattern = "[invalid".to_string();
+        let oc = make_oc_config(oc_mock.uri());
+
+        // Mount resolve_status_option_and_session mocks
+        mount_triage_github_mocks(
+            &mock,
+            json!([
+                {"node_id": "i1", "number": 1, "title": "@ai Fix bug", "body": "body", "state": "open", "pull_request": null},
+            ]),
+            json!({"nodes": []}),
+            json!({"nodes": []}),
+        )
+        .await;
+
+        // OpenCode should never be called — regex fails before any session
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "x", "projectID": "p", "directory": "/d", "title": "t",
+                "version": "1", "time": {"created": 1, "updated": 2}
+            })))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_triage_check(&deps, &ctx, &oc).await;
+        assert!(result.is_err(), "triage check should fail on invalid regex");
+        assert!(
+            matches!(result, Err(WorkflowError::Other(ref msg)) if msg.contains("invalid title_pattern")),
+            "error should mention 'invalid title_pattern': {:?}",
+            result
+        );
+    }
+
+    // Test: run_triage_check with GitHub API error (list_repo_issues 500) → returns error
+    #[tokio::test]
+    async fn triage_github_api_error_returns_error() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        // Mount only resolve_status_option_and_session mocks
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "triage-opt-id", "name": "Triage"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // list_repo_issues returns 500
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // OpenCode should never be called
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "x", "projectID": "p", "directory": "/d", "title": "t",
+                "version": "1", "time": {"created": 1, "updated": 2}
+            })))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_triage_check(&deps, &ctx, &oc).await;
+        assert!(
+            result.is_err(),
+            "triage check should fail on GitHub API error"
+        );
+    }
+
+    // Test: run_todo_check with GitHub API error (list_repo_issues 500 in get_issue_body_map) → returns error
+    #[tokio::test]
+    async fn todo_github_api_error_returns_error() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        // Mount resolve_field_ids mocks (fields + status field)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "todo-opt-id", "name": "Todo"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // list_project_items — no todo items
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("items(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "items": { "nodes": [] } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // list_repo_issues returns 500 (called by get_issue_body_map)
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // OpenCode should never be called
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "x", "projectID": "p", "directory": "/d", "title": "t",
+                "version": "1", "time": {"created": 1, "updated": 2}
+            })))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_todo_check(&deps, &ctx, &oc).await;
+        assert!(
+            result.is_err(),
+            "todo check should fail on GitHub API error"
+        );
+    }
+
+    // Test: run_review_check with GitHub API error (list_repo_issues 500 in get_issue_body_map) → returns error
+    #[tokio::test]
+    async fn review_github_api_error_returns_error() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        // Mount resolve_field_ids mocks (fields + status field)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "review-tech-id", "name": "Review Technical"},
+                                {"id": "review-prod-id", "name": "Review Product"},
+                                {"id": "qa-id", "name": "QA"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // list_project_items — no items
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("items(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "items": { "nodes": [] } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // list_repo_issues returns 500 (called by get_issue_body_map)
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // OpenCode should never be called
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "x", "projectID": "p", "directory": "/d", "title": "t",
+                "version": "1", "time": {"created": 1, "updated": 2}
+            })))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_review_check(&deps, &ctx, &oc).await;
+        assert!(
+            result.is_err(),
+            "review check should fail on GitHub API error"
+        );
+    }
+
+    // Test: run_triage_check with no GitHub client → returns NoGitHub error
+    #[tokio::test]
+    async fn triage_no_github_client_returns_error() {
+        let deps = make_deps(None);
+        let ctx = make_context();
+        let oc = make_oc_config("http://localhost:8081".to_string());
+
+        let result = run_triage_check(&deps, &ctx, &oc).await;
+        assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    // Test: run_todo_check with no GitHub client → returns NoGitHub error
+    #[tokio::test]
+    async fn todo_no_github_client_returns_error() {
+        let deps = make_deps(None);
+        let ctx = make_context();
+        let oc = make_oc_config("http://localhost:8081".to_string());
+
+        let result = run_todo_check(&deps, &ctx, &oc).await;
+        assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    // Test: run_review_check with no GitHub client → returns NoGitHub error
+    #[tokio::test]
+    async fn review_no_github_client_returns_error() {
+        let deps = make_deps(None);
+        let ctx = make_context();
+        let oc = make_oc_config("http://localhost:8081".to_string());
+
+        let result = run_review_check(&deps, &ctx, &oc).await;
+        assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
     }
 }

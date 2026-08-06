@@ -6,8 +6,6 @@
 //! `mod common;` and then uses `common::*` or `common::specific_fn`.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -16,15 +14,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use git_automate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig};
 use git_automate::external_agent::opencode::OpenCodeClient;
 use git_automate::external_issues::github::client::GitHubClient;
-use git_automate::external_issues::trello::client::TrelloClient;
-use git_automate::shell::{ShellFn, ShellOutput};
 use git_automate::workflow::helpers::WorkflowContext;
 
-/// Mutex to serialize tests that change the process current directory.
-///
-/// `write_project_id` reads `git-automate.yml` from `cwd`, so any test that
-/// calls it must hold this lock to avoid flakiness when tests run in parallel.
-pub static SET_CWD_MUTEX: Mutex<()> = Mutex::new(());
+pub use git_automate::test_utils::{SET_CWD_MUTEX, mock_shell};
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -35,24 +27,10 @@ pub fn gh_client(server: &MockServer) -> GitHubClient {
 }
 
 /// Build an `OpenCodeClient` pointed at a mock server.
+#[allow(dead_code)]
 pub fn oc_client(server: &MockServer) -> OpenCodeClient {
     OpenCodeClient::new(server.uri(), "pw".to_string())
 }
-
-/// A shell function that always succeeds with empty output.
-pub fn mock_shell() -> ShellFn {
-    Arc::new(|_cmd: String| {
-        Box::pin(async move {
-            ShellOutput {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: 0,
-            }
-        })
-    })
-}
-
-/// Build a `ProjectConfig` with opencode config pointing at *url*.
 pub fn project_with_opencode(url: String) -> ProjectConfig {
     ProjectConfig {
         repository: "https://github.com/owner/repo".to_string(),
@@ -62,7 +40,7 @@ pub fn project_with_opencode(url: String) -> ProjectConfig {
             url,
             pw: "pw".to_string(),
         }),
-        issue_provider: Some("github".to_string()),
+        issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
         trello_token: None,
@@ -77,7 +55,7 @@ pub fn project_without_opencode() -> ProjectConfig {
         project_id: Some("PID-123".to_string()),
         directory: None,
         opencode: None,
-        issue_provider: Some("github".to_string()),
+        issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
         trello_token: None,
@@ -112,11 +90,10 @@ pub fn make_deps(
 
 // ── GitHub mock fixtures ──────────────────────────────────────
 
-/// Mount the four GraphQL mocks needed by setup + triage + todo + review:
-/// status field (all 7 options), fields list (Status + sessionId),
-/// project items (empty), and field values (empty).
-pub async fn mount_github_graphql_mocks(server: &MockServer) {
-    // `field(name:` — get_project_status_field
+/// Mount the GraphQL mock that returns the project status field with all 7 workflow options.
+///
+/// Matches `field(name:` queries (used by `get_project_status_field`).
+pub async fn mount_status_field_mock(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("field(name:"))
@@ -140,8 +117,12 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
 
-    // `fields(first:` — get_project_fields
+/// Mount the GraphQL mock that returns the project field definitions.
+///
+/// Matches `fields(first:` queries (used by `get_project_fields`).
+pub async fn mount_project_fields_mock(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("fields(first:"))
@@ -159,8 +140,12 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
 
-    // `items(first:` — list_project_items (empty)
+/// Mount the GraphQL mock that returns an empty list of project items.
+///
+/// Matches `items(first:` queries (used by `list_project_items`).
+pub async fn mount_empty_items_mock(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("items(first:"))
@@ -169,8 +154,12 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
 
-    // `addProjectV2ItemById` — add_issue_to_project
+/// Mount the GraphQL mock for the `addProjectV2ItemById` mutation.
+///
+/// Used by `add_issue_to_project` to attach an issue to a project board.
+pub async fn mount_add_item_mock(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("addProjectV2ItemById"))
@@ -181,8 +170,12 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
 
-    // `updateProjectV2ItemFieldValue` — status update + session id update
+/// Mount the GraphQL mock for the `updateProjectV2ItemFieldValue` mutation.
+///
+/// Used for status transitions and session ID updates.
+pub async fn mount_update_field_mock(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("updateProjectV2ItemFieldValue"))
@@ -193,8 +186,13 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
 
-    // `fieldValues(first:` — get_project_item_values (empty → no session)
+/// Mount the GraphQL mock that returns an empty list of field values.
+///
+/// Matches `fieldValues(first:` queries (used by `get_project_item_values`,
+/// empty response signals no existing session).
+pub async fn mount_empty_field_values_mock(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("fieldValues(first:"))
@@ -203,8 +201,12 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
 
-    // REST GET /repos/owner/repo/issues — returns an @ai issue
+/// Mount the REST mock that returns a single `@ai`-tagged issue.
+///
+/// Matches `GET /repos/owner/repo/issues` (used by issue polling).
+pub async fn mount_ai_issue_mock(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/repos/owner/repo/issues"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -219,6 +221,20 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
         ])))
         .mount(server)
         .await;
+}
+
+/// Mount all GitHub GraphQL + REST mocks needed by setup + triage + todo + review.
+///
+/// Convenience wrapper that calls every individual mock helper.
+/// Prefer the individual helpers when a test only needs a subset.
+pub async fn mount_github_graphql_mocks(server: &MockServer) {
+    mount_status_field_mock(server).await;
+    mount_project_fields_mock(server).await;
+    mount_empty_items_mock(server).await;
+    mount_add_item_mock(server).await;
+    mount_update_field_mock(server).await;
+    mount_empty_field_values_mock(server).await;
+    mount_ai_issue_mock(server).await;
 }
 
 /// Mount OpenCode health + agents mocks.
@@ -247,14 +263,4 @@ pub async fn mount_opencode_mocks(server: &MockServer) {
         ])))
         .mount(server)
         .await;
-}
-
-/// Build a TrelloClient pointed at a mock server.
-pub fn tl_client(server: &MockServer) -> TrelloClient {
-    TrelloClient::new_with_base_url(
-        "test-key".to_string(),
-        "test-token".to_string(),
-        server.uri(),
-    )
-    .expect("credentials are non-empty")
 }
