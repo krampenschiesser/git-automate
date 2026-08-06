@@ -1,3 +1,4 @@
+concurrency: 4
 projects:
   sks-iac:
     repository: https://github.com/krampenschiesser/sks-iac

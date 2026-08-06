@@ -1,6 +1,4 @@
 //! Issue-related type definitions for the GitHub API client.
-//!
-//! Mirrors the TypeScript types from `src/github.ts`.
 
 use serde::Deserialize;
 

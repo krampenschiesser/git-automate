@@ -1,5 +1,4 @@
-//! Shell execution module — mirrors the TypeScript plugin's `buildShellFn`
-//! (`src/plugin.ts` lines 11-19).
+//! Shell execution module.
 //!
 //! Runs commands via `sh -c <command>`, captures stdout, stderr, and the
 //! exit code. stdout/stderr are decoded with `String::from_utf8_lossy`
@@ -75,8 +74,7 @@ pub async fn execute_shell(command: &str) -> ShellOutput {
 
 /// Create a [`ShellFn`] that executes commands via `sh -c <command>`.
 ///
-/// This is the Rust equivalent of `buildShellFn` in `src/plugin.ts` — it
-/// returns a clonable, shareable shell function matching the `shell` field
+/// Returns a clonable, shareable shell function matching the `shell` field
 /// of `WorkflowContext`.
 pub fn create_shell_fn() -> ShellFn {
     Arc::new(|command: String| Box::pin(async move { execute_shell(&command).await }))

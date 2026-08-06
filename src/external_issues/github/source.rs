@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 
-use crate::external_issues::client::GitHubClient;
-use crate::external_issues::types::IssueInfo;
-use crate::issues::{ExternalIssue, ExternalIssueError, ExternalIssueSource};
+use super::client::GitHubClient;
+use super::types::IssueInfo;
+use crate::external_issues::common::{ExternalIssue, ExternalIssueError, ExternalIssueSource};
 
 /// Issues source backed by GitHub Issues + Projects V2.
 ///
@@ -137,7 +137,7 @@ impl ExternalIssueSource for GitHubIssueSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_issues::client::GitHubClient;
+    use crate::external_issues::github::client::GitHubClient;
     use serde_json::json;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

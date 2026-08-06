@@ -1,9 +1,8 @@
 //! Repository URL parsing and standalone helper functions.
 //!
-//! Mirrors `src/github.ts` lines 53-74 (`parseRepositoryUrl`) and
-//! provides the `ParsedRepo` re-export for convenience.
+//! Provides the `ParsedRepo` re-export for convenience.
 
-use crate::external_issues::types::ParsedRepo;
+use super::types::ParsedRepo;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,7 +13,7 @@ pub enum RepoParseError {
 
 /// Extract owner and repo name from common GitHub repository URL formats.
 ///
-/// Handles all four formats from the TypeScript source:
+/// Handles all four formats:
 /// - `https://github.com/owner/repo`
 /// - `https://github.com/owner/repo.git`
 /// - `git@github.com:owner/repo.git`
@@ -80,8 +79,8 @@ fn plain_match(s: &str) -> Option<(String, String)> {
 /// Returns None if there is no `/` or if there are extra path segments
 /// (e.g. `owner/repo/sub` is rejected — it has more than one `/`).
 ///
-/// This matches the TypeScript regex `^([^/]+)\/([^/]+)$` which requires
-/// exactly one `/` with no additional segments.
+/// This regex `^([^/]+)\/([^/]+)$` requires exactly one `/` with no
+/// additional segments.
 fn split_owner_repo(s: &str) -> Option<(String, String)> {
     let idx = s.find('/')?;
     let owner = &s[..idx];
@@ -98,7 +97,7 @@ fn split_owner_repo(s: &str) -> Option<(String, String)> {
 
 // ─── Re-export ParsedRepo for callers that import from this module ───
 
-pub use crate::external_issues::types::ParsedRepo as RepoInfo;
+pub use super::types::ParsedRepo as RepoInfo;
 
 #[cfg(test)]
 mod tests {

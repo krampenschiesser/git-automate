@@ -1,17 +1,36 @@
-# src/external_issues/ — GitHub API Client
+# src/external_issues/ — External Issue Sources
 
-GraphQL + REST client for GitHub Projects V2 and issues via `reqwest`.
+Abstraction layer + GitHub implementation for external issue management.
+
+## STRUCTURE
+
+```
+external_issues/
+├── mod.rs           # Module declarations + re-exports
+├── common/          # Provider-agnostic abstractions
+│   └── mod.rs       # ExternalIssue, ExternalIssueError, ExternalIssueSource trait + 7 unit tests
+└── github/          # GitHub-based implementation
+    ├── mod.rs       # Submodule declarations + re-exports (GitHubClient, GitHubError, GitHubIssueSource)
+    ├── client.rs    # GitHubClient — all API methods (GraphQL + REST)
+    ├── types.rs     # Typed response structs per GraphQL query
+    ├── project.rs   # ProjectV2Summary
+    ├── repo.rs      # parse_repository_url() -> ParsedRepo
+    ├── issues.rs    # IssueInfo
+    └── source.rs    # GitHubIssueSource — ExternalIssueSource implementation + 5 wiremock tests
+```
 
 ## WHERE TO LOOK
 
 | File | Role | Key Exports |
 |------|------|-------------|
-| `client.rs` | `GitHubClient` — all API methods | `graphql()`, `create_project()`, `get_project_fields()`, `get_project_status_field()`, `list_project_items()`, `update_project_item_status()` |
-| `types.rs` | Typed response structs per GraphQL query | `NodeProjectResult`, `StatusFieldInfo`, `ProjectItem`, `IssueInfo`, `ProjectFieldInfo`, `GitHubError` |
-| `mod.rs` | Submodule re-exports | `pub use client::GitHubClient`; domain types |
-| `repo.rs` | Repository URL parser | `parse_repository_url() -> ParsedRepo` |
-| `project.rs` | Project V2 field types | `ProjectV2Summary` |
-| `issues.rs` | Issue-related REST helpers | Issue type definitions |
+| `common/mod.rs` | Trait + canonical types + unit tests | `ExternalIssueSource` trait, `ExternalIssue` struct, `ExternalIssueError` enum |
+| `github/client.rs` | `GitHubClient` — all API methods | `graphql()`, `create_project()`, `get_project_fields()`, `get_project_status_field()`, `list_project_items()`, `update_project_item_status()` |
+| `github/types.rs` | Typed response structs per GraphQL query | `NodeProjectResult`, `StatusFieldInfo`, `ProjectItem`, `IssueInfo`, `ProjectFieldInfo`, `GitHubError` |
+| `github/mod.rs` | Submodule re-exports | `pub use client::GitHubClient`; domain types |
+| `github/source.rs` | `GitHubIssueSource` — `ExternalIssueSource` impl | `GitHubIssueSource` struct, `new()`, `fetch_issues_by_state()` |
+| `github/repo.rs` | Repository URL parser | `parse_repository_url() -> ParsedRepo` |
+| `github/project.rs` | Project V2 field types | `ProjectV2Summary` |
+| `github/issues.rs` | Issue-related REST helpers | Issue type definitions |
 
 ## CONVENTIONS
 

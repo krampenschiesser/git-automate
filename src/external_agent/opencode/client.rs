@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::json;
 use thiserror::Error;
 
-use crate::external_agent::types::{Agent, AgentInfo, HealthResponse, Session};
+use crate::external_agent::opencode::types::{Agent, AgentInfo, HealthResponse, Session};
 
 const OPENCODE_USERNAME: &str = "opencode";
 
@@ -24,9 +24,7 @@ pub enum OpenCodeError {
 
 /// A minimal HTTP client for the OpenCode server.
 ///
-/// Uses HTTP Basic auth with username `"opencode"` and the provided password,
-/// matching the behaviour of the TypeScript `checkOpencodeHealth` /
-/// `startOpencodeSession` helpers.
+/// Uses HTTP Basic auth with username `"opencode"` and the provided password.
 pub struct OpenCodeClient {
     client: Client,
     pub(crate) base_url: String,
@@ -64,8 +62,8 @@ impl OpenCodeClient {
     /// `GET /global/health` — returns `true` only when the server reports
     /// `healthy: true`.
     ///
-    /// Mirrors the TypeScript `catch {}` semantics: on *any* failure (network
-    /// error, non-2xx status, malformed JSON, or a missing `healthy` field)
+    /// On *any* failure (network error, non-2xx status, malformed JSON, or a
+    /// missing `healthy` field)
     /// the method returns `false` rather than propagating the error.
     pub async fn check_health(&self) -> bool {
         self.check_health_inner().await.unwrap_or_default()
@@ -169,13 +167,30 @@ impl OpenCodeClient {
 
         Ok(session_id)
     }
+
+    /// `GET /session/status` — count active (non-Done) sessions.
+    /// Sessions present in the status map (idle, busy, retry) are considered active.
+    /// Sessions absent from the map are Done and do not count.
+    pub async fn count_active_sessions(&self) -> Result<usize, OpenCodeError> {
+        let response = self
+            .client
+            .get(format!("{}/session/status", self.base_url))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
+        }
+        let statuses: std::collections::HashMap<String, serde_json::Value> =
+            response.json().await?;
+        Ok(statuses.len())
+    }
 }
 
 /// Encode credentials for HTTP Basic authentication.
 ///
-/// Returns `Basic <base64("username:password")>`, matching
-/// `Buffer.from("opencode:password", "utf-8").toString("base64")` from the
-/// TypeScript port.
+/// Returns `Basic <base64("username:password")>`, using standard base64
+/// encoding.
 pub fn encode_basic_auth(username: &str, password: &str) -> String {
     let combined = format!("{}:{}", username, password);
     let encoded = base64::engine::general_purpose::STANDARD.encode(combined);
@@ -548,5 +563,65 @@ mod tests {
             .unwrap();
 
         server.verify().await;
+    }
+
+    // --- count_active_sessions (tests 16-19) ------------------------------
+
+    #[tokio::test]
+    async fn count_active_sessions_with_mixed_statuses() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sess1": { "type": "idle" },
+                "sess2": { "type": "busy" },
+                "sess3": { "type": "retry", "attempt": 1, "message": "fail" }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        assert_eq!(client.count_active_sessions().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn count_active_sessions_empty_map() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        assert_eq!(client.count_active_sessions().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn count_active_sessions_500_returns_error() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.count_active_sessions().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn count_active_sessions_sends_auth_header() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        client.count_active_sessions().await.unwrap();
     }
 }

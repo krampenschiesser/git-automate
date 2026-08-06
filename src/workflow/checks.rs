@@ -1,4 +1,4 @@
-//! Workflow checks — port of `src/workflow-checks.ts`.
+//! Workflow checks.
 //!
 //! Implements three workflow checks that drive the automation loop:
 //! - `run_triage_check` — finds `@ai`-tagged issues, adds them to the project,
@@ -11,8 +11,8 @@
 
 use std::collections::HashMap;
 
-use crate::external_agent::client::OpenCodeClient;
-use crate::external_issues::types::IssueInfo;
+use crate::external_agent::opencode::OpenCodeClient;
+use crate::external_issues::github::types::IssueInfo;
 
 use super::helpers::{
     ProjectContext, WorkflowContext, WorkflowError, clone_repo_if_needed, fill_prompt,
@@ -23,8 +23,6 @@ use super::helpers::{
 // ─── Constants ─────────────────────────────────────────────────
 
 /// Descriptor for a review workflow state.
-///
-/// Mirrors the TypeScript `ReviewState` interface from `workflow-checks.ts:17`.
 #[derive(Clone, Copy)]
 pub enum ReviewState {
     Technical,
@@ -59,9 +57,6 @@ impl ReviewState {
 }
 
 /// The three review states, in order.
-///
-/// Equivalent to the TypeScript `REVIEW_STATES` constant
-/// (`workflow-checks.ts:23-27`).
 pub const REVIEW_STATES: [ReviewState; 3] = [
     ReviewState::Technical,
     ReviewState::Product,
@@ -71,9 +66,6 @@ pub const REVIEW_STATES: [ReviewState; 3] = [
 // ─── OpenCode session config ───────────────────────────────────
 
 /// OpenCode session configuration passed to check functions.
-///
-/// Equivalent to the TypeScript `{ url: string; pw: string; directory?: string }`
-/// parameter of the check functions.
 #[derive(Clone)]
 pub struct OpencodeSessionConfig {
     pub url: String,
@@ -93,18 +85,42 @@ impl OpencodeSessionConfig {
 
 /// Start an OpenCode session with the given parameters.
 ///
-/// Creates a new [`OpenCodeClient`] per call (matching the TypeScript
-/// `createOpencodeClient` usage in `startOpencodeSession`).
+/// Creates a new [`OpenCodeClient`] per call.
 ///
-/// Maps [`crate::external_agent::client::OpenCodeError`] to `WorkflowError::Other`.
+/// When `concurrency` is `Some(limit)`, the active session count is queried
+/// first; if it meets or exceeds the limit the session is **not** created and
+/// an `WorkflowError::Other` is returned.
+///
+/// Maps [`crate::external_agent::opencode::OpenCodeError`] to `WorkflowError::Other`.
 async fn start_opencode_session(
     oc: &OpencodeSessionConfig,
     directory: &str,
     title: &str,
     agent: &str,
     message: &str,
+    concurrency: Option<usize>,
 ) -> Result<String, WorkflowError> {
     let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
+
+    if let Some(limit) = concurrency {
+        let active = client
+            .count_active_sessions()
+            .await
+            .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
+        if active >= limit {
+            tracing::warn!(
+                "OpenCode active sessions ({}) >= concurrency limit ({}), skipping: {}",
+                active,
+                limit,
+                title
+            );
+            return Err(WorkflowError::Other(format!(
+                "concurrency limit ({}) reached — {} active sessions",
+                limit, active
+            )));
+        }
+    }
+
     client
         .start_session(directory, title, agent, message)
         .await
@@ -115,8 +131,6 @@ async fn start_opencode_session(
 
 /// Find issues with titles starting `@ai `, add them to the project, set
 /// status to "Triage", and start a triage session if no session exists yet.
-///
-/// Equivalent to `runTriageCheck` in `src/workflow-checks.ts:35-83`.
 pub async fn run_triage_check(
     deps: &WorkflowContext,
     ctx: &ProjectContext,
@@ -131,9 +145,15 @@ pub async fn run_triage_check(
         resolve_status_option_and_session(github, &ctx.project_id, "Triage").await?;
 
     let issues = github.list_repo_issues(&ctx.owner, &ctx.repo).await?;
+    let pattern = regex::Regex::new(&ctx.config.title_pattern).map_err(|e| {
+        WorkflowError::Other(format!(
+            "invalid title_pattern '{}': {}",
+            ctx.config.title_pattern, e
+        ))
+    })?;
     let ai_issues: Vec<&IssueInfo> = issues
         .iter()
-        .filter(|i| i.title.starts_with("@ai "))
+        .filter(|i| pattern.is_match(&i.title))
         .collect();
 
     if ai_issues.is_empty() {
@@ -187,6 +207,7 @@ pub async fn run_triage_check(
                 &issue.title,
                 "git-automate-triage",
                 &issue_body_or_title(issue),
+                deps.config.concurrency,
             )
             .await?;
             github
@@ -207,8 +228,6 @@ pub async fn run_triage_check(
 
 /// Find items with "Todo" status, create branches if needed, clone the
 /// repo, and start a developer session for each item without a session.
-///
-/// Equivalent to `runTodoCheck` in `src/workflow-checks.ts:91-151`.
 pub async fn run_todo_check(
     deps: &WorkflowContext,
     ctx: &ProjectContext,
@@ -294,6 +313,7 @@ pub async fn run_todo_check(
             &title,
             "git-automate-developer",
             &message,
+            deps.config.concurrency,
         )
         .await?;
 
@@ -314,8 +334,6 @@ pub async fn run_todo_check(
 
 /// Find items with "Review Technical", "Review Product", or "QA" status,
 /// load the appropriate prompt template, fill it, and start a review session.
-///
-/// Equivalent to `runReviewCheck` in `src/workflow-checks.ts:159-220`.
 pub async fn run_review_check(
     deps: &WorkflowContext,
     ctx: &ProjectContext,
@@ -422,6 +440,7 @@ pub async fn run_review_check(
                 &title,
                 state.agent().as_str(),
                 &filled_prompt,
+                deps.config.concurrency,
             )
             .await?;
 
@@ -445,7 +464,7 @@ pub async fn run_review_check(
 mod tests {
     use super::*;
     use crate::config::{GitAutomateConfig, ProjectConfig};
-    use crate::external_issues::client::GitHubClient;
+    use crate::external_issues::github::client::GitHubClient;
     use crate::shell::ShellFn;
     use crate::shell::ShellOutput;
     use crate::workflow::helpers::ProjectContext;
@@ -479,6 +498,7 @@ mod tests {
         WorkflowContext {
             config: GitAutomateConfig {
                 projects: std::collections::BTreeMap::new(),
+                concurrency: None,
             },
             github,
             shell: mock_shell(),
@@ -495,6 +515,10 @@ mod tests {
                 directory: None,
                 opencode: None,
                 issue_provider: Some("github".to_string()),
+                title_pattern: "@ai.*".to_string(),
+                trello_api_key: None,
+                trello_token: None,
+                trello_board_id: None,
             },
             owner: "owner".to_string(),
             repo: "repo".to_string(),
@@ -1802,9 +1826,108 @@ mod tests {
             directory: None,
         };
 
-        let result = start_opencode_session(&oc, "/dir", "title", "agent", "message").await;
+        let result = start_opencode_session(&oc, "/dir", "title", "agent", "message", None).await;
         assert!(result.is_err());
         assert!(matches!(result, Err(WorkflowError::Other(_))));
+    }
+
+    // Test 17a: start_opencode_session skips when active sessions >= concurrency limit
+    #[tokio::test]
+    async fn start_opencode_session_skips_when_at_limit() {
+        let mock = MockServer::start().await;
+
+        // GET /session/status returns 4 active sessions
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sess1": {"status": "idle"},
+                "sess2": {"status": "busy"},
+                "sess3": {"status": "idle"},
+                "sess4": {"status": "idle"},
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // POST /session should NOT be called — limit is 2 and there are 4 active
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "should-not-happen",
+                "projectID": "p",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": {"created": 1, "updated": 2}
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "pw".to_string(),
+            directory: None,
+        };
+
+        // limit = Some(2), active = 4 → 4 >= 2 → should skip
+        let result =
+            start_opencode_session(&oc, "/dir", "title", "agent", "message", Some(2)).await;
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(WorkflowError::Other(_))));
+    }
+
+    // Test 17b: start_opencode_session proceeds when active sessions < concurrency limit
+    #[tokio::test]
+    async fn start_opencode_session_proceeds_below_limit() {
+        let mock = MockServer::start().await;
+
+        // GET /session/status returns 2 active sessions
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sess1": {"status": "idle"},
+                "sess2": {"status": "busy"},
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // POST /session should be called exactly once and return "sess123"
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": {"created": 1, "updated": 2}
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // POST /session/sess123/prompt_async — 204
+        Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "pw".to_string(),
+            directory: None,
+        };
+
+        // limit = Some(5), active = 2 → 2 < 5 → should proceed
+        let result =
+            start_opencode_session(&oc, "/dir", "title", "agent", "message", Some(5)).await;
+
+        assert_eq!(result.unwrap(), "sess123");
     }
 
     // Test 18: Review — item with existing session → skips

@@ -16,6 +16,9 @@ base64 = "0.22"
 regex = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+rig = "0.41.0"
+rig-core = "0.41.0"
+rig-agent = "0.41.0"
 
 [dev-dependencies]
 wiremock = "0.6"

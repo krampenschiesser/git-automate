@@ -4,8 +4,8 @@
 //! (GitHub, GitLab, Jira, etc.). Each provider implements [`ExternalIssueSource`]
 //! and returns issues in the canonical [`ExternalIssue`] shape, decoupling the
 //! workflow engine from the underlying issue backend.
-
-pub mod github;
+//!
+//! The concrete GitHub implementation lives in [`crate::external_issues::github`].
 
 /// Canonical issue representation returned by any [`ExternalIssueSource`].
 ///
@@ -34,7 +34,9 @@ pub enum ExternalIssueError {
     #[error("External issue source error: {0}")]
     Other(String),
     #[error("GitHub error: {0}")]
-    GitHub(#[from] crate::external_issues::client::GitHubError),
+    GitHub(#[from] crate::external_issues::github::client::GitHubError),
+    #[error("Trello error: {0}")]
+    Trello(#[from] crate::external_issues::trello::client::TrelloError),
     #[error("Issue not found: {0}")]
     IssueNotFound(String),
     #[error("Project not found: {0}")]

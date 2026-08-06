@@ -1,8 +1,4 @@
 //! Domain types and GraphQL/REST response structs for the GitHub API client.
-//!
-//! Mirrors the TypeScript interfaces from `src/github.ts`:
-//! - Domain types: lines 14-44, 340-403
-//! - GraphQL response structs: lines 78-144
 //! - REST response shapes: derived from octokit response.data usage
 
 use serde::Deserialize;
@@ -10,7 +6,7 @@ use serde::Deserialize;
 // ─── Domain types ───────────────────────────────────────────
 
 // Re-exported from `project.rs` — moved to match AGENTS.md intent.
-pub use crate::external_issues::project::ProjectV2Summary;
+pub use super::project::ProjectV2Summary;
 
 /// A field on a Project V2 board.
 ///
@@ -39,7 +35,7 @@ pub struct StatusFieldInfo {
 }
 
 // Re-exported from `issues.rs` — moved to match AGENTS.md intent.
-pub use crate::external_issues::issues::IssueInfo;
+pub use super::issues::IssueInfo;
 
 /// Parsed owner/repo extracted from a repository URL or shorthand.
 #[derive(Debug, Clone, PartialEq)]

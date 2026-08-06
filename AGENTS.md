@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-08-05
-**Commit:** d56f333 (main)
+**Commit:** 3bcfa39 (main)
 
 ## OVERVIEW
 
@@ -10,15 +10,15 @@ Standalone Rust daemon that automates GitHub issue workflows via a polling loop 
 ## STRUCTURE
 ```
 .
-├── src/                 # All Rust source (7 flat files + 3 subdirs)
+├── src/                 # All Rust source (4 flat files + 5 subdirs)
 │   ├── lib.rs           # Library entry point + test utilities
 │   ├── main.rs          # Daemon CLI (clap), polling loop, signal handling
 │   ├── config.rs        # YAML config + ${env:VAR} substitution
-│   ├── log.rs           # Logging abstraction
 │   ├── shell.rs         # Shell command execution abstraction
-│   ├── github/          # GitHub API client (GraphQL + REST via reqwest)
-│   ├── opencode/        # OpenCode HTTP client
+│   ├── external_issues/ # GitHub API client (GraphQL + REST via reqwest)
+│   ├── external_agent/  # OpenCode HTTP client
 │   ├── workflow/        # Workflow engine (helpers, checks, orchestrator)
+│   ├── issues/          # External issue source abstraction (trait + GitHub impl)
 │   └── assets/          # Embedded prompt/agent templates (include_str!)
 ├── tests/               # Integration tests (wiremock-based)
 ├── git-automate.yml     # Runtime config — GitHub projects + OpenCode server creds
@@ -35,8 +35,10 @@ Standalone Rust daemon that automates GitHub issue workflows via a polling loop 
 |------|----------|-------|
 | Daemon entry point | `src/main.rs` | CLI with clap, 30s polling loop, signal handling |
 | Config parsing | `src/config.rs` | YAML parser with `${env:VAR}` substitution |
-| GitHub API client | `src/github/` | GraphQL (Projects V2) + REST (issues/branches) via reqwest |
-| OpenCode client | `src/opencode/` | Health check, agent listing, session start via HTTP |
+| Shell abstraction | `src/shell.rs` | `ShellFn`, `ShellOutput` type aliases |
+| GitHub API client | `src/external_issues/` | GraphQL (Projects V2) + REST (issues/branches) via reqwest |
+| OpenCode client | `src/external_agent/` | Health check, agent listing, session start via HTTP |
+| Issue source abstraction | `src/issues/` | `ExternalIssueSource` trait + `GitHubIssueSource` impl |
 | Workflow orchestration | `src/workflow/mod.rs` | `Workflow` struct — setup/check/triage/todo/review |
 | Individual checks | `src/workflow/checks.rs` | `run_triage_check`, `run_todo_check`, `run_review_check` |
 | Shared helpers | `src/workflow/helpers.rs` | Prompt loading, repo cloning, field resolution |
@@ -50,15 +52,21 @@ Standalone Rust daemon that automates GitHub issue workflows via a polling loop 
 | `serve` | function | `src/main.rs` | 0 | Daemon entry — starts polling loop |
 | `check_health` | function | `src/main.rs` | 0 | Health subcommand |
 | `Workflow` | struct | `src/workflow/mod.rs` | 1 (main) | Orchestrates all checks |
-| `GitHubClient` | struct | `src/github/client.rs` | 1 (workflow) | GitHub API (GraphQL + REST) |
+| `GitHubClient` | struct | `src/external_issues/client.rs` | 16 | GitHub API (GraphQL + REST) |
+| `GitHubIssueSource` | struct | `src/issues/github.rs` | 1 | GitHub impl of `ExternalIssueSource` |
+| `ExternalIssueSource` | trait | `src/issues/mod.rs` | 1 | Abstraction over issue backends |
+| `ExternalIssue` | struct | `src/issues/mod.rs` | 5 | Canonical issue representation |
+| `OpenCodeClient` | struct | `src/external_agent/client.rs` | 2 | OpenCode HTTP API client |
 | `ProjectConfig` | struct | `src/config.rs` | 8 | Single project config shape |
 | `GitAutomateConfig` | struct | `src/config.rs` | 5 | Top-level config shape |
 | `ProjectContext` | struct | `src/workflow/helpers.rs` | 5 | Resolved project state |
-| `WorkflowDeps` | struct | `src/workflow/mod.rs` | 4 | Injected dependencies |
+| `WorkflowContext` | struct | `src/workflow/helpers.rs` | 4 | Injected dependencies |
 | `parse_config` | function | `src/config.rs` | 2 | YAML → typed config (+ env sub) |
 | `load_config` | function | `src/config.rs` | 1 | Reads `git-automate.yml` from cwd |
-| `parse_repository_url` | function | `src/github/repo.rs` | 3 | owner/repo extraction from URL |
+| `parse_repository_url` | function | `src/external_issues/repo.rs` | 3 | owner/repo extraction from URL |
 | `run_all` | method | `src/workflow/mod.rs` | 2 | Runs all checks in sequence |
+| `fill_prompt` | function | `src/workflow/helpers.rs` | 3 | Fills `{{KEY}}` placeholders in templates |
+| `REQUIRED_AGENTS` | const | `src/workflow/mod.rs` | 1 | Required OpenCode agent names |
 
 ## CONVENTIONS
 
@@ -70,11 +78,12 @@ Standalone Rust daemon that automates GitHub issue workflows via a polling loop 
 - **HTTP**: `reqwest::Client` for all API calls (GitHub GraphQL/REST + OpenCode HTTP)
 - **Agent/prompt pairing**: assets in `src/assets/prompts/` + `src/assets/agents/` — parallel directories, embedded via `include_str!`
 - **ESM imports / import.meta.url / .js extensions**: N/A — Rust uses `mod` declarations and `include_str!`
+- **Config**: `issueProvider` field in `git-automate.yml` selects the issue backend (currently `github`); `${env:VAR}` for secrets
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
 - **Tests exist**: 174 tests (161 lib + 8 bin + 5 integration) — uses built-in `#[test]` + `wiremock` for integration
-- **No ESLint/Prettier/Biome**: uses `cargo clippy -- -D warnings` + `cargo fmt`
+- **No linting tools from JS ecosystem**: uses `cargo clippy -- -D warnings` + `cargo fmt`
 - **`GITHUB_TOKEN` optional**: if unset, `github` is `None` — checks fail gracefully
 - **`catch {}` without binding**: `check_opencode_health` swallows network errors — returns `false` intentionally
 - **Assets embedded**: `include_str!` at compile time — no runtime file access for prompts/agents
@@ -107,5 +116,6 @@ cargo run -- serve --config git-automate.yml  # Run the daemon
 - Polling interval: 30s (standalone daemon, no `session.idle` hook)
 - Repos cloned to `/tmp/git-automate-work/{owner}-{repo}` with `--depth 1`
 - No barrel exports (`lib.rs`); every module uses direct file paths via `mod` declarations
-- `bun.lock` was a stale artifact — removed; `pnpm-lock.yaml`, `package.json`, `tsconfig.json` all removed
+- `bun.lock` was a stale artifact — removed; `pnpm-lock.yaml`, `package.json` all removed
+- **Issue source abstraction**: `src/issues/` provides a trait-based abstraction (`ExternalIssueSource`) — GitHub is the only implementation; `issueProvider` config field controls which backend is used
 - **CI gaps**: no dependency caching, no cross-platform matrix, no `cargo audit` security check, no `serve()` polling-loop tests

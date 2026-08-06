@@ -1,4 +1,4 @@
-//! Shared workflow helpers — port of `src/workflow-helpers.ts`.
+//! Shared workflow helpers.
 //!
 //! Defines: shared types (`ProjectContext`, `FieldIds`, dependency structs),
 //! prompt template loading/filling, repo cloning, config writing, and
@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use regex::Regex;
 
 use crate::config::{GitAutomateConfig, ProjectConfig};
-use crate::external_issues::client::{GitHubClient, GitHubError};
-use crate::external_issues::repo::parse_repository_url;
-use crate::external_issues::types::{IssueInfo, ParsedRepo, StatusOption};
+use crate::external_issues::github::client::{GitHubClient, GitHubError};
+use crate::external_issues::github::repo::parse_repository_url;
+use crate::external_issues::github::types::{IssueInfo, ParsedRepo, StatusOption};
 use crate::shell::{ShellFn, ShellOutput};
 
 // ─── Constants ────────────────────────────────────────────────
@@ -85,8 +85,7 @@ pub struct ContextDeps {
     pub config: GitAutomateConfig,
 }
 
-/// Full dependency set for workflow checks and the orchestrator
-/// (equivalent to `WorkflowContext` from `src/workflow.ts`).
+/// Full dependency set for workflow checks and the orchestrator.
 #[derive(Clone)]
 pub struct WorkflowContext {
     pub config: GitAutomateConfig,
@@ -596,6 +595,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut config = GitAutomateConfig {
             projects: std::collections::BTreeMap::new(),
+            concurrency: None,
         };
 
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().unwrap();
@@ -688,6 +688,7 @@ mod tests {
         let deps = WorkflowContext {
             config: GitAutomateConfig {
                 projects: std::collections::BTreeMap::new(),
+                concurrency: None,
             },
             github: None,
             shell: shell.clone(),
@@ -703,6 +704,7 @@ mod tests {
         let shell = create_test_shell();
         let config = GitAutomateConfig {
             projects: std::collections::BTreeMap::new(),
+            concurrency: None,
         };
         let deps = WorkflowContext {
             config: config.clone(),

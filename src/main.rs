@@ -1,9 +1,8 @@
 //! git-automate daemon — standalone Rust binary.
 //!
-//! Replaces the TypeScript plugin's `gitAutomate` function (`src/plugin.ts`)
-//! with a long-running daemon that polls GitHub + OpenCode every 30 seconds.
+//! A long-running daemon that polls GitHub + OpenCode every 30 seconds.
 //!
-//! Behaviour mirrors `plugin.ts`:
+//! Behaviour:
 //!   - Config failure → **exit** (daemon mode is stricter than the TS plugin).
 //!   - `GITHUB_TOKEN` unset/empty → log error, `github: None`, continue.
 //!   - Logging goes through `tracing` with `[git-automate][LEVEL] message` format.
@@ -19,8 +18,8 @@ use tracing_subscriber::layer::Layer;
 use tracing_subscriber::prelude::*;
 
 use git_automate::config::parse_config;
-use git_automate::external_agent::client::OpenCodeClient;
-use git_automate::external_issues::client::GitHubClient;
+use git_automate::external_agent::opencode::OpenCodeClient;
+use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::shell::create_shell_fn;
 use git_automate::workflow::Workflow;
 use git_automate::workflow::helpers::WorkflowContext;

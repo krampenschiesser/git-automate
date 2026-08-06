@@ -1,10 +1,8 @@
 //! GitHub API client supporting both GraphQL (Projects V2) and REST operations.
-//!
-//! Mirrors the TypeScript `GitHubClient` from `src/github.ts`.
 //! Authentication uses a personal access token. GraphQL requests go to
 //! `https://api.github.com/graphql`; REST requests go to `https://api.github.com/`.
 
-use crate::external_issues::types::*;
+use super::types::*;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -653,7 +651,7 @@ impl GitHubClient {
     /// List all issues in a repository with their parent issue number (if any),
     /// using the GraphQL API.
     ///
-    /// This is used by [`crate::issues::github::GitHubIssueSource`] to build
+    /// This is used by [`crate::external_issues::github::GitHubIssueSource`] to build
     /// the parent → children (sub-task) map for `ExternalIssue.sub_task_external_ids`.
     pub async fn list_issues_with_parents(
         &self,

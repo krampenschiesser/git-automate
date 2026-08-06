@@ -32,15 +32,29 @@ pub struct ProjectConfig {
     pub opencode: Option<OpencodeConfig>,
     #[serde(rename = "issueProvider", default = "default_issue_provider")]
     pub issue_provider: Option<String>,
+    #[serde(rename = "titlePattern", default = "default_title_pattern")]
+    pub title_pattern: String,
+    #[serde(rename = "trelloApiKey")]
+    pub trello_api_key: Option<String>,
+    #[serde(rename = "trelloToken")]
+    pub trello_token: Option<String>,
+    #[serde(rename = "trelloBoardId")]
+    pub trello_board_id: Option<String>,
 }
 
 fn default_issue_provider() -> Option<String> {
     Some("github".to_string())
 }
 
+fn default_title_pattern() -> String {
+    "@ai.*".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitAutomateConfig {
     pub projects: BTreeMap<String, ProjectConfig>,
+    #[serde(default)]
+    pub concurrency: Option<usize>,
 }
 
 /// Compiled regex for `${env:VAR}` patterns, cached via `OnceLock`.
@@ -97,12 +111,41 @@ fn validate_project(data: &Value, name: &str) -> Result<ProjectConfig, ConfigErr
         directory: None,
         opencode: None,
         issue_provider: Some("github".to_string()),
+        title_pattern: default_title_pattern(),
+        trello_api_key: None,
+        trello_token: None,
+        trello_board_id: None,
     };
 
     if let Some(provider) = mapping.get("issueProvider")
         && let Some(s) = provider.as_str()
     {
         config.issue_provider = Some(s.to_string());
+    }
+
+    if let Some(pattern) = mapping.get("titlePattern")
+        && let Some(s) = pattern.as_str()
+    {
+        config.title_pattern = s.to_string();
+    }
+
+    // Trello credentials (optional — only needed when issueProvider is "trello")
+    if let Some(key) = mapping.get("trelloApiKey")
+        && let Some(s) = key.as_str()
+    {
+        config.trello_api_key = Some(s.to_string());
+    }
+
+    if let Some(token) = mapping.get("trelloToken")
+        && let Some(s) = token.as_str()
+    {
+        config.trello_token = Some(s.to_string());
+    }
+
+    if let Some(board_id) = mapping.get("trelloBoardId")
+        && let Some(s) = board_id.as_str()
+    {
+        config.trello_board_id = Some(s.to_string());
     }
 
     if let Some(raw_id) = mapping.get("projectId") {
@@ -183,7 +226,15 @@ fn validate_config(data: &Value) -> Result<GitAutomateConfig, ConfigError> {
         projects.insert(name_str.to_string(), project);
     }
 
-    Ok(GitAutomateConfig { projects })
+    let concurrency = mapping
+        .get("concurrency")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    Ok(GitAutomateConfig {
+        projects,
+        concurrency,
+    })
 }
 
 pub fn parse_config(file_path: &Path) -> Result<GitAutomateConfig, ConfigError> {
@@ -510,9 +561,106 @@ projects:
             directory: None,
             opencode: None,
             issue_provider: Some("github".to_string()),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
         };
         let yaml = serde_yaml::to_string(&pc).unwrap();
         let parsed: ProjectConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.issue_provider.as_deref(), Some("github"));
+    }
+
+    // Test: parse_config with issueProvider: trello + trello fields + env var substitution
+    #[test]
+    fn parse_config_with_trello_provider_and_credentials() {
+        unsafe {
+            std::env::set_var("GA_TEST_TRELLO_KEY", "secret-key");
+            std::env::set_var("GA_TEST_TRELLO_TOKEN", "secret-token");
+        }
+        let yaml = r#"
+projects:
+  trello-board:
+    repository: https://github.com/user/repo
+    issueProvider: trello
+    titlePattern: "@ai.*"
+    trelloApiKey: ${env:GA_TEST_TRELLO_KEY}
+    trelloToken: ${env:GA_TEST_TRELLO_TOKEN}
+    trelloBoardId: BRD-123
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let project = config.projects.get("trello-board").unwrap();
+        assert_eq!(project.issue_provider.as_deref(), Some("trello"));
+        assert_eq!(project.trello_api_key.as_deref(), Some("secret-key"));
+        assert_eq!(project.trello_token.as_deref(), Some("secret-token"));
+        assert_eq!(project.trello_board_id.as_deref(), Some("BRD-123"));
+    }
+
+    // --- concurrency config tests ---
+
+    // Test: parse_config with concurrency: 4 → config.concurrency == Some(4)
+    #[test]
+    fn parse_config_with_concurrency() {
+        let yaml = r#"
+concurrency: 4
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(config.concurrency, Some(4));
+    }
+
+    // Test: parse_config without concurrency → defaults to None
+    #[test]
+    fn parse_config_without_concurrency_defaults_to_none() {
+        let yaml = r#"
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(config.concurrency, None);
+    }
+
+    // Test: parse_config with concurrency: 0 → config.concurrency == Some(0)
+    #[test]
+    fn parse_config_with_concurrency_zero() {
+        let yaml = r#"
+concurrency: 0
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(config.concurrency, Some(0));
+    }
+
+    // Test: git_automate_config_serde_round_trip_concurrency
+    #[test]
+    fn git_automate_config_serde_round_trip_concurrency() {
+        let config = GitAutomateConfig {
+            projects: BTreeMap::new(),
+            concurrency: Some(4),
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let parsed: GitAutomateConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.concurrency, Some(4));
     }
 }

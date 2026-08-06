@@ -1,0 +1,612 @@
+//! Workflow integration tests: triage flow, setup initialization, and helpers.
+//!
+//! Tests 1, 2, 5, 8, 9, 10 from the original `integration.rs`.
+
+mod common;
+
+use serde_json::json;
+use tempfile::tempdir;
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use common::*;
+use git_automate::config::parse_config;
+use git_automate::workflow::Workflow;
+use git_automate::workflow::helpers::{WorkflowContext, write_project_id};
+
+// ─── Test 1: Full triage flow with mocks ──────────────────────
+
+#[tokio::test]
+async fn test_full_triage_flow_with_mocks() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+
+    mount_github_graphql_mocks(&gh_mock).await;
+    mount_opencode_mocks(&oc_mock).await;
+
+    // Track that the session creation POST was actually called.
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "sess123",
+            "projectID": "p1",
+            "directory": "/d",
+            "title": "t",
+            "version": "1",
+            "time": {"created": 1, "updated": 2}
+        })))
+        .expect(1)
+        .named("session_creation")
+        .mount(&oc_mock)
+        .await;
+
+    // Track that prompt_async was called.
+    Mock::given(method("POST"))
+        .and(path("/session/sess123/prompt_async"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .named("prompt_async")
+        .mount(&oc_mock)
+        .await;
+
+    let client = gh_client(&gh_mock);
+    let deps = make_deps(Some(client), true, Some(oc_mock.uri()));
+    let workflow = Workflow::new(deps);
+
+    // Run the full workflow — should complete without error.
+    workflow.run_all().await.expect("run_all should succeed");
+
+    // Verify the OpenCode session creation and prompt were called.
+    oc_mock.verify().await;
+}
+
+// ─── Test 2: Graceful shutdown after one poll ─────────────────
+
+#[tokio::test]
+async fn test_daemon_graceful_shutdown_after_one_poll() {
+    let gh_mock = MockServer::start().await;
+
+    // Mount only the setup-check mocks (status field + fields).
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": {
+                        "id": "sf",
+                        "options": [
+                            {"id": "o1", "name": "Triage"},
+                            {"id": "o2", "name": "Todo"},
+                            {"id": "o3", "name": "In Development"},
+                            {"id": "o4", "name": "Review Technical"},
+                            {"id": "o5", "name": "Review Product"},
+                            {"id": "o6", "name": "QA"},
+                            {"id": "o7", "name": "Done"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            {"id": "f1", "name": "Status", "dataType": "SINGLE_SELECT"},
+                            {"id": "f2", "name": "sessionId", "dataType": "TEXT"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    let client = gh_client(&gh_mock);
+    // Project without opencode — opencode/triage/todo/review checks are skipped,
+    // only the setup check runs.
+    let deps = make_deps(Some(client), false, None);
+    let workflow = Workflow::new(deps);
+
+    // One poll cycle should complete without panic.
+    workflow
+        .run_all()
+        .await
+        .expect("run_all should succeed without panic");
+}
+
+// ─── Test 5: write_project_id persists to YAML ────────────────
+
+#[tokio::test]
+async fn test_write_project_id_persists_to_yaml() {
+    let tmp = tempdir().expect("tempdir should succeed");
+    let config_path = tmp.path().join("git-automate.yml");
+
+    // Write a config without projectId.
+    let yaml = r#"
+projects:
+  my-proj:
+    repository: "https://github.com/owner/repo"
+    opencode:
+      url: "http://localhost"
+      pw: "pw"
+"#;
+    std::fs::write(&config_path, yaml).expect("write should succeed");
+
+    // Parse the config so the in-memory BTreeMap has the project entry.
+    let mut config = parse_config(&config_path).expect("parse_config should succeed");
+    assert_eq!(config.projects.get("my-proj").unwrap().project_id, None);
+
+    // write_project_id uses current_dir to find git-automate.yml.
+    let _guard = SET_CWD_MUTEX.lock().unwrap();
+    let original_dir = std::env::current_dir().expect("current_dir should succeed");
+    std::env::set_current_dir(tmp.path()).expect("set_current_dir should succeed");
+
+    write_project_id("my-proj", "PID-999", &mut config)
+        .await
+        .expect("write_project_id should succeed");
+
+    std::env::set_current_dir(&original_dir).expect("restore cwd should succeed");
+
+    // Verify in-memory config updated.
+    assert_eq!(
+        config
+            .projects
+            .get("my-proj")
+            .unwrap()
+            .project_id
+            .as_deref(),
+        Some("PID-999")
+    );
+
+    // Verify on-disk YAML was updated.
+    let written = std::fs::read_to_string(&config_path).expect("read should succeed");
+    let data: serde_yaml::Value =
+        serde_yaml::from_str(&written).expect("yaml parse should succeed");
+    let pid = data
+        .get("projects")
+        .and_then(|p| p.get("my-proj"))
+        .and_then(|p| p.get("projectId"))
+        .and_then(|v| v.as_str())
+        .expect("projectId should exist in YAML");
+    assert_eq!(pid, "PID-999");
+}
+
+// ─── Test 8: Setup initialization creates project, fields, and statuses ───
+//
+// When a project has no `projectId` in config, `run_setup_check` must:
+//   1. Resolve the owner node ID (user/organization query).
+//   2. Create the GitHub Project V2.
+//   3. Persist the new project ID to `git-automate.yml`.
+//   4. Ensure all 7 status options exist on the Status field.
+//   5. Ensure the `sessionId` text field exists on the project.
+//
+// Each GraphQL call is matched by `body_string_contains` on a unique substring
+// so the mocks are mutually exclusive:
+//   - `user(login:`       → get_owner_id query
+//   - `createProjectV2(input` → createProjectV2 mutation (not createProjectV2Field)
+//   - `field(name:`       → get_project_status_field query
+//   - `updateProjectV2FieldConfiguration` → add_project_status_options mutation
+//   - `fields(first:`     → get_project_fields query
+//   - `createProjectV2Field` → add_project_field mutation
+
+#[tokio::test]
+async fn test_setup_initialization_creates_project_fields_and_statuses() {
+    let gh_mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("user(login:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "user": { "id": "owner-node-id" } }
+        })))
+        .expect(1)
+        .named("get_owner_id")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2(input"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "createProjectV2": { "id": "PVT-123" } }
+        })))
+        .expect(1)
+        .named("create_project_v2")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": { "id": "status-field-id", "options": [] }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_status_field")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateProjectV2FieldConfiguration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "updateProjectV2FieldConfiguration": {
+                    "projectV2Field": { "id": "status-field-id" }
+                }
+            }
+        })))
+        .expect(1)
+        .named("add_status_options")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            { "id": "f1", "name": "Status", "dataType": "SINGLE_SELECT" }
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_project_fields")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "createProjectV2Field": { "projectField": { "id": "session-field-id" } }
+            }
+        })))
+        .expect(1)
+        .named("add_session_id_field")
+        .mount(&gh_mock)
+        .await;
+
+    // ── Arrange: config file without projectId ──────────────────
+    let tmp = tempdir().expect("tempdir should succeed");
+    let config_path = tmp.path().join("git-automate.yml");
+    let yaml = r#"
+projects:
+  my-proj:
+    repository: "https://github.com/owner/repo"
+    titlePattern: "@ai.*"
+"#;
+    std::fs::write(&config_path, yaml).expect("write should succeed");
+
+    let config = parse_config(&config_path).expect("parse_config should succeed");
+    assert_eq!(
+        config.projects.get("my-proj").unwrap().project_id,
+        None,
+        "project should start without a projectId"
+    );
+
+    // ── Act ─────────────────────────────────────────────────────
+    let client = gh_client(&gh_mock);
+    let deps = WorkflowContext {
+        config,
+        github: Some(client),
+        shell: mock_shell(),
+    };
+
+    // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
+    let _guard = SET_CWD_MUTEX.lock().unwrap();
+    let original_dir = std::env::current_dir().expect("current_dir should succeed");
+    std::env::set_current_dir(tmp.path()).expect("set_current_dir should succeed");
+
+    let workflow = Workflow::new(deps);
+    let result = workflow.run_setup_check().await;
+
+    std::env::set_current_dir(&original_dir).expect("restore cwd should succeed");
+
+    assert!(result.is_ok(), "run_setup_check should succeed");
+
+    gh_mock.verify().await;
+
+    let written = std::fs::read_to_string(&config_path).expect("read should succeed");
+    let data: serde_yaml::Value =
+        serde_yaml::from_str(&written).expect("yaml parse should succeed");
+    let pid = data
+        .get("projects")
+        .and_then(|p| p.get("my-proj"))
+        .and_then(|p| p.get("projectId"))
+        .and_then(|v| v.as_str())
+        .expect("projectId should exist in YAML after setup");
+    assert_eq!(
+        pid, "PVT-123",
+        "projectId in YAML should match the ID returned by createProjectV2"
+    );
+}
+
+// ─── Test 9: Setup is idempotent when project, all statuses, and sessionId exist ───
+
+#[tokio::test]
+async fn test_setup_initialization_idempotent_when_everything_exists() {
+    let gh_mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": {
+                        "id": "status-field-id",
+                        "options": [
+                            { "id": "o1", "name": "Triage" },
+                            { "id": "o2", "name": "Todo" },
+                            { "id": "o3", "name": "In Development" },
+                            { "id": "o4", "name": "Review Technical" },
+                            { "id": "o5", "name": "Review Product" },
+                            { "id": "o6", "name": "QA" },
+                            { "id": "o7", "name": "Done" },
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_status_field")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateProjectV2FieldConfiguration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "updateProjectV2FieldConfiguration": {
+                    "projectV2Field": { "id": "status-field-id" }
+                }
+            }
+        })))
+        .expect(0)
+        .named("add_status_options_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            { "id": "f1", "name": "Status", "dataType": "SINGLE_SELECT" },
+                            { "id": "f2", "name": "sessionId", "dataType": "TEXT" },
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_project_fields")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "createProjectV2Field": { "projectField": { "id": "session-field-id" } }
+            }
+        })))
+        .expect(0)
+        .named("add_session_id_field_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("user(login:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "user": { "id": "owner-node-id" } }
+        })))
+        .expect(0)
+        .named("get_owner_id_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2(input"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "createProjectV2": { "id": "PVT-999" } }
+        })))
+        .expect(0)
+        .named("create_project_v2_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // ── Arrange: config with projectId already set ──────────────
+    let tmp = tempdir().expect("tempdir should succeed");
+    let config_path = tmp.path().join("git-automate.yml");
+    let yaml = r#"
+projects:
+  my-proj:
+    repository: "https://github.com/owner/repo"
+    projectId: "PID-123"
+    titlePattern: "@ai.*"
+"#;
+    std::fs::write(&config_path, yaml).expect("write should succeed");
+
+    let config = parse_config(&config_path).expect("parse_config should succeed");
+    assert_eq!(
+        config
+            .projects
+            .get("my-proj")
+            .unwrap()
+            .project_id
+            .as_deref(),
+        Some("PID-123"),
+        "project should already have projectId"
+    );
+
+    // ── Act ─────────────────────────────────────────────────────
+    let client = gh_client(&gh_mock);
+    let deps = WorkflowContext {
+        config,
+        github: Some(client),
+        shell: mock_shell(),
+    };
+
+    let workflow = Workflow::new(deps);
+    let result = workflow.run_setup_check().await;
+
+    assert!(result.is_ok(), "run_setup_check should succeed");
+
+    gh_mock.verify().await;
+}
+
+// ─── Test 10: Setup adds missing status options and sessionId field ───
+//
+// When the project already has an ID but is missing some status options
+// and has no sessionId field, setup should add the missing options and
+// create the sessionId field — without creating a new project.
+
+#[tokio::test]
+async fn test_setup_initialization_adds_missing_status_options_and_field() {
+    let gh_mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": {
+                        "id": "status-field-id",
+                        "options": [
+                            { "id": "o1", "name": "Triage" },
+                            { "id": "o2", "name": "Todo" },
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_status_field")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateProjectV2FieldConfiguration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "updateProjectV2FieldConfiguration": {
+                    "projectV2Field": { "id": "status-field-id" }
+                }
+            }
+        })))
+        .expect(1)
+        .named("add_status_options")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            { "id": "f1", "name": "Status", "dataType": "SINGLE_SELECT" }
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_project_fields")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "createProjectV2Field": { "projectField": { "id": "session-field-id" } }
+            }
+        })))
+        .expect(1)
+        .named("add_session_id_field")
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2(input"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "createProjectV2": { "id": "PVT-999" } }
+        })))
+        .expect(0)
+        .named("create_project_v2_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // ── Arrange: config with projectId, missing some statuses + no sessionId
+    let tmp = tempdir().expect("tempdir should succeed");
+    let config_path = tmp.path().join("git-automate.yml");
+    let yaml = r#"
+projects:
+  my-proj:
+    repository: "https://github.com/owner/repo"
+    projectId: "PID-123"
+    titlePattern: "@ai.*"
+"#;
+    std::fs::write(&config_path, yaml).expect("write should succeed");
+
+    let config = parse_config(&config_path).expect("parse_config should succeed");
+    assert_eq!(
+        config
+            .projects
+            .get("my-proj")
+            .unwrap()
+            .project_id
+            .as_deref(),
+        Some("PID-123")
+    );
+
+    // ── Act ─────────────────────────────────────────────────────
+    let client = gh_client(&gh_mock);
+    let deps = WorkflowContext {
+        config,
+        github: Some(client),
+        shell: mock_shell(),
+    };
+
+    let workflow = Workflow::new(deps);
+    let result = workflow.run_setup_check().await;
+
+    // ── Assert ──────────────────────────────────────────────────
+    assert!(result.is_ok(), "run_setup_check should succeed");
+
+    gh_mock.verify().await;
+}

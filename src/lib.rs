@@ -2,7 +2,6 @@
 //! via OpenCode agent sessions.
 
 pub mod config;
-pub mod issues;
 pub mod shell;
 
 pub mod external_agent;

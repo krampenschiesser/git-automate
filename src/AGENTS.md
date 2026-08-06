@@ -7,11 +7,10 @@ All Rust source is flat in this directory. Submodules are in `src/external_issue
 | File/Dir | Role | Key Exports |
 |----------|------|-------------|
 | `lib.rs` | Library entry point, test utilities | `test_utils::SET_CWD_MUTEX` |
-| `main.rs` | Daemon CLI (clap), polling loop, signal handling | `main()`, `Cli`, `serve()`, `check_health()` |
+| `main.rs` | Daemon CLI (clap), polling loop, signal handling, tracing init | `main()`, `Cli`, `serve()`, `check_health()`, `init_tracing()`, `GitAutomateFormatLayer` |
 | `config.rs` | YAML config + `${env:VAR}` substitution | `ProjectConfig`, `GitAutomateConfig`, `parse_config()`, `load_config()` |
-| `main.rs` | Tracing init (`init_tracing()`) + daemon CLI | `init_tracing()`, `GitAutomateFormatLayer` |
 | `shell.rs` | Shell command execution abstraction | `ShellFn`, `ShellOutput` |
-| `external_issues/` | GitHub API client (GraphQL + REST via reqwest) | `GitHubClient`, `parse_repository_url()`, domain types |
+| `external_issues/` | External issue sources — abstraction + GitHub impl | `ExternalIssue`, `ExternalIssueError`, `ExternalIssueSource` (common); `GitHubClient`, `GitHubIssueSource`, `GitHubError` (github) |
 | `external_agent/` | OpenCode HTTP client | `OpenCodeClient`, `Agent`, `AgentInfo`, `Session`, `PromptPart` |
 | `workflow/` | Workflow engine | `Workflow` struct, `run_triage_check()`, `run_todo_check()`, `run_review_check()`, `WorkflowContext`, `ProjectContext` |
 | `assets/` | Embedded prompt/agent templates | 6 prompts + 6 `.agent.md` files (via `include_str!`) |

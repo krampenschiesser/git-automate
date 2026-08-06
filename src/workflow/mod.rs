@@ -1,4 +1,4 @@
-//! Workflow orchestrator — port of `src/workflow.ts`.
+//! Workflow orchestrator.
 //!
 //! The [`Workflow`] struct ties together all workflow checks in sequence:
 //! setup → opencode → triage → todo → review. Each public `run_*_check`
@@ -9,10 +9,10 @@ pub mod checks;
 pub mod helpers;
 
 use crate::config::ProjectConfig;
-use crate::external_agent::client::OpenCodeClient;
-use crate::external_agent::types::AgentInfo;
-use crate::external_issues::repo::parse_repository_url;
-use crate::external_issues::types::ParsedRepo;
+use crate::external_agent::opencode::AgentInfo;
+use crate::external_agent::opencode::OpenCodeClient;
+use crate::external_issues::github::repo::parse_repository_url;
+use crate::external_issues::github::types::ParsedRepo;
 
 use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
 use self::helpers::{
@@ -22,7 +22,7 @@ use self::helpers::{
 // ─── Constants ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-pub enum AgentName {
+pub enum AgentName { //fixme rename to Agent
     Triage,
     TaskManager,
     Developer,
@@ -32,7 +32,7 @@ pub enum AgentName {
 }
 
 impl AgentName {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str { //fixme implement trait instead of a custom method
         match self {
             AgentName::Triage => "git-automate-triage",
             AgentName::TaskManager => "git-automate-taskmanager",
@@ -45,9 +45,7 @@ impl AgentName {
 }
 
 /// The six required OpenCode agents that must be installed.
-///
-/// Equivalent to `REQUIRED_AGENTS` in `src/workflow.ts`.
-pub const REQUIRED_AGENTS: [AgentName; 6] = [
+pub const REQUIRED_AGENTS: [AgentName; 6] = [//fixme remove this, use the enum
     AgentName::Triage,
     AgentName::TaskManager,
     AgentName::Developer,
@@ -57,8 +55,6 @@ pub const REQUIRED_AGENTS: [AgentName; 6] = [
 ];
 
 /// The seven workflow status options.
-///
-/// Equivalent to `STATUS_OPTIONS` in `src/workflow.ts` (now an enum).
 #[derive(Clone, Copy)]
 pub enum WorkflowStatus {
     Triage,
@@ -71,7 +67,7 @@ pub enum WorkflowStatus {
 }
 
 impl WorkflowStatus {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str { //fixme implement trait
         match self {
             WorkflowStatus::Triage => "Triage",
             WorkflowStatus::Todo => "Todo",
@@ -99,8 +95,6 @@ impl WorkflowStatus {
 // ─── Workflow ──────────────────────────────────────────────────
 
 /// Orchestrator that runs workflow checks in sequence.
-///
-/// Equivalent to the `Workflow` class from `src/workflow.ts`.
 pub struct Workflow {
     deps: WorkflowContext,
 }
@@ -109,7 +103,7 @@ pub struct Workflow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowStep {
     Setup,
-    OpencodeCheck,
+    OpencodeCheck, //fixme this should be independent of opencode and just use the abstraction layer
     Triage,
     Todo,
     Review,
@@ -176,7 +170,7 @@ impl Workflow {
 
     /// For each project with an OpenCode config: check server health and
     /// verify required agents are present.
-    pub async fn run_opencode_check(&self) -> Result<(), WorkflowError> {
+    pub async fn run_opencode_check(&self) -> Result<(), WorkflowError> {//fixme this should be independent of opencode and just use the abstraction layer
         for (project_name, project_config) in &self.deps.config.projects {
             let Some(opencode) = &project_config.opencode else {
                 continue;
@@ -425,7 +419,7 @@ impl Workflow {
 mod tests {
     use super::*;
     use crate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig};
-    use crate::external_issues::client::GitHubClient;
+    use crate::external_issues::github::client::GitHubClient;
     use crate::shell::{ShellFn, ShellOutput};
     use crate::workflow::helpers::LogCapture;
     use std::collections::BTreeMap;
@@ -458,6 +452,7 @@ mod tests {
         WorkflowContext {
             config: GitAutomateConfig {
                 projects: BTreeMap::new(),
+                concurrency: None,
             },
             github,
             shell: mock_shell(),
@@ -472,6 +467,10 @@ mod tests {
             directory: None,
             opencode: None,
             issue_provider: Some("github".to_string()),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
         }
     }
 
@@ -524,13 +523,20 @@ mod tests {
                 pw: "test-pw".to_string(),
             }),
             issue_provider: Some("github".to_string()),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
         };
         let mut projects = BTreeMap::new();
         projects.insert("test-proj".to_string(), project);
 
         let capture = LogCapture::install();
         let deps = WorkflowContext {
-            config: GitAutomateConfig { projects },
+            config: GitAutomateConfig {
+                projects,
+                concurrency: None,
+            },
             github: None,
             shell: mock_shell(),
         };
@@ -654,12 +660,19 @@ mod tests {
             directory: None,
             opencode: None,
             issue_provider: Some("github".to_string()),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
         };
         let mut projects = BTreeMap::new();
         projects.insert("test-proj".to_string(), project.clone());
 
         let deps = WorkflowContext {
-            config: GitAutomateConfig { projects },
+            config: GitAutomateConfig {
+                projects,
+                concurrency: None,
+            },
             github: Some(client),
             shell: mock_shell(),
         };
@@ -704,13 +717,20 @@ mod tests {
             directory: None,
             opencode: None,
             issue_provider: Some("github".to_string()),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
         };
         let mut projects = BTreeMap::new();
         projects.insert("proj-a".to_string(), project);
 
         let capture = LogCapture::install();
         let deps = WorkflowContext {
-            config: GitAutomateConfig { projects },
+            config: GitAutomateConfig {
+                projects,
+                concurrency: None,
+            },
             github: Some(client),
             shell: mock_shell(),
         };
@@ -739,7 +759,10 @@ mod tests {
         projects.insert("no-opencode-proj".to_string(), project);
 
         let deps = WorkflowContext {
-            config: GitAutomateConfig { projects },
+            config: GitAutomateConfig {
+                projects,
+                concurrency: None,
+            },
             github: Some(client),
             shell: mock_shell(),
         };
@@ -849,6 +872,10 @@ mod tests {
             directory: None,
             opencode: None,
             issue_provider: Some("github".to_string()),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
         };
 
         let deps = WorkflowContext {
@@ -858,6 +885,7 @@ mod tests {
                     m.insert("test-proj".to_string(), project.clone());
                     m
                 },
+                concurrency: None,
             },
             github: Some(client),
             shell: mock_shell(),
@@ -943,6 +971,10 @@ mod tests {
             directory: None,
             opencode: None,
             issue_provider: Some("github".to_string()),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
         };
 
         let deps = WorkflowContext {
@@ -952,6 +984,7 @@ mod tests {
                     m.insert("test-proj".to_string(), project.clone());
                     m
                 },
+                concurrency: None,
             },
             github: Some(client),
             shell: mock_shell(),

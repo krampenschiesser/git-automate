@@ -1,70 +1,21 @@
-//! Abstraction layer over external AI agent APIs (e.g. OpenCode).
+//! OpenCode implementation of the [`ExternalAgent`] trait.
 //!
-//! Defines the [`ExternalAgent`] trait — a provider-agnostic interface for
-//! managing AI agent sessions — and implements it for [`OpenCodeClient`].
-//! Each implementation maps the trait's canonical operations to the
-//! underlying provider's HTTP endpoints.
+//! Contains the `impl ExternalAgent for OpenCodeClient` block, the
+//! `extract_shell_output` helper, OpenCode-specific deserialisation types
+//! (`SessionStatusMap`, `OpenCodeSessionStatus`), and the `From<Session> for
+//! SessionInfo` projection. All tests for the trait implementation live here.
 
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use thiserror::Error;
 
-use crate::external_agent::client::OpenCodeClient;
-use crate::external_agent::types::Session;
+use crate::external_agent::common::{
+    AgentSessionStatus, ExternalAgent, ExternalAgentError, SessionInfo,
+};
+use crate::external_agent::opencode::client::OpenCodeClient;
+use crate::external_agent::opencode::types::Session;
 
-// ─── Error type ────────────────────────────────────────────────
-
-/// Errors that can occur while operating an [`ExternalAgent`].
-#[derive(Debug, Error)]
-pub enum ExternalAgentError {
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("HTTP status {0}")]
-    HttpStatus(u16),
-    #[error("Failed to parse response: {0}")]
-    Parse(String),
-    #[error("Session not found: {0}")]
-    SessionNotFound(String),
-    #[error("Failed to start session: {0}")]
-    StartSession(String),
-    #[error("Failed to execute shell command: {0}")]
-    ShellCommand(String),
-    #[error("Failed to get session status: {0}")]
-    SessionStatus(String),
-    #[error("Failed to nudge session: {0}")]
-    Nudge(String),
-    #[error("Failed to list sessions: {0}")]
-    ListSessions(String),
-    #[error("Failed to get session: {0}")]
-    GetSession(String),
-}
-
-// ─── Canonical types ───────────────────────────────────────────
-
-/// Status of an agent session from the daemon's perspective.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentSessionStatus {
-    /// Session has completed its work (or was removed).
-    Done,
-    /// Session is actively running or awaiting retry.
-    Waiting,
-    /// Session is idle and available.
-    Idle,
-}
-
-/// Canonical session representation returned by any [`ExternalAgent`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionInfo {
-    /// Unique session identifier.
-    pub id: String,
-    /// Human-readable session title.
-    pub title: String,
-    /// Working directory for the session.
-    pub directory: String,
-    /// Project ID the session belongs to.
-    pub project_id: String,
-}
+// ─── From<Session> for SessionInfo ─────────────────────────────
 
 impl From<Session> for SessionInfo {
     fn from(session: Session) -> Self {
@@ -86,7 +37,7 @@ struct SessionStatusMap {
     sessions: std::collections::HashMap<String, OpenCodeSessionStatus>,
 }
 
-/// Mirrors the TypeScript `SessionStatus` union from the OpenCode SDK:
+/// The session status union:
 /// `{ type: "idle" } | { type: "busy" } | { type: "retry", ... }`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -100,58 +51,7 @@ enum OpenCodeSessionStatus {
     },
 }
 
-// ─── The trait ─────────────────────────────────────────────────
-
-/// Abstraction over any external AI agent server (OpenCode, Claude-Code, etc.).
-///
-/// Implementations translate the provider-agnostic operations below into the
-/// underlying provider's HTTP API calls. The trait is `Send + Sync` so it can
-/// be held behind an `Arc` in async workflow code.
-pub trait ExternalAgent: Send + Sync {
-    /// Start a session for *project_key* with the given system and user prompts.
-    ///
-    /// *project_key* is typically a working-directory path or project identifier.
-    /// Returns the new session's ID.
-    fn start_session(
-        &self,
-        project_key: &str,
-        system_prompt: &str,
-        user_prompt: &str,
-    ) -> impl std::future::Future<Output = Result<String, ExternalAgentError>> + Send;
-
-    /// Execute *command* (e.g. `git commit`, `cargo test`) inside an existing session.
-    fn execute_shell(
-        &self,
-        session_id: &str,
-        command: &str,
-    ) -> impl std::future::Future<Output = Result<String, ExternalAgentError>> + Send;
-
-    /// Check whether a session is [`AgentSessionStatus::Done`],
-    /// [`AgentSessionStatus::Waiting`], or [`AgentSessionStatus::Idle`].
-    fn session_status(
-        &self,
-        session_id: &str,
-    ) -> impl std::future::Future<Output = Result<AgentSessionStatus, ExternalAgentError>> + Send;
-
-    /// Nudge a session to continue processing (e.g. wake a waiting/idle session).
-    fn nudge_session(
-        &self,
-        session_id: &str,
-    ) -> impl std::future::Future<Output = Result<(), ExternalAgentError>> + Send;
-
-    /// Retrieve a session by ID. Returns `None` if the session does not exist.
-    fn get_session(
-        &self,
-        session_id: &str,
-    ) -> impl std::future::Future<Output = Result<Option<SessionInfo>, ExternalAgentError>> + Send;
-
-    /// List all sessions known to the agent server.
-    fn list_sessions(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<SessionInfo>, ExternalAgentError>> + Send;
-}
-
-// ─── Implementation for OpenCodeClient ─────────────────────────
+// ─── Helper: extract text output from shell-command response ───
 
 /// Internal helper: extract text output from a shell-command response body.
 ///
@@ -204,6 +104,8 @@ fn extract_shell_output(body: &Value) -> String {
 
     output
 }
+
+// ─── Implementation for OpenCodeClient ─────────────────────────
 
 impl ExternalAgent for OpenCodeClient {
     fn start_session(
@@ -453,7 +355,7 @@ impl ExternalAgent for OpenCodeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_agent::client::encode_basic_auth;
+    use crate::external_agent::opencode::encode_basic_auth;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1071,7 +973,7 @@ mod tests {
             directory: "/proj".to_string(),
             title: "Title".to_string(),
             version: "1".to_string(),
-            time: crate::external_agent::types::SessionTime {
+            time: crate::external_agent::opencode::types::SessionTime {
                 created: 1,
                 updated: 2,
             },
@@ -1137,7 +1039,7 @@ mod tests {
         assert_eq!(extract_shell_output(&body), "visible");
     }
 
-    // ── Auth header on all requests ─────────────────────────────
+    // ── Auth header on all agent endpoints ──────────────────────
 
     // Test 34: auth header sent on all agent endpoints
     #[tokio::test]
