@@ -3,6 +3,7 @@
 .vscode
 .codegraph
 .omo
+docs/book/
 
 # Added by cargo
 #
