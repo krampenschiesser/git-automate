@@ -281,6 +281,50 @@ pub struct IdHolder {
     pub id: String,
 }
 
+/// Owner type returned by the GitHub REST API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OwnerType {
+    User,
+    Organization,
+}
+
+impl TryFrom<String> for OwnerType {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "User" => Ok(OwnerType::User),
+            "Organization" => Ok(OwnerType::Organization),
+            other => Err(format!("Unknown owner type: {other}")),
+        }
+    }
+}
+
+/// Owner info from `GET /repos/{owner}/{repo}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct RestRepoOwner {
+    pub login: String,
+    #[serde(rename = "type")]
+    pub owner_type: String,
+}
+
+/// Full repository response from `GET /repos/{owner}/{repo}` including owner.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct RestRepoWithOwner {
+    pub owner: RestRepoOwner,
+}
+
+/// A Project V2 item returned by `GET /orgs/{org}/projectsV2` or `GET /users/{username}/projectsV2`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct RestProjectsV2Item {
+    pub id: i64,
+    #[serde(rename = "node_id")]
+    pub node_id: Option<String>,
+    pub number: i64,
+    pub title: String,
+    pub state: String,
+}
+
 // ─── Issue hierarchy (GraphQL) ────────────────────────────────
 
 /// A single issue node with its parent issue number (if any).

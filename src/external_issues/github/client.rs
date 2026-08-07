@@ -30,6 +30,8 @@ pub enum GitHubError {
     ProjectNotFound(String),
     #[error("Could not resolve owner node ID for: {0}")]
     OwnerNotFound(String),
+    #[error("Unknown owner type: {0}")]
+    UnknownOwnerType(String),
     #[error("{0}")]
     Other(String),
 }
@@ -726,6 +728,53 @@ impl GitHubClient {
             Err(e) => Err(e),
         }
     }
+
+    /// Determine whether the owner of a repository is a "User" or "Organization".
+    /// Uses GET /repos/{owner}/{repo} REST endpoint.
+    pub async fn get_repo_owner_type(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<OwnerType, GitHubError> {
+        let path = format!("/repos/{}/{}", owner, repo);
+        let data = self.rest_get(&path, None).await?;
+        let result: RestRepoWithOwner = serde_json::from_value(data)?;
+        match result.owner.owner_type.as_str() {
+            "User" => Ok(OwnerType::User),
+            "Organization" => Ok(OwnerType::Organization),
+            other => Err(GitHubError::UnknownOwnerType(other.to_string())),
+        }
+    }
+
+    /// List all Projects V2 that reference items from the given repository.
+    /// Automatically determines whether the owner is a user or organization,
+    /// then calls the appropriate REST endpoint.
+    pub async fn list_repo_projects_v2(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<ProjectV2Summary>, GitHubError> {
+        let owner_type = self.get_repo_owner_type(owner, repo).await?;
+        let q = format!("repo:{}/{}", owner, repo);
+        let path = match owner_type {
+            OwnerType::User => format!("/users/{}/projectsV2", owner),
+            OwnerType::Organization => format!("/orgs/{}/projectsV2", owner),
+        };
+        let data = self.rest_get(&path, Some(&q)).await?;
+        let items: Vec<RestProjectsV2Item> = serde_json::from_value(data)?;
+        let summaries = items
+            .into_iter()
+            .map(|item| {
+                let id = item.node_id.unwrap_or_else(|| item.id.to_string());
+                ProjectV2Summary {
+                    id,
+                    number: item.number.to_string(),
+                    title: item.title,
+                }
+            })
+            .collect();
+        Ok(summaries)
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────
@@ -1408,5 +1457,148 @@ mod tests {
 
         let result = client.list_issues_with_parents("owner", "repo").await;
         assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
+    }
+
+    // ── Owner type + Projects V2 listing (REST) ──────────────────
+
+    /// Test 26: get_repo_owner_type Organization → OwnerType::Organization
+    #[tokio::test]
+    async fn get_repo_owner_type_organization_returns_owner_type() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "owner": { "login": "owner", "type": "Organization" }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.get_repo_owner_type("owner", "repo").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), OwnerType::Organization);
+    }
+
+    /// Test 27: get_repo_owner_type User → OwnerType::User
+    #[tokio::test]
+    async fn get_repo_owner_type_user_returns_owner_type() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "owner": { "login": "owner", "type": "User" }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.get_repo_owner_type("owner", "repo").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), OwnerType::User);
+    }
+
+    /// Test 28: get_repo_owner_type unknown type → Err(UnknownOwnerType)
+    #[tokio::test]
+    async fn get_repo_owner_type_unknown_type_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "owner": { "login": "owner", "type": "Bot" }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.get_repo_owner_type("owner", "repo").await;
+        assert!(matches!(
+            result,
+            Err(GitHubError::UnknownOwnerType(ref t)) if t == "Bot"
+        ));
+    }
+
+    /// Test 29: list_repo_projects_v2 org owner → calls /orgs path, not /users
+    #[tokio::test]
+    async fn list_repo_projects_v2_org_owner_returns_summaries() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "owner": { "login": "owner", "type": "Organization" }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/orgs/owner/projectsV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "id": 1, "node_id": "PVT_1", "number": 3, "title": "Project Board", "state": "open" }
+            ])))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/users/owner/projectsV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let summaries = client
+            .list_repo_projects_v2("owner", "repo")
+            .await
+            .expect("should succeed");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "PVT_1");
+        assert_eq!(summaries[0].number, "3");
+        assert_eq!(summaries[0].title, "Project Board");
+
+        mock.verify().await;
+    }
+
+    /// Test 30: list_repo_projects_v2 user owner → calls /users path, not /orgs
+    #[tokio::test]
+    async fn list_repo_projects_v2_user_owner_returns_summaries() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "owner": { "login": "owner", "type": "User" }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/users/owner/projectsV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "id": 2, "node_id": "PVT_2", "number": 5, "title": "Personal Board", "state": "open" }
+            ])))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/orgs/owner/projectsV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let summaries = client
+            .list_repo_projects_v2("owner", "repo")
+            .await
+            .expect("should succeed");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "PVT_2");
+        assert_eq!(summaries[0].number, "5");
+        assert_eq!(summaries[0].title, "Personal Board");
+
+        mock.verify().await;
     }
 }
