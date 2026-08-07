@@ -1176,9 +1176,26 @@ mod tests {
 mod log_capture_test {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::sync::OnceLock;
     use tracing::Subscriber;
     use tracing::field::Visit;
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    /// Ensures a global subscriber is installed so that all tracing callsites
+    /// are registered with `Interest::Always`.
+    ///
+    /// Without this, callsites first encountered while no subscriber is set
+    /// may be cached with `Interest::Never`, causing their events to be
+    /// silently dropped for the rest of the process — even after a
+    /// thread-local subscriber (via `set_default`) is installed.
+    /// `set_global_default` invalidates that global `Interest` cache.
+    static GLOBAL_SUBSCRIBER: OnceLock<()> = OnceLock::new();
+
+    fn ensure_global_subscriber() {
+        GLOBAL_SUBSCRIBER.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
 
     #[derive(Clone, Default)]
     pub struct SharedBuffer(pub Arc<StdMutex<Vec<String>>>);
@@ -1237,6 +1254,7 @@ mod log_capture_test {
 
     impl LogCapture {
         pub fn install() -> Self {
+            ensure_global_subscriber();
             let buffer = SharedBuffer::default();
             let layer = CapturingLayer {
                 buffer: buffer.clone(),
