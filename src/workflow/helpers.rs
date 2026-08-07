@@ -157,6 +157,26 @@ pub fn load_prompt_template(name: &str) -> Result<String, WorkflowError> {
     Ok(content.to_string())
 }
 
+/// Load an embedded agent definition file by short name.
+///
+/// Mirrors [`load_prompt_template`] but reads from `src/assets/agents/`.
+/// Uses `include_str!` — no runtime file access.
+///
+/// # Errors
+/// Returns `WorkflowError::TemplateNotFound` for unknown names.
+pub fn load_agent_template(name: &str) -> Result<String, WorkflowError> {
+    let content = match name {
+        "triage" => include_str!("../assets/agents/git-automate-triage.agent.md"),
+        "taskmanager" => include_str!("../assets/agents/git-automate-taskmanager.agent.md"),
+        "developer" => include_str!("../assets/agents/git-automate-developer.agent.md"),
+        "reviewer" => include_str!("../assets/agents/git-automate-reviewer.agent.md"),
+        "product" => include_str!("../assets/agents/git-automate-product.agent.md"),
+        "qa" => include_str!("../assets/agents/git-automate-qa.agent.md"),
+        _ => return Err(WorkflowError::TemplateNotFound(name.to_string())),
+    };
+    Ok(content.to_string())
+}
+
 /// Replace every `{{KEY}}` occurrence in *template* with the corresponding
 /// value from *values*. Unknown keys are replaced with an empty string.
 ///
@@ -476,6 +496,32 @@ mod tests {
     #[test]
     fn load_prompt_template_nonexistent() {
         let result = load_prompt_template("nonexistent");
+        assert!(matches!(
+            result,
+            Err(WorkflowError::TemplateNotFound(name)) if name == "nonexistent"
+        ));
+    }
+
+    // ── load_agent_template tests ──────────────────────────────
+
+    // Test 5: load_agent_template("triage") → returns content containing YAML frontmatter
+    #[test]
+    fn load_agent_template_triage() {
+        let content = load_agent_template("triage").expect("triage agent should load");
+        assert!(
+            content.contains("git-automate-triage"),
+            "triage agent should contain its name"
+        );
+        assert!(
+            content.contains("subagent"),
+            "triage agent should contain mode: subagent"
+        );
+    }
+
+    // Test 6: load_agent_template("nonexistent") → Err(TemplateNotFound)
+    #[test]
+    fn load_agent_template_nonexistent() {
+        let result = load_agent_template("nonexistent");
         assert!(matches!(
             result,
             Err(WorkflowError::TemplateNotFound(name)) if name == "nonexistent"
