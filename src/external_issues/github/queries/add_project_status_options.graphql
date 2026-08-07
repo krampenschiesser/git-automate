@@ -1,0 +1,16 @@
+mutation AddProjectStatusOptions($input: UpdateProjectV2FieldInput!) {
+    updateProjectV2Field(input: $input) {
+        projectV2Field {
+            __typename
+            ... on ProjectV2Field {
+                id
+            }
+            ... on ProjectV2IterationField {
+                id
+            }
+            ... on ProjectV2SingleSelectField {
+                id
+            }
+        }
+    }
+}

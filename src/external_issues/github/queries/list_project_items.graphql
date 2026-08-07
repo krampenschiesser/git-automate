@@ -1,0 +1,26 @@
+query ListProjectItems($id: ID!) {
+    node(id: $id) {
+        __typename
+        ... on ProjectV2 {
+            items(first: 100) {
+                nodes {
+                    id
+                    content {
+                        __typename
+                        ... on DraftIssue {
+                            id
+                        }
+                        ... on Issue {
+                            id
+                            number
+                        }
+                        ... on PullRequest {
+                            id
+                            number
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

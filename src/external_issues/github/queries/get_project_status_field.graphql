@@ -1,0 +1,17 @@
+query GetProjectStatusField($id: ID!, $name: String!) {
+    node(id: $id) {
+        __typename
+        ... on ProjectV2 {
+            field(name: $name) {
+                __typename
+                ... on ProjectV2SingleSelectField {
+                    id
+                    options {
+                        id
+                        name
+                    }
+                }
+            }
+        }
+    }
+}
