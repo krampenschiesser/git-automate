@@ -50,8 +50,13 @@ enum Commands {
         #[arg(long)]
         pw: String,
     },
+    /// Check project setup, OpenCode health, and copy missing agents
+    Doctor {
+        /// Path to the git-automate.yml config file
+        #[arg(long, default_value = git_automate::config::DEFAULT_CONFIG_FILE)]
+        config: PathBuf,
+    },
 }
-
 
 // ─── Entry point ─────────────────────────────────────────────
 
@@ -64,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Serve { config } => serve(&config).await,
         Commands::Health { url, pw } => check_health(&url, &pw).await,
+        Commands::Doctor { config } => doctor(&config).await,
     }
 }
 
@@ -77,9 +83,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error>> {
     let config = parse_config(config_path)?;
 
-    let token = std::env::var("GITHUB_TOKEN").map_err(|_| {
-        "GITHUB_TOKEN environment variable is not set — cannot start daemon"
-    })?;
+    let token = std::env::var("GITHUB_TOKEN")
+        .map_err(|_| "GITHUB_TOKEN environment variable is not set — cannot start daemon")?;
     if token.is_empty() {
         return Err("GITHUB_TOKEN environment variable is empty — cannot start daemon".into());
     }
@@ -89,6 +94,32 @@ async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error
     let deps = WorkflowContext {
         config,
         github: Some(github),
+        shell,
+    };
+    let workflow = Workflow::new(deps);
+
+    Ok(workflow)
+}
+
+// ─── doctor_setup ────────────────────────────────────────────
+
+/// Like [`setup`], but treats `GITHUB_TOKEN` as optional — warns and
+/// continues with `github: None` when the token is unset or empty.
+async fn doctor_setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error>> {
+    let config = parse_config(config_path)?;
+
+    let github = match std::env::var("GITHUB_TOKEN") {
+        Ok(token) if !token.is_empty() => Some(GitHubClient::new(token)?),
+        _ => {
+            tracing::warn!("GITHUB_TOKEN not set or empty — GitHub checks will be skipped");
+            None
+        }
+    };
+
+    let shell = create_shell_fn();
+    let deps = WorkflowContext {
+        config,
+        github,
         shell,
     };
     let workflow = Workflow::new(deps);
@@ -139,6 +170,20 @@ async fn check_health(url: &str, pw: &str) -> Result<(), Box<dyn std::error::Err
         tracing::error!("not healthy");
         Err("OpenCode server is not healthy".into())
     }
+}
+
+// ─── doctor ────────────────────────────────────────────────
+
+/// Run a one-shot doctor check (no polling loop).
+async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let workflow = doctor_setup(config_path).await?;
+
+    tracing::info!("Running doctor checks");
+    if let Err(e) = workflow.run_doctor_check().await {
+        tracing::error!("Doctor check failed: {}", e);
+    }
+
+    Ok(())
 }
 
 // ─── Tests ───────────────────────────────────────────────────
@@ -300,5 +345,70 @@ mod tests {
             msg.contains("not healthy"),
             "error message should mention 'not healthy': {msg}"
         );
+    }
+
+    // T-n: doctor_setup without GITHUB_TOKEN → warns, github=None, succeeds
+    #[tokio::test]
+    async fn doctor_setup_no_github_token_warns() {
+        let _guard = ENV_LOCK.lock().await;
+        let saved = std::env::var("GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("git-automate.yml");
+        std::fs::write(
+            &config_path,
+            "projects:\n  test:\n    repository: owner/repo\n",
+        )
+        .expect("write config");
+
+        let result = doctor_setup(&config_path).await;
+        assert!(
+            result.is_ok(),
+            "doctor_setup should succeed without GITHUB_TOKEN"
+        );
+
+        if let Some(val) = saved {
+            unsafe {
+                std::env::set_var("GITHUB_TOKEN", val);
+            }
+        }
+    }
+
+    // T-n: doctor_setup with GITHUB_TOKEN → succeeds, github=Some
+    #[tokio::test]
+    async fn doctor_setup_with_github_token_succeeds() {
+        let _guard = ENV_LOCK.lock().await;
+        let saved = std::env::var("GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "ghp_testtoken123456789");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("git-automate.yml");
+        std::fs::write(
+            &config_path,
+            "projects:\n  test:\n    repository: owner/repo\n",
+        )
+        .expect("write config");
+
+        let result = doctor_setup(&config_path).await;
+        assert!(
+            result.is_ok(),
+            "doctor_setup should succeed: {:?}",
+            result.err()
+        );
+
+        if let Some(val) = saved {
+            unsafe {
+                std::env::set_var("GITHUB_TOKEN", val);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("GITHUB_TOKEN");
+            }
+        }
     }
 }
