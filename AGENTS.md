@@ -3,6 +3,7 @@
 **Generated:** 2026-08-05
 **Commit:** 3bcfa39 (main)
 
+
 use the `sks-rust-basic` skill for writing code, tests or reviewing those.
 
 ## OVERVIEW
