@@ -1,0 +1,7 @@
+mutation CreateProject($input: CreateProjectV2Input!) {
+    createProjectV2(input: $input) {
+        projectV2 {
+            id
+        }
+    }
+}

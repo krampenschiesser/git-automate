@@ -1,0 +1,19 @@
+query GetProjectItemValues($id: ID!) {
+    node(id: $id) {
+        __typename
+        ... on ProjectV2Item {
+            fieldValues(first: 100) {
+                nodes {
+                    __typename
+                    ... on ProjectV2ItemFieldTextValue {
+                        text
+                    }
+                    ... on ProjectV2ItemFieldSingleSelectValue {
+                        name
+                        optionId
+                    }
+                }
+            }
+        }
+    }
+}
