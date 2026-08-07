@@ -1118,8 +1118,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_string_contains("field(name:"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1)
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "Internal Server Error"
+            })))
+            .expect(4)
             .mount(&server)
             .await;
 
