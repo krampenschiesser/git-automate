@@ -294,7 +294,7 @@ impl Workflow {
                 continue;
             }
             let oc = self.opencode_config(project_config);
-            if let Err(e) = self.copy_missing_agents(&oc).await {
+            if let Err(e) = self.check_agents_and_create_if_missing(&oc).await {
                 tracing::error!("Doctor check failed for {}: {}", project_name, e);
             }
         }
@@ -429,12 +429,10 @@ impl Workflow {
         Ok(())
     }
 
-    /// Copy missing agent definition files to `~/.opencode/agents/`.
-    ///
-    /// Checks OpenCode server health, lists available agents for the
-    /// configured directory, and writes any missing required agent
-    /// definitions from embedded templates.
-    async fn copy_missing_agents(&self, oc: &OpencodeSessionConfig) -> Result<(), WorkflowError> {
+    async fn check_agents_and_create_if_missing(
+        &self,
+        oc: &OpencodeSessionConfig,
+    ) -> Result<(), WorkflowError> {
         let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
 
         if !client.check_health().await {
@@ -589,7 +587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_missing_agents_writes_files() {
+    async fn check_agents_and_create_if_missing_writes_files() {
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let saved_home = std::env::var("HOME").ok();
@@ -637,10 +635,10 @@ mod tests {
             directory: None,
         };
 
-        let result = workflow.copy_missing_agents(&oc).await;
+        let result = workflow.check_agents_and_create_if_missing(&oc).await;
         assert!(
             result.is_ok(),
-            "copy_missing_agents should succeed: {:?}",
+            "check_agents_and_create_if_missing should succeed: {:?}",
             result.err()
         );
 
