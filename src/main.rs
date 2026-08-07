@@ -52,7 +52,6 @@ enum Commands {
     },
 }
 
-
 // ─── Entry point ─────────────────────────────────────────────
 
 #[tokio::main]
@@ -77,9 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error>> {
     let config = parse_config(config_path)?;
 
-    let token = std::env::var("GITHUB_TOKEN").map_err(|_| {
-        "GITHUB_TOKEN environment variable is not set — cannot start daemon"
-    })?;
+    let token = std::env::var("GITHUB_TOKEN")
+        .map_err(|_| "GITHUB_TOKEN environment variable is not set — cannot start daemon")?;
     if token.is_empty() {
         return Err("GITHUB_TOKEN environment variable is empty — cannot start daemon".into());
     }
