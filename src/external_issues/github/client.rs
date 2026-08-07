@@ -2,9 +2,9 @@
 //! Authentication uses a personal access token. GraphQL requests go to
 //! `https://api.github.com/graphql`; REST requests go to `https://api.github.com/`.
 //!
-//! Uses octocrab (v0.54) as the HTTP transport. Low-level `_get` / `_post`
-//! calls bypass octocrab's error mapping so status codes and response bodies
-//! can be inspected directly, matching the behaviour previously on reqwest.
+//! Uses octocrab (v0.54) as the HTTP transport. GraphQL operations use
+//! octocrab's built-in `graphql()` method; REST operations use low-level
+//! `_get` / `_post` calls for direct status code and body inspection.
 
 use super::types::*;
 use octocrab::Octocrab;
@@ -78,7 +78,7 @@ impl GitHubClient {
         }
         let client = Octocrab::builder()
             .personal_token(token)
-            .add_retry_config(RetryConfig::None)
+            .add_retry_config(RetryConfig::Simple(3))
             .build()
             .map_err(|e| GitHubError::Other(e.to_string()))?;
         Ok(Self { client })
@@ -91,7 +91,7 @@ impl GitHubClient {
         }
         let client = Octocrab::builder()
             .personal_token(token)
-            .add_retry_config(RetryConfig::None)
+            .add_retry_config(RetryConfig::Simple(3))
             .base_uri(base_url)
             .map_err(|e| GitHubError::Other(e.to_string()))?
             .build()
@@ -101,13 +101,8 @@ impl GitHubClient {
 
     // ── Core transport ──────────────────────────────────────────
 
-    /// Execute a GraphQL query or mutation.
-    ///
-    /// POSTs to `{base_url}/graphql` with body `{ query, variables }`.
-    /// On non-200: returns `Err(HttpStatus(status))`.
-    /// On `{"errors": ...}`: returns `Err(GraphQLError(...))`.
-    /// On `{"data": null}` or missing `data`: returns `Err(GraphQLError(...))`.
-    /// Otherwise deserializes the `data` field into `T`.
+    /// Execute a GraphQL query or mutation via octocrab's built-in
+    /// `graphql()` method.
     pub async fn graphql<T: DeserializeOwned>(
         &self,
         query: &str,
@@ -119,34 +114,7 @@ impl GitHubClient {
             "variables": vars,
         });
 
-        // Use _post (not graphql()) so we can inspect status + body directly,
-        // including treating {"data": null} as a GraphQLError.
-        let response = self.client._post("/graphql", Some(&payload)).await?;
-
-        let status = response.status().as_u16();
-        if status != 200 {
-            return Err(GitHubError::HttpStatus(status));
-        }
-
-        let body_str = self.client.body_to_string(response).await?;
-        let body: Value = serde_json::from_str(&body_str)?;
-
-        if let Some(errors) = body.get("errors") {
-            return Err(GitHubError::GraphQLError(errors.to_string()));
-        }
-
-        let data = body.get("data").ok_or_else(|| {
-            GitHubError::GraphQLError("response missing 'data' field".to_string())
-        })?;
-
-        if data.is_null() {
-            return Err(GitHubError::GraphQLError(
-                "'data' field is null".to_string(),
-            ));
-        }
-
-        let result: T = serde_json::from_value(data.clone())?;
-        Ok(result)
+        Ok(self.client.graphql(&payload).await?)
     }
 
     /// GET `{base_url}{path}?{query}` (query is optional).
@@ -154,37 +122,7 @@ impl GitHubClient {
     /// On non-2xx: returns `Err(HttpStatus(status))`.
     async fn rest_get(&self, path: &str, query: Option<&str>) -> Result<Value, GitHubError> {
         let uri = match query {
-            Some(q) => {
-                let encoded: String = q
-                    .bytes()
-                    .map(|b| match b {
-                        b'A'..=b'Z'
-                        | b'a'..=b'z'
-                        | b'0'..=b'9'
-                        | b'-'
-                        | b'_'
-                        | b'.'
-                        | b'~'
-                        | b'!'
-                        | b'$'
-                        | b'&'
-                        | b'\''
-                        | b'('
-                        | b')'
-                        | b'*'
-                        | b'+'
-                        | b','
-                        | b';'
-                        | b'='
-                        | b':'
-                        | b'@'
-                        | b'/'
-                        | b'?' => (b as char).to_string(),
-                        _ => format!("%{:02X}", b),
-                    })
-                    .collect();
-                format!("{}?{}", path, encoded)
-            }
+            Some(q) => format!("{}?{}", path, urlencoding::encode(q)),
             None => path.to_string(),
         };
 
@@ -836,7 +774,9 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "Internal Server Error"
+            })))
             .mount(&mock)
             .await;
 
@@ -873,9 +813,9 @@ mod tests {
         }
     }
 
-    /// Test 4: graphql<T> with mock returning {"data": null} → Err(GraphQLError)
+    /// Test 4: graphql<T> with mock returning {"data": null} → Err
     #[tokio::test]
-    async fn graphql_null_data_returns_graphql_error() {
+    async fn graphql_null_data_returns_error() {
         let mock = MockServer::start().await;
         let client = make_client(&mock).await;
 
@@ -891,7 +831,7 @@ mod tests {
             .graphql(r#"mutation { createProjectV2(input: {}) { id } }"#, None)
             .await;
 
-        assert!(matches!(result, Err(GitHubError::GraphQLError(_))));
+        assert!(result.is_err());
     }
 
     // ── Constructor ──────────────────────────────────────────
@@ -1460,7 +1400,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_string_contains("parentIssue"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "Internal Server Error"
+            })))
             .mount(&mock)
             .await;
 
