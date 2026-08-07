@@ -16,8 +16,7 @@ use crate::external_issues::github::types::ParsedRepo;
 
 use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
 use self::helpers::{
-    SESSION_FIELD_NAME, WorkflowContext, WorkflowError, load_agent_template, resolve_context,
-    write_project_id,
+    WorkflowContext, WorkflowError, load_agent_template, resolve_context, write_project_id,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -349,31 +348,7 @@ impl Workflow {
             .github
             .as_ref()
             .ok_or_else(|| WorkflowError::NoGitHub(project_id.to_string()))?;
-
-        let status_field = github
-            .get_project_status_field(project_id)
-            .await?
-            .ok_or_else(|| WorkflowError::NoStatusField(project_id.to_string()))?;
-
-        let existing: std::collections::HashSet<&str> = status_field
-            .options
-            .iter()
-            .map(|o| o.name.as_str())
-            .collect();
-
-        let missing: Vec<&str> = WorkflowStatus::all()
-            .iter()
-            .map(|s| s.as_str())
-            .filter(|opt| !existing.contains(opt))
-            .collect();
-
-        if !missing.is_empty() {
-            tracing::info!("Adding status options: {}", missing.join(", "));
-            github
-                .add_project_status_options(&status_field.id, &missing)
-                .await?;
-        }
-        Ok(())
+        helpers::ensure_status_options(github, project_id).await
     }
 
     /// Ensure the project has a `sessionId` text field.
@@ -383,17 +358,7 @@ impl Workflow {
             .github
             .as_ref()
             .ok_or_else(|| WorkflowError::NoGitHub(project_id.to_string()))?;
-
-        let fields = github.get_project_fields(project_id).await?;
-        let has_session_id = fields.iter().any(|f| f.name == SESSION_FIELD_NAME);
-
-        if !has_session_id {
-            tracing::info!("Adding sessionId field");
-            github
-                .add_project_field(project_id, SESSION_FIELD_NAME, "TEXT")
-                .await?;
-        }
-        Ok(())
+        helpers::ensure_session_id_field(github, project_id).await
     }
 
     /// Check OpenCode server health and verify all required agents exist.
