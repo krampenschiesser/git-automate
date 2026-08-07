@@ -1,9 +1,14 @@
 //! GitHub API client supporting both GraphQL (Projects V2) and REST operations.
 //! Authentication uses a personal access token. GraphQL requests go to
 //! `https://api.github.com/graphql`; REST requests go to `https://api.github.com/`.
+//!
+//! Uses octocrab (v0.54) as the HTTP transport. Low-level `_get` / `_post`
+//! calls bypass octocrab's error mapping so status codes and response bodies
+//! can be inspected directly, matching the behaviour previously on reqwest.
 
 use super::types::*;
-use reqwest::Client;
+use octocrab::Octocrab;
+use octocrab::service::middleware::retry::RetryConfig;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -16,7 +21,7 @@ pub enum GitHubError {
     #[error("GitHub token is required")]
     EmptyToken,
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
     #[error("HTTP status {0}")]
     HttpStatus(u16),
     #[error("GraphQL error: {0}")]
@@ -35,13 +40,31 @@ impl From<serde_json::Error> for GitHubError {
     }
 }
 
+impl From<octocrab::Error> for GitHubError {
+    fn from(e: octocrab::Error) -> Self {
+        match e {
+            octocrab::Error::GitHub { source, .. } => {
+                GitHubError::HttpStatus(source.status_code.as_u16())
+            }
+            octocrab::Error::Graphql { source, .. } => {
+                GitHubError::GraphQLError(format!("{:?}", source))
+            }
+            octocrab::Error::Hyper { source, .. } => {
+                GitHubError::Other(format!("hyper error: {}", source))
+            }
+            octocrab::Error::Serde { source, .. } => {
+                GitHubError::Other(format!("serde error: {}", source))
+            }
+            other => GitHubError::Other(format!("{:?}", other)),
+        }
+    }
+}
+
 // ─── Client ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
-    client: Client,
-    token: String,
-    base_url: String,
+    client: Octocrab,
 }
 
 impl GitHubClient {
@@ -53,15 +76,12 @@ impl GitHubClient {
         if token.is_empty() {
             return Err(GitHubError::EmptyToken);
         }
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+        let client = Octocrab::builder()
+            .personal_token(token)
+            .add_retry_config(RetryConfig::None)
             .build()
             .map_err(|e| GitHubError::Other(e.to_string()))?;
-        Ok(Self {
-            client,
-            token,
-            base_url: "https://api.github.com".to_string(),
-        })
+        Ok(Self { client })
     }
 
     /// Create a client targeting a custom base URL (for testing/integration).
@@ -69,30 +89,17 @@ impl GitHubClient {
         if token.is_empty() {
             return Err(GitHubError::EmptyToken);
         }
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+        let client = Octocrab::builder()
+            .personal_token(token)
+            .add_retry_config(RetryConfig::None)
+            .base_uri(base_url)
+            .map_err(|e| GitHubError::Other(e.to_string()))?
             .build()
             .map_err(|e| GitHubError::Other(e.to_string()))?;
-        Ok(Self {
-            client,
-            token,
-            base_url,
-        })
+        Ok(Self { client })
     }
 
     // ── Core transport ──────────────────────────────────────────
-
-    fn authenticated_request(
-        &self,
-        method: reqwest::Method,
-        url: String,
-    ) -> reqwest::RequestBuilder {
-        self.client
-            .request(method, url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "git-automate")
-            .header("Accept", "application/vnd.github+json")
-    }
 
     /// Execute a GraphQL query or mutation.
     ///
@@ -112,18 +119,17 @@ impl GitHubClient {
             "variables": vars,
         });
 
-        let request = self
-            .authenticated_request(reqwest::Method::POST, format!("{}/graphql", self.base_url))
-            .json(&payload);
-
-        let response = request.send().await?;
+        // Use _post (not graphql()) so we can inspect status + body directly,
+        // including treating {"data": null} as a GraphQLError.
+        let response = self.client._post("/graphql", Some(&payload)).await?;
 
         let status = response.status().as_u16();
         if status != 200 {
             return Err(GitHubError::HttpStatus(status));
         }
 
-        let body: Value = response.json().await?;
+        let body_str = self.client.body_to_string(response).await?;
+        let body: Value = serde_json::from_str(&body_str)?;
 
         if let Some(errors) = body.get("errors") {
             return Err(GitHubError::GraphQLError(errors.to_string()));
@@ -147,22 +153,50 @@ impl GitHubClient {
     /// Returns the parsed JSON body as a `Value`.
     /// On non-2xx: returns `Err(HttpStatus(status))`.
     async fn rest_get(&self, path: &str, query: Option<&str>) -> Result<Value, GitHubError> {
-        let url = match query {
-            Some(q) => format!("{}{}?{}", self.base_url, path, q),
-            None => format!("{}{}", self.base_url, path),
+        let uri = match query {
+            Some(q) => {
+                let encoded: String = q
+                    .bytes()
+                    .map(|b| match b {
+                        b'A'..=b'Z'
+                        | b'a'..=b'z'
+                        | b'0'..=b'9'
+                        | b'-'
+                        | b'_'
+                        | b'.'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b':'
+                        | b'@'
+                        | b'/'
+                        | b'?' => (b as char).to_string(),
+                        _ => format!("%{:02X}", b),
+                    })
+                    .collect();
+                format!("{}?{}", path, encoded)
+            }
+            None => path.to_string(),
         };
 
-        let response = self
-            .authenticated_request(reqwest::Method::GET, url)
-            .send()
-            .await?;
+        let response = self.client._get(uri).await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(GitHubError::HttpStatus(status));
         }
 
-        let body: Value = response.json().await?;
+        let body_str = self.client.body_to_string(response).await?;
+        let body: Value = serde_json::from_str(&body_str)?;
         Ok(body)
     }
 
@@ -170,21 +204,16 @@ impl GitHubClient {
     /// Returns the parsed JSON body as a `Value`.
     /// On non-2xx: returns `Err(HttpStatus(status))`.
     async fn rest_post(&self, path: &str, body: &Value) -> Result<Value, GitHubError> {
-        let url = format!("{}{}", self.base_url, path);
-
-        let response = self
-            .authenticated_request(reqwest::Method::POST, url)
-            .json(body)
-            .send()
-            .await?;
+        let response = self.client._post(path, Some(body)).await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(GitHubError::HttpStatus(status));
         }
 
-        let resp_body: Value = response.json().await?;
-        Ok(resp_body)
+        let body_str = self.client.body_to_string(response).await?;
+        let body: Value = serde_json::from_str(&body_str)?;
+        Ok(body)
     }
 
     // ── Project V2 methods ─────────────────────────────────────
@@ -875,8 +904,8 @@ mod tests {
     }
 
     /// Test 6: GitHubClient::new("token123") → Ok(...)
-    #[test]
-    fn new_valid_token_succeeds() {
+    #[tokio::test]
+    async fn new_valid_token_succeeds() {
         let result = GitHubClient::new("token123".to_string());
         assert!(result.is_ok());
     }
