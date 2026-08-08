@@ -249,6 +249,45 @@ impl GitHubClient {
         Ok(result.create_project_v2.id)
     }
 
+    /// Resolve a Project V2 by its number to a global node ID.
+    ///
+    /// Queries both `user(login:)` and `organization(login:)` since the
+    /// owner may be either a user or an organization. Returns the first
+    /// non-`null` ID found.
+    pub async fn get_project_by_number(
+        &self,
+        owner: &str,
+        number: i64,
+    ) -> Result<String, GitHubError> {
+        let result = self
+            .graphql::<ProjectNumberResult>(
+                r#"query($owner: String!, $number: Int!) {
+                    user(login: $owner) {
+                        projectV2(number: $number) {
+                            id
+                        }
+                    }
+                    organization(login: $owner) {
+                        projectV2(number: $number) {
+                            id
+                        }
+                    }
+                }"#,
+                Some(&json!({ "owner": owner, "number": number })),
+            )
+            .await?;
+
+        let id = result
+            .user
+            .and_then(|u| u.project_v2.map(|p| p.id))
+            .or_else(|| result.organization.and_then(|o| o.project_v2.map(|p| p.id)));
+
+        match id {
+            Some(id) => Ok(id),
+            None => Err(GitHubError::ProjectNotFound(format!("project #{}", number))),
+        }
+    }
+
     /// Fetch a Project V2 by node ID.
     pub async fn get_project(&self, project_id: &str) -> Result<ProjectV2Summary, GitHubError> {
         let result = self
@@ -971,6 +1010,71 @@ mod tests {
             .await;
 
         let result = client.get_project("p1").await;
+        assert!(matches!(result, Err(GitHubError::ProjectNotFound(_))));
+    }
+
+    /// Test: get_project_by_number with user project → returns global ID
+    #[tokio::test]
+    async fn get_project_by_number_user_project_returns_id() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectV2": { "id": "PVT-user-1" } },
+                    "organization": null
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.get_project_by_number("octocat", 4).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "PVT-user-1");
+    }
+
+    /// Test: get_project_by_number with org project → returns global ID
+    #[tokio::test]
+    async fn get_project_by_number_org_project_returns_id() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": null,
+                    "organization": { "projectV2": { "id": "PVT-org-1" } }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.get_project_by_number("github", 4).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "PVT-org-1");
+    }
+
+    /// Test: get_project_by_number with project not found → Err(ProjectNotFound)
+    #[tokio::test]
+    async fn get_project_by_number_not_found_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectV2": null },
+                    "organization": { "projectV2": null }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.get_project_by_number("octocat", 999).await;
         assert!(matches!(result, Err(GitHubError::ProjectNotFound(_))));
     }
 

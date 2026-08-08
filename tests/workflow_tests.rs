@@ -610,3 +610,189 @@ projects:
 
     gh_mock.verify().await;
 }
+
+// ─── Test 11: Numeric projectId is resolved to a global ID ──────────
+//
+// When `projectId` in the config is a numeric project number (e.g. `4`)
+// rather than a relay global ID, `setup_project` must resolve it via
+// `get_project_by_number` before using it in `node(id:)` queries.
+//
+// Mocks:
+//   - `projectV2(number:`  → returns global ID "PVT-resolved" for project #4
+//   - `field(name:`        → returns Status field with all 7 options
+//   - `updateProjectV2FieldConfiguration` → should NOT be called (all options present)
+//   - `fields(first:`      → returns Status + sessionId fields
+//   - `createProjectV2Field` → should NOT be called (sessionId exists)
+
+#[tokio::test]
+async fn test_setup_resolves_numeric_project_id_to_global_id() {
+    let gh_mock = MockServer::start().await;
+
+    // 1. get_project_by_number → resolve numeric "4" to global ID
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("projectV2(number:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "user": { "projectV2": { "id": "PVT-resolved" } },
+                "organization": null
+            }
+        })))
+        .expect(1)
+        .named("resolve_project_number")
+        .mount(&gh_mock)
+        .await;
+
+    // 2. ensure_status_options: Status field with all 7 options
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": {
+                        "id": "status-field-id",
+                        "options": [
+                            {"id": "o1", "name": "Triage"},
+                            {"id": "o2", "name": "Todo"},
+                            {"id": "o3", "name": "In Development"},
+                            {"id": "o4", "name": "Review Technical"},
+                            {"id": "o5", "name": "Review Product"},
+                            {"id": "o6", "name": "QA"},
+                            {"id": "o7", "name": "Done"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_status_field")
+        .mount(&gh_mock)
+        .await;
+
+    // 3. updateProjectV2FieldConfiguration should NOT be called (all options present)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateProjectV2FieldConfiguration"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("add_status_options_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // 4. ensure_session_id_field: project fields include sessionId
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            {"id": "f1", "name": "Status", "dataType": "SINGLE_SELECT"},
+                            {"id": "f2", "name": "sessionId", "dataType": "TEXT"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_project_fields")
+        .mount(&gh_mock)
+        .await;
+
+    // 5. createProjectV2Field should NOT be called (sessionId exists)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("add_session_id_field_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // 6. createProjectV2 should NOT be called (project_id is set)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2(input"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("create_project_v2_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // 7. get_owner_id should NOT be called (project_id is set, no creation)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("user(login:"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("get_owner_id_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // ── Arrange: config with numeric projectId ────────────────────
+    let tmp = tempdir().expect("tempdir should succeed");
+    let config_path = tmp.path().join("git-automate.yml");
+    let yaml = r#"
+projects:
+  my-proj:
+    repository: "https://github.com/owner/repo"
+    projectId: 4
+    titlePattern: "@ai.*"
+"#;
+    std::fs::write(&config_path, yaml).expect("write should succeed");
+
+    let config = parse_config(&config_path).expect("parse_config should succeed");
+    assert_eq!(
+        config
+            .projects
+            .get("my-proj")
+            .unwrap()
+            .project_id
+            .as_deref(),
+        Some("4"),
+        "project should have numeric projectId '4'"
+    );
+
+    // ── Act ────────────────────────────────────────────────────────
+    let client = gh_client(&gh_mock);
+    let deps = WorkflowContext {
+        config,
+        github: Some(client),
+        shell: mock_shell(),
+    };
+
+    // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
+    let _guard = SET_CWD_MUTEX.lock().await;
+    let original_dir = std::env::current_dir().expect("current_dir should succeed");
+    std::env::set_current_dir(tmp.path()).expect("set_current_dir should succeed");
+
+    let workflow = Workflow::new(deps);
+    let result = workflow.run_setup_check().await;
+
+    std::env::set_current_dir(&original_dir).expect("restore cwd should succeed");
+
+    // ── Assert ────────────────────────────────────────────────────
+    assert!(
+        result.is_ok(),
+        "run_setup_check should succeed with numeric projectId"
+    );
+
+    gh_mock.verify().await;
+
+    // Verify the resolved global ID was persisted to the config file.
+    let written = std::fs::read_to_string(&config_path).expect("read should succeed");
+    let data: serde_yaml::Value =
+        serde_yaml::from_str(&written).expect("yaml parse should succeed");
+    let pid = data
+        .get("projects")
+        .and_then(|p| p.get("my-proj"))
+        .and_then(|p| p.get("projectId"))
+        .and_then(|v| v.as_str())
+        .expect("projectId should exist in YAML after setup");
+    assert_eq!(
+        pid, "PVT-resolved",
+        "projectId in YAML should be the resolved global ID"
+    );
+}

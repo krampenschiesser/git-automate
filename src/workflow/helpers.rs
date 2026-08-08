@@ -353,6 +353,38 @@ pub fn issue_body_or_title(issue: &IssueInfo) -> String {
         .unwrap_or_else(|| format!("Issue #{}: {}", issue.number, issue.title))
 }
 
+// ─── Project ID resolution ──────────────────────────────────────
+
+/// Resolve a project ID that may be a numeric project number to a global node ID.
+///
+/// If `project_id` is purely numeric (a project number / databaseId), resolves
+/// it to a relay global ID via [`GitHubClient::get_project_by_number`].
+/// Otherwise, treats it as an already-valid global ID and returns it unchanged.
+///
+/// Returns `(resolved_id, was_resolved)` — `was_resolved` is `true` when the
+/// input was numeric and a different global ID was produced, allowing callers
+/// to persist the resolved ID back to config.
+pub async fn resolve_project_id(
+    github: &GitHubClient,
+    owner: &str,
+    project_id: &str,
+) -> Result<(String, bool), WorkflowError> {
+    if project_id.chars().all(|c| c.is_ascii_digit()) {
+        let number: i64 = project_id.parse().map_err(|e| {
+            WorkflowError::Other(format!("invalid project number '{}': {}", project_id, e))
+        })?;
+        tracing::info!(
+            "Resolving project number {} for owner {} to a global ID",
+            number,
+            owner
+        );
+        let global_id = github.get_project_by_number(owner, number).await?;
+        Ok((global_id, true))
+    } else {
+        Ok((project_id.to_string(), false))
+    }
+}
+
 // ─── Context resolution ───────────────────────────────────────
 
 /// Resolve a project name + config into a fully populated [`ProjectContext`],
@@ -375,7 +407,11 @@ pub async fn resolve_context(
     let mut config = deps.config.clone();
 
     let project_id = if let Some(pid) = &project_config.project_id {
-        pid.clone()
+        let (resolved, was_resolved) = resolve_project_id(github, &owner, pid).await?;
+        if was_resolved {
+            write_project_id(project_name, &resolved, &mut config).await?;
+        }
+        resolved
     } else {
         tracing::info!("Creating project {} for {}/{}", project_name, owner, repo);
         let pid = github.create_project(&owner, project_name).await?;
@@ -821,6 +857,63 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::test_utils::gh_client;
+
+    #[tokio::test]
+    async fn resolve_project_id_numeric_resolves_to_global() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectV2": { "id": "PVT-global-4" } },
+                    "organization": null
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (resolved, was_resolved) = resolve_project_id(&client, "owner", "4").await.unwrap();
+        assert_eq!(resolved, "PVT-global-4");
+        assert!(was_resolved);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_project_id_non_numeric_returns_unchanged() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        // No mocks should be hit — non-numeric IDs are returned as-is.
+        let (resolved, was_resolved) = resolve_project_id(&client, "owner", "PID-123")
+            .await
+            .unwrap();
+        assert_eq!(resolved, "PID-123");
+        assert!(!was_resolved);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_project_id_not_found_returns_error() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectV2": null },
+                    "organization": { "projectV2": null }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let result = resolve_project_id(&client, "owner", "999").await;
+        assert!(result.is_err());
+    }
 
     fn test_project_config(project_id: Option<&str>) -> ProjectConfig {
         ProjectConfig {

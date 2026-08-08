@@ -16,7 +16,8 @@ use crate::external_issues::github::types::ParsedRepo;
 
 use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
 use self::helpers::{
-    WorkflowContext, WorkflowError, load_agent_template, resolve_context, write_project_id,
+    WorkflowContext, WorkflowError, load_agent_template, resolve_context, resolve_project_id,
+    write_project_id,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -319,15 +320,21 @@ impl Workflow {
         let ParsedRepo { owner, repo } = parse_repository_url(&config.repository)
             .map_err(|e| WorkflowError::Other(e.to_string()))?;
 
+        let github = self
+            .deps
+            .github
+            .as_ref()
+            .ok_or_else(|| WorkflowError::NoGitHub(name.to_string()))?;
+
         let project_id = if let Some(pid) = &config.project_id {
-            pid.clone()
+            let (resolved, was_resolved) = resolve_project_id(github, &owner, pid).await?;
+            if was_resolved {
+                let mut config_clone = self.deps.config.clone();
+                write_project_id(name, &resolved, &mut config_clone).await?;
+            }
+            resolved
         } else {
             tracing::info!("Creating project {} for {}/{}", name, owner, repo);
-            let github = self
-                .deps
-                .github
-                .as_ref()
-                .ok_or_else(|| WorkflowError::NoGitHub(name.to_string()))?;
             let pid = github.create_project(&owner, name).await?;
             let mut config_clone = self.deps.config.clone();
             write_project_id(name, &pid, &mut config_clone).await?;
