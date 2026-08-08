@@ -93,6 +93,22 @@ pub struct NodeOwnerResult {
     pub organization: Option<NodeIdOnly>,
 }
 
+/// Response for `get_project_by_number` query.
+///
+/// `user.project_v2` and `organization.project_v2` are both `Option` —
+/// exactly one will be `Some` when the project exists under the given owner.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ProjectNumberResult {
+    pub user: Option<NumberProjectHolder>,
+    pub organization: Option<NumberProjectHolder>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct NumberProjectHolder {
+    #[serde(rename = "projectV2")]
+    pub project_v2: Option<IdHolder>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct NodeIdOnly {
     pub id: String,
