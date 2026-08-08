@@ -2,13 +2,12 @@
 //! Authentication uses a personal access token. GraphQL requests go to
 //! `https://api.github.com/graphql`; REST requests go to `https://api.github.com/`.
 //!
-//! Uses octocrab (v0.54) as the HTTP transport. GraphQL operations use
-//! octocrab's built-in `graphql()` method; REST operations use low-level
-//! `_get` / `_post` calls for direct status code and body inspection.
+//! Uses `reqwest` as the HTTP transport. GraphQL operations POST directly
+//! to the `/graphql` endpoint; REST operations use `reqwest` GET/POST for
+//! direct status code and body inspection.
 
 use super::types::*;
-use octocrab::Octocrab;
-use octocrab::service::middleware::retry::RetryConfig;
+use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -40,23 +39,9 @@ impl From<serde_json::Error> for GitHubError {
     }
 }
 
-impl From<octocrab::Error> for GitHubError {
-    fn from(e: octocrab::Error) -> Self {
-        match e {
-            octocrab::Error::GitHub { source, .. } => {
-                GitHubError::HttpStatus(source.status_code.as_u16())
-            }
-            octocrab::Error::Graphql { source, .. } => {
-                GitHubError::GraphQLError(format!("{:?}", source))
-            }
-            octocrab::Error::Hyper { source, .. } => {
-                GitHubError::Other(format!("hyper error: {}", source))
-            }
-            octocrab::Error::Serde { source, .. } => {
-                GitHubError::Other(format!("serde error: {}", source))
-            }
-            other => GitHubError::Other(format!("{:?}", other)),
-        }
+impl From<reqwest::Error> for GitHubError {
+    fn from(e: reqwest::Error) -> Self {
+        GitHubError::Other(e.to_string())
     }
 }
 
@@ -64,7 +49,8 @@ impl From<octocrab::Error> for GitHubError {
 
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
-    client: Octocrab,
+    client: reqwest::Client,
+    base_url: String,
 }
 
 impl GitHubClient {
@@ -73,15 +59,7 @@ impl GitHubClient {
     /// # Errors
     /// Returns `GitHubError::EmptyToken` if `token` is empty.
     pub fn new(token: String) -> Result<Self, GitHubError> {
-        if token.is_empty() {
-            return Err(GitHubError::EmptyToken);
-        }
-        let client = Octocrab::builder()
-            .personal_token(token)
-            .add_retry_config(RetryConfig::Simple(3))
-            .build()
-            .map_err(|e| GitHubError::Other(e.to_string()))?;
-        Ok(Self { client })
+        Self::new_with_base_url(token, "https://api.github.com".to_string())
     }
 
     /// Create a client targeting a custom base URL (for testing/integration).
@@ -89,20 +67,64 @@ impl GitHubClient {
         if token.is_empty() {
             return Err(GitHubError::EmptyToken);
         }
-        let client = Octocrab::builder()
-            .personal_token(token)
-            .add_retry_config(RetryConfig::Simple(3))
-            .base_uri(base_url)
-            .map_err(|e| GitHubError::Other(e.to_string()))?
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("git-automate"));
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/vnd.github+json"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", token))
+                .map_err(|e| GitHubError::Other(format!("invalid auth token: {}", e)))?,
+        );
+
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
             .build()
             .map_err(|e| GitHubError::Other(e.to_string()))?;
-        Ok(Self { client })
+
+        Ok(Self { client, base_url })
     }
 
     // ── Core transport ──────────────────────────────────────────
 
-    /// Execute a GraphQL query or mutation via octocrab's built-in
-    /// `graphql()` method.
+    const MAX_ATTEMPTS: u8 = 4; // 1 initial + 3 retries on 5xx/network errors
+
+    async fn execute_with_retry(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<reqwest::Response, GitHubError> {
+        let mut last_error = String::new();
+
+        for attempt in 1..=Self::MAX_ATTEMPTS {
+            let req = request
+                .try_clone()
+                .ok_or_else(|| GitHubError::Other("request clone failed".to_string()))?;
+            match self.client.execute(req).await {
+                Ok(response) => {
+                    if !response.status().is_server_error() {
+                        return Ok(response);
+                    }
+                    if attempt < Self::MAX_ATTEMPTS {
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                    if attempt < Self::MAX_ATTEMPTS {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        Err(GitHubError::Other(last_error))
+    }
+
+    /// Execute a GraphQL query or mutation via a direct POST to `/graphql`.
     pub async fn graphql<T: DeserializeOwned>(
         &self,
         query: &str,
@@ -114,26 +136,54 @@ impl GitHubClient {
             "variables": vars,
         });
 
-        Ok(self.client.graphql(&payload).await?)
-    }
-
-    /// GET `{base_url}{path}?{query}` (query is optional).
-    /// Returns the parsed JSON body as a `Value`.
-    /// On non-2xx: returns `Err(HttpStatus(status))`.
-    async fn rest_get(&self, path: &str, query: Option<&str>) -> Result<Value, GitHubError> {
-        let uri = match query {
-            Some(q) => format!("{}?{}", path, urlencoding::encode(q)),
-            None => path.to_string(),
-        };
-
-        let response = self.client._get(uri).await?;
+        let url = format!("{}/graphql", self.base_url);
+        let request = self.client.post(&url).json(&payload).build()?;
+        let response = self.execute_with_retry(request).await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(GitHubError::HttpStatus(status));
         }
 
-        let body_str = self.client.body_to_string(response).await?;
+        let body: Value = response.json().await?;
+
+        if let Some(errors) = body.get("errors") {
+            return Err(GitHubError::GraphQLError(format!("{:?}", errors)));
+        }
+
+        let data = body.get("data").ok_or_else(|| {
+            GitHubError::Other("GraphQL response missing 'data' field".to_string())
+        })?;
+
+        if data.is_null() {
+            return Err(GitHubError::Other(
+                "GraphQL response data is null".to_string(),
+            ));
+        }
+
+        Ok(serde_json::from_value(data.clone())?)
+    }
+
+    /// GET `{base_url}{path}?{query}` (query is optional).
+    /// Returns the parsed JSON body as a `Value`.
+    /// On non-2xx: returns `Err(HttpStatus(status))`.
+    async fn rest_get(&self, path: &str, query: Option<&str>) -> Result<Value, GitHubError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.client.get(&url);
+
+        if let Some(q) = query {
+            request = request.query(&[("q", q)]);
+        }
+
+        let request = request.build()?;
+        let response = self.execute_with_retry(request).await?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            return Err(GitHubError::HttpStatus(status));
+        }
+
+        let body_str = response.text().await?;
         let body: Value = serde_json::from_str(&body_str)?;
         Ok(body)
     }
@@ -142,14 +192,16 @@ impl GitHubClient {
     /// Returns the parsed JSON body as a `Value`.
     /// On non-2xx: returns `Err(HttpStatus(status))`.
     async fn rest_post(&self, path: &str, body: &Value) -> Result<Value, GitHubError> {
-        let response = self.client._post(path, Some(body)).await?;
+        let url = format!("{}{}", self.base_url, path);
+        let request = self.client.post(&url).json(body).build()?;
+        let response = self.execute_with_retry(request).await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(GitHubError::HttpStatus(status));
         }
 
-        let body_str = self.client.body_to_string(response).await?;
+        let body_str = response.text().await?;
         let body: Value = serde_json::from_str(&body_str)?;
         Ok(body)
     }
