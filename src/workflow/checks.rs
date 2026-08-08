@@ -2028,7 +2028,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        // list_repo_issues returns 500 (retried 3x by RetryConfig::Simple(3))
+        // list_repo_issues returns 500 (retried 3x: 1 initial + 3 retries via execute_with_retry)
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/issues"))
             .respond_with(ResponseTemplate::new(500))
