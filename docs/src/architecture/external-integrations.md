@@ -18,7 +18,7 @@ Used for Project V2 operations:
 | `add_issue_to_project()` | mutation `addProjectV2ItemById` | Add an issue to a project |
 | `update_project_item_status()` | mutation `updateProjectV2ItemFieldValue` | Set status on an item |
 | `get_project_item_values()` | query `fieldValues(first: 10)` | Get field values for an item |
-| `add_project_status_options()` | mutation `updateProjectV2FieldConfiguration` | Add missing status options |
+| `add_project_status_options()` | mutation `updateProjectV2Field` | Replace single-select field options (existing + new) |
 | `add_project_field()` | mutation `createProjectV2Field` | Add a custom field |
 
 ### REST

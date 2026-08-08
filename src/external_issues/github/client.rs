@@ -377,16 +377,14 @@ impl GitHubClient {
     pub async fn add_project_status_options(
         &self,
         field_id: &str,
-        options: &[&str],
+        options: &[Value],
     ) -> Result<(), GitHubError> {
-        let add_options: Vec<Value> = options.iter().map(|name| json!({ "name": name })).collect();
-
         self.graphql::<UpdateFieldConfigResult>(
             include_str!("queries/add_project_status_options.graphql"),
             Some(&json!({
                 "input": {
                     "fieldId": field_id,
-                    "addOptions": add_options,
+                    "singleSelectOptions": options,
                 }
             })),
         )

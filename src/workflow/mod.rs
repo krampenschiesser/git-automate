@@ -1240,9 +1240,9 @@ mod tests {
         // addProjectStatusOptions should NOT be called
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .and(body_string_contains("updateProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "updateProjectV2FieldConfiguration": { "projectV2Field": { "id": "x" } } }
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "x" } } }
             })))
             .expect(0)
             .mount(&mock)
@@ -1285,9 +1285,9 @@ mod tests {
         // addProjectStatusOptions → expect 1 call
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .and(body_string_contains("updateProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "updateProjectV2FieldConfiguration": { "projectV2Field": { "id": "x" } } }
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "x" } } }
             })))
             .expect(1)
             .mount(&mock)

@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use regex::Regex;
+use serde_json::{Value, json};
 
 use super::WorkflowStatus;
 use crate::config::{GitAutomateConfig, ProjectConfig};
@@ -450,16 +451,24 @@ pub async fn ensure_status_options(
         .map(|o| o.name.as_str())
         .collect();
 
-    let missing: Vec<&str> = WorkflowStatus::all()
+    let all_options: Vec<Value> = status_field
+        .options
         .iter()
-        .map(|s| s.as_str())
-        .filter(|opt| !existing.contains(opt))
+        .map(|o| json!({ "id": o.id, "name": o.name, "color": "GRAY", "description": "" }))
+        .chain(
+            WorkflowStatus::all()
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|opt| !existing.contains(opt))
+                .map(|name| json!({ "name": name, "color": "GRAY", "description": "" })),
+        )
         .collect();
 
-    if !missing.is_empty() {
-        tracing::info!("Adding status options: {}", missing.join(", "));
+    let missing_count = all_options.len() - status_field.options.len();
+    if missing_count > 0 {
+        tracing::info!("Adding {} status options", missing_count);
         github
-            .add_project_status_options(&status_field.id, &missing)
+            .add_project_status_options(&status_field.id, &all_options)
             .await?;
     }
     Ok(())
@@ -852,7 +861,6 @@ mod tests {
 
     // ── resolve_context / resolve_field_ids / resolve_status_option_and_session tests ──
 
-    use serde_json::json;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -985,7 +993,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .and(body_string_contains("updateProjectV2Field"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&server)
@@ -1185,7 +1193,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .and(body_string_contains("updateProjectV2Field"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&server)
@@ -1222,9 +1230,9 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .and(body_string_contains("updateProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "updateProjectV2FieldConfiguration": { "projectV2Field": { "id": "x" } } }
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "x" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -1379,9 +1387,9 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .and(body_string_contains("updateProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "updateProjectV2FieldConfiguration": { "projectV2Field": { "id": "x" } } }
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "x" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -1454,7 +1462,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("updateProjectV2FieldConfiguration"))
+            .and(body_string_contains("updateProjectV2Field"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&server)

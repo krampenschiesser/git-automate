@@ -170,8 +170,8 @@ pub struct StatusFieldDetail {
 /// Response for `add_project_status_options` mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct UpdateFieldConfigResult {
-    #[serde(rename = "updateProjectV2FieldConfiguration")]
-    pub update_project_v2_field_configuration: UpdateFieldConfigInner,
+    #[serde(rename = "updateProjectV2Field")]
+    pub update_project_v2_field: UpdateFieldConfigInner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]

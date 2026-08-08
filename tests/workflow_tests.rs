@@ -193,7 +193,7 @@ projects:
 //   - `user(login:`       → get_owner_id query
 //   - `createProjectV2(input` → createProjectV2 mutation (not createProjectV2Field)
 //   - `field(name:`       → get_project_status_field query
-//   - `updateProjectV2FieldConfiguration` → add_project_status_options mutation
+//   - `updateProjectV2Field` → add_project_status_options mutation
 //   - `fields(first:`     → get_project_fields query
 //   - `createProjectV2Field` → add_project_field mutation
 
@@ -240,10 +240,10 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
-        .and(body_string_contains("updateProjectV2FieldConfiguration"))
+        .and(body_string_contains("updateProjectV2Field"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "updateProjectV2FieldConfiguration": {
+                "updateProjectV2Field": {
                     "projectV2Field": { "id": "status-field-id" }
                 }
             }
@@ -374,10 +374,10 @@ async fn test_setup_initialization_idempotent_when_everything_exists() {
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
-        .and(body_string_contains("updateProjectV2FieldConfiguration"))
+        .and(body_string_contains("updateProjectV2Field"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "updateProjectV2FieldConfiguration": {
+                "updateProjectV2Field": {
                     "projectV2Field": { "id": "status-field-id" }
                 }
             }
@@ -515,10 +515,10 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
-        .and(body_string_contains("updateProjectV2FieldConfiguration"))
+        .and(body_string_contains("updateProjectV2Field"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "updateProjectV2FieldConfiguration": {
+                "updateProjectV2Field": {
                     "projectV2Field": { "id": "status-field-id" }
                 }
             }
@@ -620,7 +620,7 @@ projects:
 // Mocks:
 //   - `projectV2(number:`  → returns global ID "PVT-resolved" for project #4
 //   - `field(name:`        → returns Status field with all 7 options
-//   - `updateProjectV2FieldConfiguration` → should NOT be called (all options present)
+//   - `updateProjectV2Field` → should NOT be called (all options present)
 //   - `fields(first:`      → returns Status + sessionId fields
 //   - `createProjectV2Field` → should NOT be called (sessionId exists)
 
@@ -670,10 +670,10 @@ async fn test_setup_resolves_numeric_project_id_to_global_id() {
         .mount(&gh_mock)
         .await;
 
-    // 3. updateProjectV2FieldConfiguration should NOT be called (all options present)
+    // 3. updateProjectV2Field should NOT be called (all options present)
     Mock::given(method("POST"))
         .and(path("/graphql"))
-        .and(body_string_contains("updateProjectV2FieldConfiguration"))
+        .and(body_string_contains("updateProjectV2Field"))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .named("add_status_options_should_not_be_called")
