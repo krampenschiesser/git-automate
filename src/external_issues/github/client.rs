@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+// Re-export list-query types used by find_project_by_name.
+use super::types::{OrgProjectsResult, UserProjectsResult};
+
 // ─── Error type ───────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -677,6 +680,53 @@ impl GitHubClient {
 
         self.rest_post(&path, &body).await?;
         Ok(())
+    }
+
+    pub async fn find_project_by_name(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<String, GitHubError> {
+        // Try user first.
+        let result = self
+            .graphql::<UserProjectsResult>(
+                include_str!("queries/list_user_projects.graphql"),
+                Some(&json!({ "login": owner })),
+            )
+            .await;
+
+        if let Ok(result) = result
+            && let Some(holder) = result.user
+        {
+            for project in holder.projects_v2.nodes {
+                if project.title == name {
+                    return Ok(project.id);
+                }
+            }
+        }
+
+        // Fall back to organization.
+        let result = self
+            .graphql::<OrgProjectsResult>(
+                include_str!("queries/list_org_projects.graphql"),
+                Some(&json!({ "login": owner })),
+            )
+            .await;
+
+        if let Ok(result) = result
+            && let Some(holder) = result.organization
+        {
+            for project in holder.projects_v2.nodes {
+                if project.title == name {
+                    return Ok(project.id);
+                }
+            }
+        }
+
+        Err(GitHubError::ProjectNotFound(format!(
+            "project named '{}'",
+            name
+        )))
     }
 
     /// Check whether a branch exists in a repository.
