@@ -12,12 +12,18 @@ pub use super::project::ProjectV2Summary;
 ///
 /// `dataType` is serialized as `dataType` in the GraphQL response;
 /// serde rename maps the Rust snake_case `data_type`.
+/// `name` and `data_type` are optional because `fields.nodes` returns a
+/// union (`ProjectV2FieldConfiguration`) — only `ProjectV2Field` and
+/// `ProjectV2SingleSelectField` are matched by inline fragments, and only
+/// `ProjectV2Field` has `dataType`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
 pub struct ProjectFieldInfo {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
-    #[serde(rename = "dataType")]
-    pub data_type: String,
+    #[serde(default, rename = "dataType")]
+    pub data_type: Option<String>,
 }
 
 /// A single selectable option within a `StatusFieldInfo`.

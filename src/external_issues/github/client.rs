@@ -251,14 +251,17 @@ impl GitHubClient {
 
     /// Resolve a Project V2 by its number to a global node ID.
     ///
-    /// Queries both `user(login:)` and `organization(login:)` since the
-    /// owner may be either a user or an organization. Returns the first
-    /// non-`null` ID found.
+    /// The owner may be either a user or an organization. Sends two
+    /// sequential queries — `user(login:)` first, then `organization(login:)`
+    /// as a fallback. This avoids a GraphQL `NOT_FOUND` error on the
+    /// `organization` field when the owner is a user (and vice versa),
+    /// which would cause a single combined query to fail.
     pub async fn get_project_by_number(
         &self,
         owner: &str,
         number: i64,
     ) -> Result<String, GitHubError> {
+        // Try user first.
         let result = self
             .graphql::<ProjectNumberResult>(
                 r#"query($owner: String!, $number: Int!) {
@@ -267,6 +270,21 @@ impl GitHubClient {
                             id
                         }
                     }
+                }"#,
+                Some(&json!({ "owner": owner, "number": number })),
+            )
+            .await;
+
+        if let Ok(result) = result
+            && let Some(id) = result.user.and_then(|u| u.project_v2.map(|p| p.id))
+        {
+            return Ok(id);
+        }
+
+        // Fall back to organization.
+        let result = self
+            .graphql::<ProjectNumberResult>(
+                r#"query($owner: String!, $number: Int!) {
                     organization(login: $owner) {
                         projectV2(number: $number) {
                             id
@@ -275,17 +293,15 @@ impl GitHubClient {
                 }"#,
                 Some(&json!({ "owner": owner, "number": number })),
             )
-            .await?;
+            .await;
 
-        let id = result
-            .user
-            .and_then(|u| u.project_v2.map(|p| p.id))
-            .or_else(|| result.organization.and_then(|o| o.project_v2.map(|p| p.id)));
-
-        match id {
-            Some(id) => Ok(id),
-            None => Err(GitHubError::ProjectNotFound(format!("project #{}", number))),
+        if let Ok(result) = result
+            && let Some(id) = result.organization.and_then(|o| o.project_v2.map(|p| p.id))
+        {
+            return Ok(id);
         }
+
+        Err(GitHubError::ProjectNotFound(format!("project #{}", number)))
     }
 
     /// Fetch a Project V2 by node ID.
@@ -328,9 +344,15 @@ impl GitHubClient {
                         ... on ProjectV2 {
                             fields(first: 100) {
                                 nodes {
-                                    id
-                                    name
-                                    dataType
+                                    ... on ProjectV2Field {
+                                        id
+                                        name
+                                        dataType
+                                    }
+                                    ... on ProjectV2SingleSelectField {
+                                        id
+                                        name
+                                    }
                                 }
                             }
                         }
@@ -1078,6 +1100,88 @@ mod tests {
         assert!(matches!(result, Err(GitHubError::ProjectNotFound(_))));
     }
 
+    /// Test: get_project_by_number with user owner — user query succeeds,
+    /// org query is never called (reproduces the combined-query NOT_FOUND bug).
+    #[tokio::test]
+    async fn get_project_by_number_user_owner_skips_org_query() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("user(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectV2": { "id": "PVT-user-1" } }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Org query should never fire — user query already found the project.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("organization(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": [{
+                    "message": "Could not resolve to an Organization with the login of 'octocat'.",
+                    "path": ["organization"],
+                    "type": "NOT_FOUND"
+                }]
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let result = client.get_project_by_number("octocat", 4).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "PVT-user-1");
+
+        mock.verify().await;
+    }
+
+    /// Test: get_project_by_number with org owner — user query returns
+    /// NOT_FOUND error, falls through to org query which succeeds.
+    #[tokio::test]
+    async fn get_project_by_number_org_owner_falls_through_user_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("user(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "user": null },
+                "errors": [{
+                    "message": "Could not resolve to a User with the login of 'github'.",
+                    "path": ["user"],
+                    "type": "NOT_FOUND"
+                }]
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("organization(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "organization": { "projectV2": { "id": "PVT-org-1" } }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let result = client.get_project_by_number("github", 4).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "PVT-org-1");
+
+        mock.verify().await;
+    }
+
     /// Test 10: get_project_fields → Vec<ProjectFieldInfo> with data_type
     #[tokio::test]
     async fn get_project_fields_returns_fields() {
@@ -1107,7 +1211,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "f1");
         assert_eq!(result[0].name, "Status");
-        assert_eq!(result[0].data_type, "SINGLE_SELECT");
+        assert_eq!(result[0].data_type, Some("SINGLE_SELECT".to_string()));
     }
 
     /// Test 11: get_project_status_field with field:null → Ok(None)
