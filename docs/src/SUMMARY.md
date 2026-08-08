@@ -6,7 +6,7 @@ A standalone Rust daemon that automates GitHub issue workflows via OpenCode agen
 
 ---
 
-- [Introduction](./introduction.md)
+- [CLI](./cli.md)
 - [Getting Started](./getting-started.md)
 - [Configuration](./configuration.md)
 - [Architecture](./architecture/overview.md)
