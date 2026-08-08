@@ -212,10 +212,7 @@ impl GitHubClient {
     async fn get_owner_id(&self, login: &str) -> Result<String, GitHubError> {
         let result = self
             .graphql::<NodeOwnerResult>(
-                r#"query($login: String!) {
-                    user(login: $login) { id }
-                    organization(login: $login) { id }
-                }"#,
+                include_str!("queries/get_owner_id.graphql"),
                 Some(&json!({ "login": login })),
             )
             .await?;
@@ -237,11 +234,7 @@ impl GitHubClient {
 
         let result = self
             .graphql::<CreateProjectV2Result>(
-                r#"mutation($input: CreateProjectV2Input!) {
-                    createProjectV2(input: $input) {
-                        id
-                    }
-                }"#,
+                include_str!("queries/create_project.graphql"),
                 Some(&json!({ "input": { "title": title, "ownerId": owner_id } })),
             )
             .await?;
@@ -264,13 +257,7 @@ impl GitHubClient {
         // Try user first.
         let result = self
             .graphql::<ProjectNumberResult>(
-                r#"query($owner: String!, $number: Int!) {
-                    user(login: $owner) {
-                        projectV2(number: $number) {
-                            id
-                        }
-                    }
-                }"#,
+                include_str!("queries/get_project_by_number_user.graphql"),
                 Some(&json!({ "owner": owner, "number": number })),
             )
             .await;
@@ -284,13 +271,7 @@ impl GitHubClient {
         // Fall back to organization.
         let result = self
             .graphql::<ProjectNumberResult>(
-                r#"query($owner: String!, $number: Int!) {
-                    organization(login: $owner) {
-                        projectV2(number: $number) {
-                            id
-                        }
-                    }
-                }"#,
+                include_str!("queries/get_project_by_number_org.graphql"),
                 Some(&json!({ "owner": owner, "number": number })),
             )
             .await;
@@ -308,15 +289,7 @@ impl GitHubClient {
     pub async fn get_project(&self, project_id: &str) -> Result<ProjectV2Summary, GitHubError> {
         let result = self
             .graphql::<NodeProjectResult>(
-                r#"query($id: ID!) {
-                    node(id: $id) {
-                        ... on ProjectV2 {
-                            id
-                            number
-                            title
-                        }
-                    }
-                }"#,
+                include_str!("queries/get_project.graphql"),
                 Some(&json!({ "id": project_id })),
             )
             .await?;
@@ -339,25 +312,7 @@ impl GitHubClient {
     ) -> Result<Vec<ProjectFieldInfo>, GitHubError> {
         let result = self
             .graphql::<NodeFieldsResult>(
-                r#"query($id: ID!) {
-                    node(id: $id) {
-                        ... on ProjectV2 {
-                            fields(first: 100) {
-                                nodes {
-                                    ... on ProjectV2Field {
-                                        id
-                                        name
-                                        dataType
-                                    }
-                                    ... on ProjectV2SingleSelectField {
-                                        id
-                                        name
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }"#,
+                include_str!("queries/get_project_fields.graphql"),
                 Some(&json!({ "id": project_id })),
             )
             .await?;
@@ -378,13 +333,7 @@ impl GitHubClient {
     ) -> Result<String, GitHubError> {
         let result = self
             .graphql::<CreateFieldResult>(
-                r#"mutation($input: CreateProjectV2FieldInput!) {
-                    createProjectV2Field(input: $input) {
-                        projectField {
-                            id
-                        }
-                    }
-                }"#,
+                include_str!("queries/add_project_field.graphql"),
                 Some(&json!({
                     "input": {
                         "projectId": project_id,
@@ -408,21 +357,7 @@ impl GitHubClient {
     ) -> Result<Option<StatusFieldInfo>, GitHubError> {
         let result = self
             .graphql::<StatusFieldResult>(
-                r#"query($id: ID!, $name: String!) {
-                    node(id: $id) {
-                        ... on ProjectV2 {
-                            field(name: $name) {
-                                ... on ProjectV2SingleSelectField {
-                                    id
-                                    options {
-                                        id
-                                        name
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }"#,
+                include_str!("queries/get_project_status_field.graphql"),
                 Some(&json!({ "id": project_id, "name": "Status" })),
             )
             .await?;
@@ -447,13 +382,7 @@ impl GitHubClient {
         let add_options: Vec<Value> = options.iter().map(|name| json!({ "name": name })).collect();
 
         self.graphql::<UpdateFieldConfigResult>(
-            r#"mutation($input: UpdateProjectV2FieldConfigurationInput!) {
-                updateProjectV2FieldConfiguration(input: $input) {
-                    projectV2Field {
-                        id
-                    }
-                }
-            }"#,
+            include_str!("queries/add_project_status_options.graphql"),
             Some(&json!({
                 "input": {
                     "fieldId": field_id,
@@ -475,27 +404,7 @@ impl GitHubClient {
     ) -> Result<Vec<ProjectItem>, GitHubError> {
         let result = self
             .graphql::<ListProjectItemsResult>(
-                r#"query($id: ID!) {
-                    node(id: $id) {
-                        ... on ProjectV2 {
-                            items(first: 100) {
-                                nodes {
-                                    id
-                                    content {
-                                        __typename
-                                        id
-                                        ... on Issue {
-                                            number
-                                        }
-                                        ... on PullRequest {
-                                            number
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }"#,
+                include_str!("queries/list_project_items.graphql"),
                 Some(&json!({ "id": project_id })),
             )
             .await?;
@@ -534,13 +443,7 @@ impl GitHubClient {
         option_id: &str,
     ) -> Result<(), GitHubError> {
         self.graphql::<UpdateItemFieldValueResult>(
-            r#"mutation($input: UpdateProjectV2ItemFieldValueInput!) {
-                updateProjectV2ItemFieldValue(input: $input) {
-                    projectV2Item {
-                        id
-                    }
-                }
-            }"#,
+            include_str!("queries/update_project_item_status.graphql"),
             Some(&json!({
                 "input": {
                     "projectId": project_id,
@@ -564,13 +467,7 @@ impl GitHubClient {
         session_id: &str,
     ) -> Result<(), GitHubError> {
         self.graphql::<UpdateItemFieldValueResult>(
-            r#"mutation($input: UpdateProjectV2ItemFieldValueInput!) {
-                updateProjectV2ItemFieldValue(input: $input) {
-                    projectV2Item {
-                        id
-                    }
-                }
-            }"#,
+            include_str!("queries/update_project_item_session_id.graphql"),
             Some(&json!({
                 "input": {
                     "projectId": project_id,
@@ -593,13 +490,7 @@ impl GitHubClient {
     ) -> Result<String, GitHubError> {
         let result = self
             .graphql::<AddItemResult>(
-                r#"mutation($input: AddProjectV2ItemByIdInput!) {
-                    addProjectV2ItemById(input: $input) {
-                        item {
-                            id
-                        }
-                    }
-                }"#,
+                include_str!("queries/add_issue_to_project.graphql"),
                 Some(&json!({
                     "input": {
                         "contentId": content_id,
@@ -621,23 +512,7 @@ impl GitHubClient {
     ) -> Result<BTreeMap<String, Option<String>>, GitHubError> {
         let result = self
             .graphql::<NodeFieldValuesResult>(
-                r#"query($id: ID!) {
-                    node(id: $id) {
-                        ... on ProjectV2Item {
-                            fieldValues(first: 100) {
-                                nodes {
-                                    name
-                                    ... on ProjectV2ItemFieldTextValue {
-                                        text
-                                    }
-                                    ... on ProjectV2ItemFieldSingleSelectValue {
-                                        option
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }"#,
+                include_str!("queries/get_project_item_values.graphql"),
                 Some(&json!({ "id": item_id })),
             )
             .await?;
@@ -745,22 +620,7 @@ impl GitHubClient {
     ) -> Result<Vec<IssueWithParent>, GitHubError> {
         let result = self
             .graphql::<IssuesWithParentsResult>(
-                r#"query($owner: String!, $repo: String!) {
-                    repository(owner: $owner, name: $repo) {
-                        issues(first: 100) {
-                            nodes {
-                                id
-                                number
-                                title
-                                body
-                                state
-                                parentIssue {
-                                    number
-                                }
-                            }
-                        }
-                    }
-                }"#,
+                include_str!("queries/list_issues_with_parents.graphql"),
                 Some(&json!({ "owner": owner, "repo": repo })),
             )
             .await?;
@@ -872,7 +732,7 @@ mod tests {
             .await;
 
         let result: CreateProjectV2Result = client
-            .graphql(r#"mutation { createProjectV2(input: {}) { id } }"#, None)
+            .graphql(include_str!("queries/test_create_project_v2.graphql"), None)
             .await
             .expect("graphql should succeed");
 
@@ -894,7 +754,7 @@ mod tests {
             .await;
 
         let result: Result<CreateProjectV2Result, _> = client
-            .graphql(r#"mutation { createProjectV2(input: {}) { id } }"#, None)
+            .graphql(include_str!("queries/test_create_project_v2.graphql"), None)
             .await;
 
         assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
@@ -915,7 +775,7 @@ mod tests {
             .await;
 
         let result: Result<CreateProjectV2Result, _> = client
-            .graphql(r#"mutation { createProjectV2(input: {}) { id } }"#, None)
+            .graphql(include_str!("queries/test_create_project_v2.graphql"), None)
             .await;
 
         match result {
@@ -941,7 +801,7 @@ mod tests {
             .await;
 
         let result: Result<CreateProjectV2Result, _> = client
-            .graphql(r#"mutation { createProjectV2(input: {}) { id } }"#, None)
+            .graphql(include_str!("queries/test_create_project_v2.graphql"), None)
             .await;
 
         assert!(result.is_err());

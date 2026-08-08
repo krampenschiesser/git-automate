@@ -1,6 +1,5 @@
 query GetProject($id: ID!) {
     node(id: $id) {
-        __typename
         ... on ProjectV2 {
             id
             number

@@ -7,7 +7,7 @@ query ListIssuesWithParents($owner: String!, $repo: String!) {
                 title
                 body
                 state
-                parent {
+                parentIssue {
                     number
                 }
             }
