@@ -1,5 +1,5 @@
-mutation AddProjectStatusOptions($input: UpdateProjectV2FieldConfigurationInput!) {
-    updateProjectV2FieldConfiguration(input: $input) {
+mutation AddProjectStatusOptions($input: UpdateProjectV2FieldInput!) {
+    updateProjectV2Field(input: $input) {
         projectV2Field {
             id
         }
