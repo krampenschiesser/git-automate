@@ -44,6 +44,9 @@ projects:
 - `GITHUB_TOKEN` -- GitHub API token. If unset, GitHub operations are skipped.
 - `OPENCODE_PW` -- OpenCode server password (referenced in config via `${env:OPENCODE_PW}`).
 
+Variables can also be set in a `.env` file in the working directory; values already
+set in the environment take precedence.
+
 ### Config Fields
 
 | Field            | Required | Description                                      |
