@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use dotenv::dotenv;
 
 use git_automate::config::parse_config;
 use git_automate::external_agent::opencode::OpenCodeClient;
@@ -65,6 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = tracing_subscriber::FmtSubscriber::new();
     // use that subscriber to process traces emitted after this point
     tracing::subscriber::set_global_default(subscriber)?;
+
+    dotenv().ok();
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve { config } => serve(&config).await,
