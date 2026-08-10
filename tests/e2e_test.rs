@@ -51,7 +51,6 @@ fn real_shell() -> ShellFn {
 }
 
 #[tokio::test]
-#[ignore = "requires GITHUB_TOKEN and OPENCODE_PW in .env"]
 async fn e2e_triage_flow_creates_session() {
     // ── 1. Load .env ──────────────────────────────────────────────
     dotenv().ok();

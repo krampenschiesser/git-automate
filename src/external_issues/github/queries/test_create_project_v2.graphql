@@ -1,5 +1,0 @@
-mutation TestCreateProjectV2 {
-    createProjectV2(input: {}) {
-        id
-    }
-}
