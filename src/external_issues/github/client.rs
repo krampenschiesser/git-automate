@@ -608,6 +608,22 @@ impl GitHubClient {
         Ok(result.node_id)
     }
 
+    /// Create a new issue in a repository via the REST API.
+    pub async fn create_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<RestCreatedIssue, GitHubError> {
+        let path = format!("/repos/{}/{}/issues", owner, repo);
+        let body_json = json!({ "title": title, "body": body });
+        let data = self.rest_post(&path, &body_json).await?;
+
+        let result: RestCreatedIssue = serde_json::from_value(data)?;
+        Ok(result)
+    }
+
     // ── Issue hierarchy (GraphQL) ──────────────────────────────
 
     /// List all issues in a repository with their parent issue number (if any),
