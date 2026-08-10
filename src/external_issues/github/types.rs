@@ -297,6 +297,17 @@ pub struct RestIssueNode {
     pub node_id: String,
 }
 
+/// Response from `POST /repos/{owner}/{repo}/issues` — a newly created issue.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct RestCreatedIssue {
+    #[serde(rename = "node_id")]
+    pub node_id: String,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+}
+
 /// Helper struct for responses that just need an `id` field.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct IdHolder {
