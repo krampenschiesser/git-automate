@@ -1,7 +1,9 @@
 mutation AddProjectStatusOptions($input: UpdateProjectV2FieldInput!) {
     updateProjectV2Field(input: $input) {
         projectV2Field {
-            id
+            ... on ProjectV2Field {
+                id
+            }
         }
     }
 }

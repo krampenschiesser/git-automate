@@ -1577,4 +1577,68 @@ mod tests {
         let result = client.list_issues_with_parents("owner", "repo").await;
         assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
     }
+
+    // ── add_project_status_options ──────────────────────────────
+
+    /// Test 26: add_project_status_options succeeds; the `... on ProjectV2Field`
+    /// inline fragment matcher is the regression guard (without it, reverting the
+    /// GraphQL fix would go undetected because wiremock returns 404).
+    #[tokio::test]
+    async fn add_project_status_options_succeeds_with_inline_fragment() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2Field"))
+            .and(body_string_contains("... on ProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2Field": {
+                        "projectV2Field": { "id": "status-field-id" }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let options = vec![
+            json!({"name": "Triage", "color": "GRAY", "description": ""}),
+            json!({"name": "Todo", "color": "GRAY", "description": ""}),
+        ];
+        let result = client
+            .add_project_status_options("status-field-id", &options)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "add_project_status_options should succeed with inline fragment"
+        );
+        mock.verify().await;
+    }
+
+    /// Test 27: add_project_status_options → 500 → HttpStatus(500)
+    #[tokio::test]
+    async fn add_project_status_options_500_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2Field"))
+            .and(body_string_contains("... on ProjectV2Field"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "Internal Server Error"
+            })))
+            .mount(&mock)
+            .await;
+
+        let options = vec![json!({"name": "Todo", "color": "GRAY", "description": ""})];
+        let result = client
+            .add_project_status_options("status-field-id", &options)
+            .await;
+
+        assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
+    }
 }
