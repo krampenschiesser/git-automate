@@ -37,7 +37,7 @@ Run a single test: `cargo test <name>` (works for both unit tests in `src/` and 
 ## Config (`git-automate.yml`)
 
 - Default filename: `git-automate.yml` (`config::DEFAULT_CONFIG_FILE`). Resolved from `--config` arg, else `cwd`.
-- **`projectId` is optional.** If it is numeric (a project *number*, not a relay ID) it is resolved to a GitHub global ID via `projectV2(number:)` and the resolved value is **persisted back** into `git-automate.yml`. Non-numeric values are treated as already-valid global IDs (no network call).
+- **`projectId` is optional.** If it is numeric (a project *number*, not a relay ID) it is **resolved to a GitHub global ID at runtime** via `projectV2(number:)` — the original numeric value is **kept** in `git-automate.yml` (not replaced). Non-numeric values are treated as already-valid global IDs (no network call).
 - **`${env:VAR}`** interpolation runs on every string field (recursing into maps/sequences). Unset vars become empty strings.
 - **`.env`** is loaded via `dotenv()` at startup; vars already in the environment take precedence over the file.
 - `concurrency` (top-level) caps active OpenCode sessions — when the limit is reached session creation is skipped with a warning.
