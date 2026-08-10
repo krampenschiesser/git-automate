@@ -1,8 +1,8 @@
 concurrency: 4
 projects:
   sks-iac:
-    repository: https://github.com/krampenschiesser/sks-iac
-    projectId: 1
+    repository: https://github.com/krampenschiesser/git-automate
+    projectId: 5
     issueProvider: github
     opencode:
       url: http://localhost:8081
