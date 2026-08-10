@@ -390,7 +390,12 @@ pub async fn resolve_project_id(
 // ─── Context resolution ───────────────────────────────────────
 
 /// Resolve a project name + config into a fully populated [`ProjectContext`],
-/// creating the project on GitHub and persisting the ID if it does not yet exist.
+/// creating the project on GitHub if it does not yet exist.
+///
+/// Numeric project IDs (e.g. `1`) are resolved to global node IDs at runtime
+/// via [`resolve_project_id`] — the original numeric ID is kept in the config
+/// file, not replaced by the resolved global ID. New project IDs are persisted
+/// to `git-automate.yml` when created.
 ///
 /// Equivalent to TS `resolveContext`.
 pub async fn resolve_context(
@@ -406,17 +411,15 @@ pub async fn resolve_context(
     let ParsedRepo { owner, repo } = parse_repository_url(&project_config.repository)
         .map_err(|e| WorkflowError::Other(e.to_string()))?;
 
-    let mut config = deps.config.clone();
-
+    // Numeric project IDs (e.g. "1") are resolved to global node IDs at runtime.
+    // The config file is NOT modified — the original numeric ID is preserved
+    // so users can keep `projectId: 1` and have it resolved each time.
     let project_id = if let Some(pid) = &project_config.project_id {
-        let (resolved, was_resolved) = resolve_project_id(github, &owner, pid).await?;
-        if was_resolved {
-            write_project_id(project_name, &resolved, &mut config).await?;
-        }
-        resolved
+        resolve_project_id(github, &owner, pid).await?.0
     } else {
         tracing::info!("Creating project {} for {}/{}", project_name, owner, repo);
         let pid = github.create_project(&owner, project_name).await?;
+        let mut config = deps.config.clone();
         write_project_id(project_name, &pid, &mut config).await?;
         pid
     };
@@ -565,11 +568,60 @@ pub fn write_doctor_config(
     repository: &str,
     project_id: &str,
 ) -> Result<(), WorkflowError> {
-    let yaml = format!(
-        "projects:\n  {}:\n    repository: {}\n    projectId: {}\n",
-        project_name, repository, project_id
+    let mut data: serde_yaml::Value = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)?;
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    };
+
+    let root = data
+        .as_mapping_mut()
+        .ok_or_else(|| WorkflowError::Other("config root is not a mapping".to_string()))?;
+
+    let proj_key = serde_yaml::Value::String("projects".to_string());
+    if !root.contains_key(&proj_key) {
+        root.insert(
+            proj_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+
+    let projects = root
+        .get_mut(&proj_key)
+        .and_then(|v| v.as_mapping_mut())
+        .ok_or_else(|| WorkflowError::Other("projects is not a mapping".to_string()))?;
+
+    let name_key = serde_yaml::Value::String(project_name.to_string());
+    if !projects.contains_key(&name_key) {
+        projects.insert(
+            name_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+
+    let project = projects
+        .get_mut(&name_key)
+        .and_then(|v| v.as_mapping_mut())
+        .ok_or_else(|| WorkflowError::Other("project entry is not a mapping".to_string()))?;
+
+    project.insert(
+        serde_yaml::Value::String("repository".to_string()),
+        serde_yaml::Value::String(repository.to_string()),
     );
-    std::fs::write(config_path, yaml)?;
+
+    let project_id_value = if project_id.chars().all(|c| c.is_ascii_digit()) {
+        serde_yaml::Value::Number(project_id.parse().unwrap())
+    } else {
+        serde_yaml::Value::String(project_id.to_string())
+    };
+    project.insert(
+        serde_yaml::Value::String("projectId".to_string()),
+        project_id_value,
+    );
+
+    let yaml_content = serde_yaml::to_string(&data)?;
+    std::fs::write(config_path, yaml_content)?;
     Ok(())
 }
 
@@ -1058,6 +1110,104 @@ mod tests {
         assert_eq!(ctx.owner, "owner");
         assert_eq!(ctx.repo, "repo");
         assert_eq!(ctx.project_id, "PID-123");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_context_numeric_project_id_resolves_and_does_not_persist() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("user(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectV2": { "id": "PVT-global-1" } }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"sessionId","dataType":"TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let deps = ContextDeps {
+            github: Some(client),
+            config: test_config(Some("1")),
+        };
+        let project_config = test_project_config(Some("1"));
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let config_path = tmp_dir.path().join("git-automate.yml");
+        std::fs::write(
+            &config_path,
+            "projects:\n  test-project:\n    repository: https://github.com/owner/repo\n    projectId: 1\n",
+        )
+        .unwrap();
+
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp_dir.path()).unwrap();
+
+        let ctx = resolve_context(&deps, "test-project", &project_config)
+            .await
+            .expect("resolve_context should succeed");
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert_eq!(ctx.project_id, "PVT-global-1");
+        assert_eq!(ctx.owner, "owner");
+        assert_eq!(ctx.repo, "repo");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("projectId: 1"),
+            "config should still have projectId: 1"
+        );
+        assert!(
+            !written.contains("PVT-global-1"),
+            "config should not contain the resolved global ID"
+        );
+
         server.verify().await;
     }
 

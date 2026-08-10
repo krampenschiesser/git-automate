@@ -781,19 +781,17 @@ projects:
 
     gh_mock.verify().await;
 
-    // Verify the resolved global ID was persisted to the config file.
+    // Numeric projectId should NOT be persisted — the original numeric value
+    // is kept in the config file so users can keep `projectId: 4` and have
+    // it resolved at runtime each time.
     let written = std::fs::read_to_string(&config_path).expect("read should succeed");
-    let data: serde_yaml::Value =
-        serde_yaml::from_str(&written).expect("yaml parse should succeed");
-    let pid = data
-        .get("projects")
-        .and_then(|p| p.get("my-proj"))
-        .and_then(|p| p.get("projectId"))
-        .and_then(|v| v.as_str())
-        .expect("projectId should exist in YAML after setup");
-    assert_eq!(
-        pid, "PVT-resolved",
-        "projectId in YAML should be the resolved global ID"
+    assert!(
+        written.contains("projectId: 4"),
+        "config should still have original numeric projectId: 4, got: {written}"
+    );
+    assert!(
+        !written.contains("PVT-resolved"),
+        "resolved global ID should NOT be written to config, got: {written}"
     );
 }
 

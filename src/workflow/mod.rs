@@ -325,9 +325,10 @@ impl Workflow {
     /// Parse the repository URL, create the GitHub project if it doesn't
     /// exist yet, then ensure status options and the sessionId field.
     ///
-    /// When `persist` is `true`, resolved/created project IDs are written back
-    /// to `git-automate.yml`. When `false` (used by `doctor`), the ID is
-    /// resolved in-memory only and the config file is left unchanged.
+    /// Numeric project IDs (e.g. `1`) are resolved to global node IDs at
+    /// runtime — the original numeric ID is kept in the config file.
+    /// When a new project is created and `persist` is `true`, the new
+    /// global ID is written to `git-automate.yml`.
     async fn setup_project(
         &self,
         name: &str,
@@ -343,13 +344,11 @@ impl Workflow {
             .as_ref()
             .ok_or_else(|| WorkflowError::NoGitHub(name.to_string()))?;
 
+        // Numeric project IDs (e.g. "1") are resolved to global node IDs at runtime.
+        // The config file is NOT modified — the original numeric ID is preserved
+        // so users can keep `projectId: 1` and have it resolved each time.
         let project_id = if let Some(pid) = &config.project_id {
-            let (resolved, was_resolved) = resolve_project_id(github, &owner, pid).await?;
-            if was_resolved && persist {
-                let mut config_clone = self.deps.config.clone();
-                write_project_id(name, &resolved, &mut config_clone).await?;
-            }
-            resolved
+            resolve_project_id(github, &owner, pid).await?.0
         } else {
             tracing::info!("Creating project {} for {}/{}", name, owner, repo);
             let pid = github.create_project(&owner, name).await?;
@@ -998,6 +997,123 @@ mod tests {
         let result = workflow.setup_project("test-proj", &project, true).await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn setup_project_numeric_project_id_resolves_and_does_not_persist() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("user(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "user": { "projectV2": { "id": "PVT-global-1" } }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"sessionId","dataType":"TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2": { "id": "should-not-be-called" } }
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let project = ProjectConfig {
+            repository: "https://github.com/owner/repo".to_string(),
+            project_id: Some("1".to_string()),
+            directory: None,
+            opencode: None,
+            issue_provider: "github".to_string(),
+            title_pattern: "@ai.*".to_string(),
+            trello_api_key: None,
+            trello_token: None,
+            trello_board_id: None,
+        };
+
+        let deps = WorkflowContext {
+            config: GitAutomateConfig {
+                projects: {
+                    let mut m = BTreeMap::new();
+                    m.insert("test-proj".to_string(), project.clone());
+                    m
+                },
+                concurrency: None,
+            },
+            github: Some(client),
+            shell: mock_shell(),
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n    projectId: 1\n";
+        std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
+        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.setup_project("test-proj", &project, true).await;
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(result.is_ok());
+
+        let written = std::fs::read_to_string(tmp.path().join("git-automate.yml")).unwrap();
+        assert!(
+            written.contains("projectId: 1"),
+            "config should still have projectId: 1"
+        );
+        assert!(
+            !written.contains("PVT-global-1"),
+            "config should not contain the resolved global ID"
+        );
+
+        mock.verify().await;
     }
 
     // ── ensure_status_options with all options (test 9) ──────

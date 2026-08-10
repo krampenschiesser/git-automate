@@ -24,7 +24,7 @@ use git_automate::shell::create_shell_fn;
 use git_automate::workflow::Workflow;
 use git_automate::workflow::helpers::{
     WorkflowContext, detect_git_remote, ensure_session_id_field, ensure_status_options,
-    prompt_input, write_doctor_config,
+    prompt_input, resolve_project_id, write_doctor_config,
 };
 
 // ─── CLI ─────────────────────────────────────────────────────
@@ -145,10 +145,16 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let project_id = if let Some(pid) = existing_project_id {
-        pid
+    // Numeric project IDs (e.g. "1") are resolved to global node IDs at runtime.
+    // The original ID is preserved in the config file — not replaced by the
+    // resolved global ID.
+    let (resolved_project_id, original_project_id) = if let Some(pid) = existing_project_id {
+        let (resolved, _was_resolved) = resolve_project_id(&github, &owner, &pid)
+            .await
+            .map_err(|e| format!("Failed to resolve project ID: {}", e))?;
+        (resolved, pid)
     } else {
-        match github.find_project_by_name(&owner, &repo).await {
+        let pid = match github.find_project_by_name(&owner, &repo).await {
             Ok(id) => id,
             Err(_) => {
                 let choice = prompt_input("Use user or organization project? (user/org): ");
@@ -165,13 +171,14 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 github.create_project(&project_owner, &repo).await?
             }
-        }
+        };
+        (pid.clone(), pid)
     };
 
-    ensure_status_options(&github, &project_id).await?;
-    ensure_session_id_field(&github, &project_id).await?;
+    ensure_status_options(&github, &resolved_project_id).await?;
+    ensure_session_id_field(&github, &resolved_project_id).await?;
     let repository_url = format!("https://github.com/{}/{}", owner, repo);
-    write_doctor_config(config_path, &repo, &repository_url, &project_id)?;
+    write_doctor_config(config_path, &repo, &repository_url, &original_project_id)?;
 
     tracing::info!(
         "Doctor setup complete — config written to {}",
@@ -660,5 +667,105 @@ mod tests {
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("projectId: PID-456"));
+    }
+
+    #[tokio::test]
+    async fn write_doctor_config_numeric_id_preserves_int() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("git-automate.yml");
+
+        let result = write_doctor_config(
+            &config_path,
+            "my-repo",
+            "https://github.com/owner/my-repo",
+            "1",
+        );
+        assert!(result.is_ok());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("projectId: 1"));
+
+        let parsed = git_automate::config::parse_config(&config_path).unwrap();
+        let project = parsed.projects.get("my-repo").unwrap();
+        assert_eq!(project.project_id.as_deref(), Some("1"));
+    }
+
+    // T-n: write_doctor_config preserves existing config fields (concurrency,
+    // issueProvider, opencode sections) when updating projectId.
+    #[tokio::test]
+    async fn write_doctor_config_preserves_existing_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("git-automate.yml");
+        std::fs::write(
+            &config_path,
+            r#"
+concurrency: 4
+issueProvider: github
+opencode:
+  url: http://localhost:8081
+  pw: ${env:OPENCODE_PW}
+projects:
+  my-repo:
+    repository: https://github.com/owner/my-repo
+    issueProvider: github
+    opencode:
+      url: http://localhost:8081
+      pw: ${env:OPENCODE_PW}
+"#,
+        )
+        .unwrap();
+
+        let result = write_doctor_config(
+            &config_path,
+            "my-repo",
+            "https://github.com/owner/my-repo",
+            "PID-789",
+        );
+        assert!(result.is_ok());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let data: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+
+        assert_eq!(data.get("concurrency").and_then(|v| v.as_u64()), Some(4));
+        assert_eq!(
+            data.get("issueProvider").and_then(|v| v.as_str()),
+            Some("github")
+        );
+
+        let opencode = data.get("opencode").and_then(|v| v.as_mapping()).unwrap();
+        assert_eq!(
+            opencode.get("url").and_then(|v| v.as_str()),
+            Some("http://localhost:8081")
+        );
+        assert_eq!(
+            opencode.get("pw").and_then(|v| v.as_str()),
+            Some("${env:OPENCODE_PW}")
+        );
+
+        let project = data
+            .get("projects")
+            .and_then(|p| p.get("my-repo"))
+            .and_then(|p| p.as_mapping())
+            .unwrap();
+        assert_eq!(
+            project.get("projectId").and_then(|v| v.as_str()),
+            Some("PID-789")
+        );
+        assert_eq!(
+            project.get("issueProvider").and_then(|v| v.as_str()),
+            Some("github")
+        );
+        let proj_opencode = project
+            .get("opencode")
+            .and_then(|v| v.as_mapping())
+            .unwrap();
+        assert_eq!(
+            proj_opencode.get("url").and_then(|v| v.as_str()),
+            Some("http://localhost:8081")
+        );
+        assert_eq!(
+            proj_opencode.get("pw").and_then(|v| v.as_str()),
+            Some("${env:OPENCODE_PW}")
+        );
     }
 }
