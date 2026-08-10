@@ -16,8 +16,7 @@ use crate::external_issues::github::types::ParsedRepo;
 
 use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
 use self::helpers::{
-    WorkflowContext, WorkflowError, load_agent_template, resolve_context, resolve_project_id,
-    write_project_id,
+    WorkflowContext, WorkflowError, resolve_context, resolve_project_id, write_project_id,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -303,7 +302,7 @@ impl Workflow {
                 continue;
             }
             let oc = self.opencode_config(project_config);
-            if let Err(e) = self.check_agents_and_create_if_missing(&oc).await {
+            if let Err(e) = self.check_opencode(&oc).await {
                 tracing::error!("Doctor check failed for {}: {}", project_name, e);
             }
         }
@@ -420,74 +419,6 @@ impl Workflow {
         }
         Ok(())
     }
-
-    async fn check_agents_and_create_if_missing(
-        &self,
-        oc: &OpencodeSessionConfig,
-    ) -> Result<(), WorkflowError> {
-        let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
-
-        if !client.check_health().await {
-            tracing::warn!(
-                "OpenCode server at {} is not healthy — skipping agent copy",
-                oc.url
-            );
-            return Ok(());
-        }
-
-        tracing::info!("OpenCode server at {} is healthy", oc.url);
-
-        let agents: Vec<AgentInfo> = client
-            .get_agents(oc.directory.as_deref())
-            .await
-            .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
-
-        let agent_names: std::collections::HashSet<&str> =
-            agents.iter().map(|a| a.name.as_str()).collect();
-
-        let missing: Vec<&AgentName> = REQUIRED_AGENTS
-            .iter()
-            .filter(|a| !agent_names.contains(a.as_str()))
-            .collect();
-
-        if missing.is_empty() {
-            tracing::info!("All required agents present");
-            return Ok(());
-        }
-
-        tracing::info!(
-            "Missing required agents: {}",
-            missing
-                .iter()
-                .map(|a| a.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        let home = match std::env::var("HOME") {
-            Ok(h) => h,
-            Err(_) => {
-                tracing::warn!("HOME environment variable not set — cannot copy agents");
-                return Ok(());
-            }
-        };
-
-        let agents_dir = std::path::Path::new(&home).join(".opencode").join("agents");
-
-        std::fs::create_dir_all(&agents_dir)
-            .map_err(|e| WorkflowError::Other(format!("Failed to create agents dir: {}", e)))?;
-
-        for agent in &missing {
-            let content = load_agent_template(agent.as_template_name())?;
-            let dest = agents_dir.join(agent.as_file_name());
-            std::fs::write(&dest, &content).map_err(|e| {
-                WorkflowError::Other(format!("Failed to write agent {}: {}", agent.as_str(), e))
-            })?;
-            tracing::info!("Copied agent {} to {}", agent.as_str(), dest.display());
-        }
-
-        Ok(())
-    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────
@@ -576,167 +507,6 @@ mod tests {
             REQUIRED_AGENTS[5].as_file_name(),
             "git-automate-qa.agent.md"
         );
-    }
-
-    #[tokio::test]
-    async fn check_agents_and_create_if_missing_writes_files() {
-        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let saved_home = std::env::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-        }
-
-        let oc_mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": true,
-                "version": "1.0.0"
-            })))
-            .expect(1)
-            .named("health")
-            .mount(&oc_mock)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name": "git-automate-triage", "description": "t", "mode": "subagent", "builtIn": true},
-                {"name": "git-automate-taskmanager", "description": "t", "mode": "subagent", "builtIn": true},
-                {"name": "git-automate-developer", "description": "t", "mode": "subagent", "builtIn": true},
-            ])))
-            .expect(1)
-            .named("agents")
-            .mount(&oc_mock)
-            .await;
-
-        let deps = WorkflowContext {
-            config: GitAutomateConfig {
-                projects: BTreeMap::new(),
-                concurrency: None,
-            },
-            github: None,
-            shell: mock_shell(),
-        };
-        let workflow = Workflow::new(deps);
-
-        let oc = OpencodeSessionConfig {
-            url: oc_mock.uri(),
-            pw: "test-pw".to_string(),
-            directory: None,
-        };
-
-        let result = workflow.check_agents_and_create_if_missing(&oc).await;
-        assert!(
-            result.is_ok(),
-            "check_agents_and_create_if_missing should succeed: {:?}",
-            result.err()
-        );
-
-        let agents_dir = tmp.path().join(".opencode").join("agents");
-        assert!(agents_dir.join("git-automate-reviewer.agent.md").exists());
-        assert!(agents_dir.join("git-automate-product.agent.md").exists());
-        assert!(agents_dir.join("git-automate-qa.agent.md").exists());
-
-        oc_mock.verify().await;
-
-        if let Some(val) = saved_home {
-            unsafe {
-                std::env::set_var("HOME", val);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("HOME");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn run_doctor_check_copies_missing_agents() {
-        let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let saved_home = std::env::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-        }
-
-        let oc_mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": true,
-                "version": "1.0.0"
-            })))
-            .expect(1)
-            .named("health")
-            .mount(&oc_mock)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name": "git-automate-triage", "description": "t", "mode": "subagent", "builtIn": true},
-                {"name": "git-automate-taskmanager", "description": "t", "mode": "subagent", "builtIn": true},
-                {"name": "git-automate-developer", "description": "t", "mode": "subagent", "builtIn": true},
-            ])))
-            .expect(1)
-            .named("agents")
-            .mount(&oc_mock)
-            .await;
-
-        let mut projects = BTreeMap::new();
-        projects.insert(
-            "test-proj".to_string(),
-            ProjectConfig {
-                repository: "https://github.com/owner/repo".to_string(),
-                project_id: Some("PID-123".to_string()),
-                directory: None,
-                opencode: Some(OpencodeConfig {
-                    url: oc_mock.uri(),
-                    pw: "test-pw".to_string(),
-                }),
-                issue_provider: "github".to_string(),
-                title_pattern: "@ai.*".to_string(),
-                trello_api_key: None,
-                trello_token: None,
-                trello_board_id: None,
-            },
-        );
-
-        let deps = WorkflowContext {
-            config: GitAutomateConfig {
-                projects,
-                concurrency: None,
-            },
-            github: None,
-            shell: mock_shell(),
-        };
-        let workflow = Workflow::new(deps);
-
-        let result = workflow.run_doctor_check().await;
-        assert!(
-            result.is_ok(),
-            "run_doctor_check should succeed: {:?}",
-            result.err()
-        );
-
-        let agents_dir = tmp.path().join(".opencode").join("agents");
-        assert!(agents_dir.join("git-automate-reviewer.agent.md").exists());
-        assert!(agents_dir.join("git-automate-product.agent.md").exists());
-        assert!(agents_dir.join("git-automate-qa.agent.md").exists());
-
-        oc_mock.verify().await;
-
-        if let Some(val) = saved_home {
-            unsafe {
-                std::env::set_var("HOME", val);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("HOME");
-            }
-        }
     }
 
     // ── run_all ordering (test 1) ─────────────────────────────

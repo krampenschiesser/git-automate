@@ -19,9 +19,13 @@ use dotenv::dotenv;
 use git_automate::config::parse_config;
 use git_automate::external_agent::opencode::OpenCodeClient;
 use git_automate::external_issues::github::client::GitHubClient;
+use git_automate::external_issues::github::repo::parse_repository_url;
 use git_automate::shell::create_shell_fn;
 use git_automate::workflow::Workflow;
-use git_automate::workflow::helpers::WorkflowContext;
+use git_automate::workflow::helpers::{
+    WorkflowContext, detect_git_remote, ensure_session_id_field, ensure_status_options,
+    prompt_input, write_doctor_config,
+};
 
 // ─── CLI ─────────────────────────────────────────────────────
 
@@ -51,7 +55,7 @@ enum Commands {
         #[arg(long)]
         pw: String,
     },
-    /// Check project setup, OpenCode health, and copy missing agents
+    /// Set up or fix a project: create config, find/create GitHub project, ensure fields
     Doctor {
         /// Path to the git-automate.yml config file
         #[arg(long, default_value = git_automate::config::DEFAULT_CONFIG_FILE)]
@@ -105,30 +109,75 @@ async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error
     Ok(workflow)
 }
 
-// ─── doctor_setup ────────────────────────────────────────────
+// ─── doctor ───────────────────────────────────────────────────
 
-/// Like [`setup`], but treats `GITHUB_TOKEN` as optional — warns and
-/// continues with `github: None` when the token is unset or empty.
-async fn doctor_setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error>> {
-    let config = parse_config(config_path)?;
+/// One-shot setup wizard implementing the flow in `docs/src/cli.md`.
+async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("GITHUB_TOKEN")
+        .map_err(|_| "GITHUB_TOKEN environment variable is not set — cannot run doctor")?;
+    if token.is_empty() {
+        return Err("GITHUB_TOKEN environment variable is empty — cannot run doctor".into());
+    }
+    let github = GitHubClient::new(token)?;
 
-    let github = match std::env::var("GITHUB_TOKEN") {
-        Ok(token) if !token.is_empty() => Some(GitHubClient::new(token)?),
-        _ => {
-            tracing::warn!("GITHUB_TOKEN not set or empty — GitHub checks will be skipped");
-            None
+    let (owner, repo, existing_project_id) = if config_path.exists() {
+        let config = parse_config(config_path)?;
+        let first = config
+            .projects
+            .values()
+            .next()
+            .ok_or("No projects defined in config")?;
+        let parsed = parse_repository_url(&first.repository)
+            .map_err(|e| format!("Invalid repository URL: {}", e))?;
+        (parsed.owner, parsed.repo, first.project_id.clone())
+    } else {
+        match detect_git_remote() {
+            Some(p) => (p.owner, p.repo, None),
+            None => {
+                let input = prompt_input("Enter repository (e.g. owner/repo): ");
+                if input.is_empty() {
+                    return Err("Repository name is required".into());
+                }
+                let p = parse_repository_url(&input)
+                    .map_err(|e| format!("Invalid repository name: {}", e))?;
+                (p.owner, p.repo, None)
+            }
         }
     };
 
-    let shell = create_shell_fn();
-    let deps = WorkflowContext {
-        config,
-        github,
-        shell,
+    let project_id = if let Some(pid) = existing_project_id {
+        pid
+    } else {
+        match github.find_project_by_name(&owner, &repo).await {
+            Ok(id) => id,
+            Err(_) => {
+                let choice = prompt_input("Use user or organization project? (user/org): ");
+                let project_owner = match choice.to_lowercase().as_str() {
+                    "user" => owner.clone(),
+                    "org" => {
+                        let org = prompt_input("Enter organization name: ");
+                        if org.is_empty() {
+                            return Err("Organization name is required".into());
+                        }
+                        org
+                    }
+                    _ => return Err(format!("Invalid choice: {}", choice).into()),
+                };
+                github.create_project(&project_owner, &repo).await?
+            }
+        }
     };
-    let workflow = Workflow::new(deps);
 
-    Ok(workflow)
+    ensure_status_options(&github, &project_id).await?;
+    ensure_session_id_field(&github, &project_id).await?;
+    let repository_url = format!("https://github.com/{}/{}", owner, repo);
+    write_doctor_config(config_path, &repo, &repository_url, &project_id)?;
+
+    tracing::info!(
+        "Doctor setup complete — config written to {}",
+        config_path.display()
+    );
+    Ok(())
 }
 
 // ─── serve ───────────────────────────────────────────────────
@@ -176,20 +225,6 @@ async fn check_health(url: &str, pw: &str) -> Result<(), Box<dyn std::error::Err
     }
 }
 
-// ─── doctor ────────────────────────────────────────────────
-
-/// Run a one-shot doctor check (no polling loop).
-async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let workflow = doctor_setup(config_path).await?;
-
-    tracing::info!("Running doctor checks");
-    if let Err(e) = workflow.run_doctor_check().await {
-        tracing::error!("Doctor check failed: {}", e);
-    }
-
-    Ok(())
-}
-
 // ─── Tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -199,7 +234,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -351,9 +386,9 @@ mod tests {
         );
     }
 
-    // T-n: doctor_setup without GITHUB_TOKEN → warns, github=None, succeeds
+    // T-n: doctor without GITHUB_TOKEN → fails
     #[tokio::test]
-    async fn doctor_setup_no_github_token_warns() {
+    async fn doctor_no_github_token_fails() {
         let _guard = ENV_LOCK.lock().await;
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe {
@@ -362,16 +397,14 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("git-automate.yml");
-        std::fs::write(
-            &config_path,
-            "projects:\n  test:\n    repository: owner/repo\n",
-        )
-        .expect("write config");
 
-        let result = doctor_setup(&config_path).await;
+        let result = doctor(&config_path).await;
+        assert!(result.is_err(), "doctor should fail without GITHUB_TOKEN");
+
+        let msg = format!("{}", result.unwrap_err());
         assert!(
-            result.is_ok(),
-            "doctor_setup should succeed without GITHUB_TOKEN"
+            msg.contains("GITHUB_TOKEN"),
+            "error should mention GITHUB_TOKEN: {msg}"
         );
 
         if let Some(val) = saved {
@@ -381,29 +414,71 @@ mod tests {
         }
     }
 
-    // T-n: doctor_setup with GITHUB_TOKEN → succeeds, github=Some
+    // T-n: doctor with existing config (projectId set) → ensures fields, writes config
     #[tokio::test]
-    async fn doctor_setup_with_github_token_succeeds() {
+    async fn doctor_with_existing_config_ensures_fields() {
         let _guard = ENV_LOCK.lock().await;
         let saved = std::env::var("GITHUB_TOKEN").ok();
         unsafe {
             std::env::set_var("GITHUB_TOKEN", "ghp_testtoken123456789");
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path = dir.path().join("git-automate.yml");
-        std::fs::write(
-            &config_path,
-            "projects:\n  test:\n    repository: owner/repo\n",
-        )
-        .expect("write config");
+        let mock = MockServer::start().await;
 
-        let result = doctor_setup(&config_path).await;
-        assert!(
-            result.is_ok(),
-            "doctor_setup should succeed: {:?}",
-            result.err()
-        );
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"sessionId","dataType":"TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let client =
+            git_automate::external_issues::github::client::GitHubClient::new_with_base_url(
+                "ghp_testtoken123456789".to_string(),
+                mock.uri(),
+            )
+            .expect("client");
+
+        let result = ensure_status_options(&client, "PID-123").await;
+        assert!(result.is_ok());
+
+        let result = ensure_session_id_field(&client, "PID-123").await;
+        assert!(result.is_ok());
+
+        mock.verify().await;
 
         if let Some(val) = saved {
             unsafe {
@@ -414,5 +489,176 @@ mod tests {
                 std::env::remove_var("GITHUB_TOKEN");
             }
         }
+    }
+
+    // T-n: find_project_by_name finds user project by title
+    #[tokio::test]
+    async fn find_project_by_name_user_project() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": {
+                        "projectsV2": {
+                            "nodes": [
+                                {"id":"PVT-1","number":1,"title":"my-repo"},
+                                {"id":"PVT-2","number":2,"title":"other"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let client =
+            git_automate::external_issues::github::client::GitHubClient::new_with_base_url(
+                "test-token".to_string(),
+                mock.uri(),
+            )
+            .expect("client");
+
+        let result = client.find_project_by_name("myuser", "my-repo").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "PVT-1");
+        mock.verify().await;
+    }
+
+    // T-n: find_project_by_name falls back to org
+    #[tokio::test]
+    async fn find_project_by_name_falls_back_to_org() {
+        let mock = MockServer::start().await;
+
+        // User query succeeds but no matching title
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("user(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": {
+                        "projectsV2": { "nodes": [] }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Org query finds it
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("organization(login:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "organization": {
+                        "projectsV2": {
+                            "nodes": [
+                                {"id":"PVT-org-1","number":3,"title":"my-repo"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let client =
+            git_automate::external_issues::github::client::GitHubClient::new_with_base_url(
+                "test-token".to_string(),
+                mock.uri(),
+            )
+            .expect("client");
+
+        let result = client.find_project_by_name("myorg", "my-repo").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "PVT-org-1");
+        mock.verify().await;
+    }
+
+    // T-n: find_project_by_name returns NotFound when no match
+    #[tokio::test]
+    async fn find_project_by_name_not_found() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectsV2": { "nodes": [] } },
+                    "organization": { "projectsV2": { "nodes": [] } }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let client =
+            git_automate::external_issues::github::client::GitHubClient::new_with_base_url(
+                "test-token".to_string(),
+                mock.uri(),
+            )
+            .expect("client");
+
+        let result = client.find_project_by_name("myuser", "nonexistent").await;
+        assert!(result.is_err());
+    }
+
+    // T-n: write_doctor_config writes correct YAML
+    #[tokio::test]
+    async fn write_doctor_config_creates_valid_yaml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("git-automate.yml");
+
+        let result = write_doctor_config(
+            &config_path,
+            "my-repo",
+            "https://github.com/owner/my-repo",
+            "PID-123",
+        );
+        assert!(result.is_ok());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let data: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+
+        let pid = data
+            .get("projects")
+            .and_then(|p| p.get("my-repo"))
+            .and_then(|p| p.get("projectId"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(pid, "PID-123");
+
+        let repo = data
+            .get("projects")
+            .and_then(|p| p.get("my-repo"))
+            .and_then(|p| p.get("repository"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(repo, "https://github.com/owner/my-repo");
+    }
+
+    // T-n: write_doctor_config updates existing config
+    #[tokio::test]
+    async fn write_doctor_config_updates_existing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("git-automate.yml");
+        std::fs::write(
+            &config_path,
+            "projects:\n  my-repo:\n    repository: https://github.com/owner/my-repo\n",
+        )
+        .unwrap();
+
+        let result = write_doctor_config(
+            &config_path,
+            "my-repo",
+            "https://github.com/owner/my-repo",
+            "PID-456",
+        );
+        assert!(result.is_ok());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("projectId: PID-456"));
     }
 }

@@ -5,6 +5,7 @@
 //! context + field resolution used by every workflow check.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 use regex::Regex;
 use serde_json::{Value, json};
@@ -542,6 +543,43 @@ pub async fn resolve_status_option_and_session(
         .ok_or_else(|| WorkflowError::NoSessionField(project_id.to_string()))?;
 
     Ok((status_field.id, option_id, session_field))
+}
+
+pub fn detect_git_remote() -> Option<ParsedRepo> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    parse_repository_url(&url).ok()
+}
+
+pub fn write_doctor_config(
+    config_path: &Path,
+    project_name: &str,
+    repository: &str,
+    project_id: &str,
+) -> Result<(), WorkflowError> {
+    let yaml = format!(
+        "projects:\n  {}:\n    repository: {}\n    projectId: {}\n",
+        project_name, repository, project_id
+    );
+    std::fs::write(config_path, yaml)?;
+    Ok(())
+}
+
+pub fn prompt_input(message: &str) -> String {
+    print!("{}", message);
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok();
+    input.trim().to_string()
 }
 
 // ─── Tests ────────────────────────────────────────────────────

@@ -1,0 +1,11 @@
+query($login: String!) {
+  user(login: $login) {
+    projectsV2(first: 100) {
+      nodes {
+        id
+        number
+        title
+      }
+    }
+  }
+}

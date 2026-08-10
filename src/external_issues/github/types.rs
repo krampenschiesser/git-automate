@@ -303,6 +303,34 @@ pub struct IdHolder {
     pub id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ProjectV2ListNode {
+    pub id: String,
+    pub number: i64,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ProjectV2ListInner {
+    pub nodes: Vec<ProjectV2ListNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ProjectV2ListHolder {
+    #[serde(rename = "projectsV2")]
+    pub projects_v2: ProjectV2ListInner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct UserProjectsResult {
+    pub user: Option<ProjectV2ListHolder>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct OrgProjectsResult {
+    pub organization: Option<ProjectV2ListHolder>,
+}
+
 // ─── Issue hierarchy (GraphQL) ────────────────────────────────
 
 /// A single issue node with its parent issue number (if any).
