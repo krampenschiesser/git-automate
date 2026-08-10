@@ -241,6 +241,7 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("updateProjectV2Field"))
+        .and(body_string_contains("... on ProjectV2Field"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "updateProjectV2Field": {
@@ -516,6 +517,7 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("updateProjectV2Field"))
+        .and(body_string_contains("... on ProjectV2Field"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "updateProjectV2Field": {
