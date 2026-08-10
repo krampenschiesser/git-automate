@@ -47,6 +47,9 @@ enum Commands {
         /// Path to the git-automate.yml config file
         #[arg(long, default_value = git_automate::config::DEFAULT_CONFIG_FILE)]
         config: PathBuf,
+        /// Run a single workflow cycle and exit (no polling loop)
+        #[arg(long)]
+        once: bool,
     },
     /// Check OpenCode server health
     Health {
@@ -75,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Serve { config } => serve(&config).await,
+        Commands::Serve { config, once } => serve(&config, once).await,
         Commands::Health { url, pw } => check_health(&url, &pw).await,
         Commands::Doctor { config } => doctor(&config).await,
     }
@@ -182,8 +185,16 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 // ─── serve ───────────────────────────────────────────────────
 
-async fn serve(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(config_path: &Path, once: bool) -> Result<(), Box<dyn std::error::Error>> {
     let workflow = setup(config_path).await?;
+
+    if once {
+        tracing::info!("Running single workflow cycle (--once mode)");
+        if let Err(e) = workflow.run_all().await {
+            tracing::error!("RunAll failed: {}", e);
+        }
+        return Ok(());
+    }
 
     tracing::info!("Starting git-automate daemon");
     if let Err(e) = workflow.run_all().await {
