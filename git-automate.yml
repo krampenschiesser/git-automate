@@ -2,7 +2,7 @@ concurrency: 4
 projects:
   sks-iac:
     repository: https://github.com/krampenschiesser/sks-iac
-    projectId: PVT_kwHOAAfr284BfXl6
+    projectId: 1
     issueProvider: github
     opencode:
       url: http://localhost:8081
