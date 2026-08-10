@@ -796,3 +796,187 @@ projects:
         "projectId in YAML should be the resolved global ID"
     );
 }
+
+// ─── Test 12: Doctor does NOT persist resolved projectId ────────────
+//
+// When running `git-automate doctor`, the numeric projectId should be
+// resolved in-memory (so status options and sessionId checks still run),
+// but the resolved global ID must NOT be written back to `git-automate.yml`.
+//
+// Mocks:
+//   - `projectV2(number:`  → returns global ID "PVT-resolved" for project #4
+//   - `field(name:`        → returns Status field with all 7 options
+//   - `fields(first:`      → returns Status + sessionId fields
+//   - `createProjectV2Field` / `updateProjectV2Field` → should NOT be called
+
+#[tokio::test]
+async fn test_doctor_does_not_persist_resolved_project_id() {
+    let gh_mock = MockServer::start().await;
+
+    // 1. get_project_by_number → resolve numeric "4" to global ID
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("projectV2(number:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "user": { "projectV2": { "id": "PVT-resolved" } },
+                "organization": null
+            }
+        })))
+        .expect(1)
+        .named("resolve_project_number")
+        .mount(&gh_mock)
+        .await;
+
+    // 2. ensure_status_options: Status field with all 7 options
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": {
+                        "id": "status-field-id",
+                        "options": [
+                            {"id": "o1", "name": "Triage"},
+                            {"id": "o2", "name": "Todo"},
+                            {"id": "o3", "name": "In Development"},
+                            {"id": "o4", "name": "Review Technical"},
+                            {"id": "o5", "name": "Review Product"},
+                            {"id": "o6", "name": "QA"},
+                            {"id": "o7", "name": "Done"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_status_field")
+        .mount(&gh_mock)
+        .await;
+
+    // 3. updateProjectV2Field should NOT be called (all options present)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateProjectV2Field"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("add_status_options_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // 4. ensure_session_id_field: project fields include sessionId
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            {"id": "f1", "name": "Status", "dataType": "SINGLE_SELECT"},
+                            {"id": "f2", "name": "sessionId", "dataType": "TEXT"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .named("get_project_fields")
+        .mount(&gh_mock)
+        .await;
+
+    // 5. createProjectV2Field should NOT be called (sessionId exists)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("add_session_id_field_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // 6. createProjectV2 should NOT be called (project_id is set)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2(input"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .named("create_project_v2_should_not_be_called")
+        .mount(&gh_mock)
+        .await;
+
+    // ── Arrange: config with numeric projectId ────────────────────
+    let tmp = tempdir().expect("tempdir should succeed");
+    let config_path = tmp.path().join("git-automate.yml");
+    let yaml = r#"
+projects:
+  my-proj:
+    repository: "https://github.com/owner/repo"
+    projectId: 4
+    titlePattern: "@ai.*"
+"#;
+    std::fs::write(&config_path, yaml).expect("write should succeed");
+
+    let config = parse_config(&config_path).expect("parse_config should succeed");
+    assert_eq!(
+        config
+            .projects
+            .get("my-proj")
+            .unwrap()
+            .project_id
+            .as_deref(),
+        Some("4"),
+        "project should have numeric projectId '4'"
+    );
+
+    // ── Act ────────────────────────────────────────────────────────
+    let client = gh_client(&gh_mock);
+    let deps = WorkflowContext {
+        config,
+        github: Some(client),
+        shell: mock_shell(),
+    };
+
+    // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
+    let _guard = SET_CWD_MUTEX.lock().await;
+    let original_dir = std::env::current_dir().expect("current_dir should succeed");
+    std::env::set_current_dir(tmp.path()).expect("set_current_dir should succeed");
+
+    let workflow = Workflow::new(deps);
+    let result = workflow.run_doctor_check().await;
+
+    std::env::set_current_dir(&original_dir).expect("restore cwd should succeed");
+
+    // ── Assert ────────────────────────────────────────────────────
+    assert!(
+        result.is_ok(),
+        "run_doctor_check should succeed with numeric projectId"
+    );
+
+    gh_mock.verify().await;
+
+    // Verify the config file was NOT modified — projectId should still be
+    // the original numeric value `4`, not the resolved global ID "PVT-resolved".
+    let written = std::fs::read_to_string(&config_path).expect("read should succeed");
+    let data: serde_yaml::Value =
+        serde_yaml::from_str(&written).expect("yaml parse should succeed");
+    let pid = data
+        .get("projects")
+        .and_then(|p| p.get("my-proj"))
+        .and_then(|p| p.get("projectId"))
+        .expect("projectId should still exist in YAML after doctor");
+
+    // The value should be the original number/string "4", NOT "PVT-resolved".
+    assert_ne!(
+        pid.as_str(),
+        Some("PVT-resolved"),
+        "projectId in YAML should NOT be overwritten with the resolved global ID during doctor"
+    );
+    // Verify it's still the original numeric value (either as integer or string).
+    assert!(
+        pid.as_i64() == Some(4) || pid.as_str() == Some("4"),
+        "projectId in YAML should still be the original value '4', got: {:?}",
+        pid
+    );
+}

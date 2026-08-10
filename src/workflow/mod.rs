@@ -180,13 +180,22 @@ impl Workflow {
     /// For each project: parse the repo URL, create the GitHub project if
     /// missing, ensure status options, and ensure the sessionId field.
     pub async fn run_setup_check(&self) -> Result<(), WorkflowError> {
+        self.run_setup_check_impl(true).await
+    }
+
+    /// Like `run_setup_check` but skips writing resolved project IDs back to
+    /// the config file when `persist` is `false` (used by `doctor`).
+    async fn run_setup_check_impl(&self, persist: bool) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
             tracing::warn!("GitHub client not available — skipping setup check");
             return Ok(());
         };
 
         for (project_name, project_config) in &self.deps.config.projects {
-            if let Err(e) = self.setup_project(project_name, project_config).await {
+            if let Err(e) = self
+                .setup_project(project_name, project_config, persist)
+                .await
+            {
                 tracing::error!("Setup check failed for {}: {}", project_name, e);
             }
         }
@@ -287,7 +296,7 @@ impl Workflow {
     }
 
     pub async fn run_doctor_check(&self) -> Result<(), WorkflowError> {
-        let _ = self.run_setup_check().await;
+        let _ = self.run_setup_check_impl(false).await;
 
         for (project_name, project_config) in &self.deps.config.projects {
             if project_config.opencode.is_none() {
@@ -316,7 +325,16 @@ impl Workflow {
 
     /// Parse the repository URL, create the GitHub project if it doesn't
     /// exist yet, then ensure status options and the sessionId field.
-    async fn setup_project(&self, name: &str, config: &ProjectConfig) -> Result<(), WorkflowError> {
+    ///
+    /// When `persist` is `true`, resolved/created project IDs are written back
+    /// to `git-automate.yml`. When `false` (used by `doctor`), the ID is
+    /// resolved in-memory only and the config file is left unchanged.
+    async fn setup_project(
+        &self,
+        name: &str,
+        config: &ProjectConfig,
+        persist: bool,
+    ) -> Result<(), WorkflowError> {
         let ParsedRepo { owner, repo } = parse_repository_url(&config.repository)
             .map_err(|e| WorkflowError::Other(e.to_string()))?;
 
@@ -328,7 +346,7 @@ impl Workflow {
 
         let project_id = if let Some(pid) = &config.project_id {
             let (resolved, was_resolved) = resolve_project_id(github, &owner, pid).await?;
-            if was_resolved {
+            if was_resolved && persist {
                 let mut config_clone = self.deps.config.clone();
                 write_project_id(name, &resolved, &mut config_clone).await?;
             }
@@ -336,8 +354,10 @@ impl Workflow {
         } else {
             tracing::info!("Creating project {} for {}/{}", name, owner, repo);
             let pid = github.create_project(&owner, name).await?;
-            let mut config_clone = self.deps.config.clone();
-            write_project_id(name, &pid, &mut config_clone).await?;
+            if persist {
+                let mut config_clone = self.deps.config.clone();
+                write_project_id(name, &pid, &mut config_clone).await?;
+            }
             pid
         };
 
@@ -1113,7 +1133,7 @@ mod tests {
         std::env::set_current_dir(tmp.path()).unwrap();
 
         let workflow = Workflow::new(deps);
-        let result = workflow.setup_project("test-proj", &project).await;
+        let result = workflow.setup_project("test-proj", &project, true).await;
 
         std::env::set_current_dir(&original_dir).unwrap();
 
@@ -1205,7 +1225,7 @@ mod tests {
         };
 
         let workflow = Workflow::new(deps);
-        let result = workflow.setup_project("test-proj", &project).await;
+        let result = workflow.setup_project("test-proj", &project, true).await;
 
         assert!(result.is_ok());
     }
