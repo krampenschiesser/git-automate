@@ -5,7 +5,7 @@
 //! Behaviour:
 //!   - Config failure → **exit** (daemon mode is stricter than the TS plugin).
 //!   - `GITHUB_TOKEN` unset/empty → **exit** (fail fast).
-//!   - Logging goes through `tracing` with `[git-automate][LEVEL] message` format.
+//!   - Logging goes through `tracing` with a default `FmtSubscriber`.
 //!   - Startup `run_all()` → catch + log `"Startup runAll failed: {e}"`.
 //!   - Polling `run_all()` → catch + log `"Polling runAll failed: {e}"`.
 //!   - SIGINT/SIGTERM → `"Received shutdown signal, exiting"`, break.
