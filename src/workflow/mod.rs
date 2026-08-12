@@ -1262,12 +1262,12 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/agent"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","description":"t","mode":"subagent","builtIn":true},
-                {"name":"git-automate-taskmanager","description":"t","mode":"subagent","builtIn":true},
-                {"name":"git-automate-developer","description":"t","mode":"subagent","builtIn":true},
-                {"name":"git-automate-reviewer","description":"t","mode":"subagent","builtIn":true},
-                {"name":"git-automate-product","description":"t","mode":"subagent","builtIn":true},
-                {"name":"git-automate-qa","description":"t","mode":"subagent","builtIn":true},
+                {"name":"git-automate-triage","description":"t","mode":"subagent","native":true},
+                {"name":"git-automate-taskmanager","description":"t","mode":"subagent","native":true},
+                {"name":"git-automate-developer","description":"t","mode":"subagent","native":true},
+                {"name":"git-automate-reviewer","description":"t","mode":"subagent","native":true},
+                {"name":"git-automate-product","description":"t","mode":"subagent","native":true},
+                {"name":"git-automate-qa","description":"t","mode":"subagent","native":true},
             ])))
             .expect(1)
             .mount(&mock)
@@ -1344,8 +1344,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/agent"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","description":"t","mode":"subagent","builtIn":true},
-                {"name":"git-automate-developer","description":"t","mode":"subagent","builtIn":true},
+                {"name":"git-automate-triage","description":"t","mode":"subagent","native":true},
+                {"name":"git-automate-developer","description":"t","mode":"subagent","native":true},
             ])))
             .mount(&mock)
             .await;
@@ -1382,12 +1382,12 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/agent"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","mode":"subagent","builtIn":true},
-                {"name":"git-automate-taskmanager","mode":"subagent","builtIn":true},
-                {"name":"git-automate-developer","mode":"subagent","builtIn":true},
-                {"name":"git-automate-reviewer","mode":"subagent","builtIn":true},
-                {"name":"git-automate-product","mode":"subagent","builtIn":true},
-                {"name":"git-automate-qa","mode":"subagent","builtIn":true},
+                {"name":"git-automate-triage","mode":"subagent","native":true},
+                {"name":"git-automate-taskmanager","mode":"subagent","native":true},
+                {"name":"git-automate-developer","mode":"subagent","native":true},
+                {"name":"git-automate-reviewer","mode":"subagent","native":true},
+                {"name":"git-automate-product","mode":"subagent","native":true},
+                {"name":"git-automate-qa","mode":"subagent","native":true},
             ])))
             .mount(&mock)
             .await;

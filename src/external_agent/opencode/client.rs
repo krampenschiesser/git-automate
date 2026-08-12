@@ -340,7 +340,7 @@ mod tests {
             .and(path("/agent"))
             .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                { "name": "agent1", "mode": "subagent", "builtIn": true }
+                { "name": "agent1", "mode": "subagent", "native": true }
             ])))
             .expect(1);
         let server = MockServer::start().await;
@@ -361,7 +361,7 @@ mod tests {
                 {
                     "name": "a",
                     "mode": "primary",
-                    "builtIn": false,
+                    "native": false,
                     "description": "test"
                 }
             ])))
