@@ -6,12 +6,16 @@ query ListProjectItems($id: ID!) {
                     id
                     content {
                         __typename
-                        id
                         ... on Issue {
+                            id
                             number
                         }
                         ... on PullRequest {
+                            id
                             number
+                        }
+                        ... on DraftIssue {
+                            id
                         }
                     }
                 }
