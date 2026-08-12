@@ -23,7 +23,7 @@ use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::external_issues::github::repo::parse_repository_url;
 use git_automate::shell::{ShellFn, ShellOutput};
 use git_automate::workflow::Workflow;
-use git_automate::workflow::helpers::WorkflowContext;
+use git_automate::workflow::helpers::{WorkflowContext, resolve_project_id};
 
 use git_automate::test_utils::SET_CWD_MUTEX;
 
@@ -54,6 +54,7 @@ fn real_shell() -> ShellFn {
 async fn e2e_triage_flow_creates_session() {
     // ── 1. Load .env ──────────────────────────────────────────────
     dotenv().ok();
+    let _ = tracing_subscriber::fmt::try_init();
 
     let token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
     let opencode_pw = std::env::var("OPENCODE_PW").unwrap_or_default();
@@ -68,17 +69,14 @@ async fn e2e_triage_flow_creates_session() {
     let config_path = project_root.join("git-automate.yml");
     let config = parse_config(&config_path).expect("Failed to parse git-automate.yml");
 
-    // Resolve project name and config (assume one project)
-    let project_name = config
+    // Pick a project with OpenCode settings: BTreeMap iteration is sorted, so
+    // `keys().next()` is not guaranteed to return the project intended for e2e.
+    let (project_name, project_config) = config
         .projects
-        .keys()
-        .next()
-        .expect("Config has no projects")
-        .clone();
-    let project_config = config
-        .projects
-        .get(&project_name)
-        .expect("Project missing from config");
+        .iter()
+        .find(|(_, c)| c.opencode.is_some())
+        .expect("No project with opencode settings found in config");
+    let _project_name = project_name.clone();
 
     let oc_config = project_config
         .opencode
@@ -94,6 +92,40 @@ async fn e2e_triage_flow_creates_session() {
 
     // ── 4. Create OpenCode client (for verification) ──────────────
     let opencode = OpenCodeClient::new(oc_config.url.clone(), oc_config.pw.clone());
+
+    // Skip if the required git-automate agents are not installed. The agents
+    // must be present in the OpenCode server's agents directory for the
+    // workflow to start triage/todo/review sessions.
+    let required_agents = [
+        "git-automate-triage",
+        "git-automate-taskmanager",
+        "git-automate-developer",
+        "git-automate-reviewer",
+        "git-automate-product",
+        "git-automate-qa",
+    ];
+    let installed_agents = match opencode.get_agents(None).await {
+        Ok(agents) => agents
+            .into_iter()
+            .map(|a| a.name)
+            .collect::<std::collections::HashSet<_>>(),
+        Err(e) => {
+            eprintln!("e2e test skipped: failed to list OpenCode agents: {}", e);
+            return;
+        }
+    };
+    let missing: Vec<_> = required_agents
+        .iter()
+        .filter(|name| !installed_agents.contains(**name))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "e2e test skipped: required OpenCode agents missing: {}",
+            missing.join(", ")
+        );
+        return;
+    }
 
     // ── 5. Create a unique @ai issue ──────────────────────────────
     let issue_title = format!(
@@ -117,6 +149,25 @@ async fn e2e_triage_flow_creates_session() {
         created_issue.number, issue_title, parsed.owner, parsed.repo
     );
 
+    // Wait for the newly created issue to be visible via the REST API before
+    // driving the workflow; GitHub's issue list is eventually consistent.
+    let mut visible = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match github.list_repo_issues(&parsed.owner, &parsed.repo).await {
+            Ok(issues) if issues.iter().any(|i| i.number == created_issue.number) => {
+                visible = true;
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(
+        visible,
+        "Created issue #{} not visible in repo issues",
+        created_issue.number
+    );
+
     // ── 6. Run the workflow ───────────────────────────────────────
     // Serialize cwd changes; set to project root where git-automate.yml lives
     let _cwd_guard = SET_CWD_MUTEX.lock().await;
@@ -133,22 +184,22 @@ async fn e2e_triage_flow_creates_session() {
     let workflow = Workflow::new(deps);
     workflow.run_all().await.expect("workflow.run_all() failed");
 
-    // ── 7. Re-parse config to get resolved project ID ─────────────
-    // The setup step may have resolved a numeric projectId to a global ID
-    // and persisted it back via write_project_id.
-    let resolved_config = parse_config(&config_path).expect("Failed to re-parse config");
-    let resolved_project = resolved_config
-        .projects
-        .get(&project_name)
-        .expect("Project missing after workflow");
-    let project_id = resolved_project
+    // ── 7. Resolve the project ID to a global node ID ─────────────
+    // Numeric project IDs are resolved at runtime and are not persisted to
+    // config, so re-parsing the file would still yield the numeric value.
+    // Explicitly resolve it here before using it for project-item queries.
+    let config_project_id = project_config
         .project_id
         .as_ref()
-        .expect("Project ID not resolved after workflow");
+        .expect("Project ID missing from config");
+    let project_id = resolve_project_id(&github, &parsed.owner, config_project_id)
+        .await
+        .expect("Failed to resolve project ID")
+        .0;
 
     // ── 8. Verify: issue is in the project ────────────────────────
     let items = github
-        .list_project_items(project_id)
+        .list_project_items(&project_id)
         .await
         .expect("Failed to list project items");
 
