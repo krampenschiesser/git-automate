@@ -1,9 +1,10 @@
 concurrency: 4
+githubToken: ${env:GITHUB_TOKEN}
 projects:
-  sks-iac:
+  git-automate:
     repository: https://github.com/krampenschiesser/git-automate
     projectId: 5
     issueProvider: github
     opencode:
-      url: http://localhost:8081
+      url: ${env:OPENCODE_URL}
       pw: ${env:OPENCODE_PW}
