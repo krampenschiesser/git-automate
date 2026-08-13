@@ -11,6 +11,7 @@
 //!    - The issue's Status field is "Triage"
 //!    - The issue has a non-empty `sessionId` field
 //!    - An OpenCode session exists (`GET /session/status` reports active sessions)
+//!    - The session's initial prompt contains the issue body (`GET /session/{id}/message`)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -263,7 +264,30 @@ async fn e2e_triage_flow_creates_session() {
 
     eprintln!("Verified: OpenCode has {} active session(s)", active_count);
 
-    // ── 12. Cleanup: restore cwd ──────────────────────────────────
+    // ── 12. Verify: initial prompt contains issue content ───────────
+    let messages = opencode
+        .get_session_messages(session_id, None)
+        .await
+        .expect("Failed to fetch session messages");
+
+    let first_user_message = messages
+        .iter()
+        .find(|m| m.is_user())
+        .unwrap_or_else(|| panic!("No user message found in session {}", session_id));
+
+    let prompt_text = first_user_message.text();
+    assert!(
+        prompt_text.contains("git-automate picks up @ai-tagged issues"),
+        "Expected the initial prompt to contain the issue body, got: {}",
+        prompt_text
+    );
+
+    eprintln!(
+        "Verified: session {} initial prompt contains issue content",
+        session_id
+    );
+
+    // ── 13. Cleanup: restore cwd ──────────────────────────────────
     std::env::set_current_dir(&original_dir)
         .unwrap_or_else(|e| panic!("Failed to restore cwd: {}", e));
     drop(_cwd_guard);
