@@ -537,6 +537,7 @@ mod tests {
             config: GitAutomateConfig {
                 projects,
                 concurrency: None,
+                github_token: None,
             },
             github: None,
             shell: mock_shell(),
@@ -645,6 +646,7 @@ mod tests {
             config: GitAutomateConfig {
                 projects,
                 concurrency: None,
+                github_token: None,
             },
             github: Some(client),
             shell: mock_shell(),
@@ -702,6 +704,7 @@ mod tests {
             config: GitAutomateConfig {
                 projects,
                 concurrency: None,
+                github_token: None,
             },
             github: Some(client),
             shell: mock_shell(),
@@ -727,6 +730,7 @@ mod tests {
             config: GitAutomateConfig {
                 projects,
                 concurrency: None,
+                github_token: None,
             },
             github: Some(client),
             shell: mock_shell(),
@@ -838,6 +842,7 @@ mod tests {
                     m
                 },
                 concurrency: None,
+                github_token: None,
             },
             github: Some(client),
             shell: mock_shell(),
@@ -937,6 +942,7 @@ mod tests {
                     m
                 },
                 concurrency: None,
+                github_token: None,
             },
             github: Some(client),
             shell: mock_shell(),
@@ -1033,6 +1039,7 @@ mod tests {
                     m
                 },
                 concurrency: None,
+                github_token: None,
             },
             github: Some(client),
             shell: mock_shell(),

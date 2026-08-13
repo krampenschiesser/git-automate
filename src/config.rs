@@ -66,6 +66,8 @@ pub struct GitAutomateConfig {
     pub projects: BTreeMap<String, ProjectConfig>,
     #[serde(default)]
     pub concurrency: Option<usize>,
+    #[serde(rename = "githubToken", default)]
+    pub github_token: Option<String>,
 }
 
 /// Compiled regex for `${env:VAR}` patterns, cached via `OnceLock`.

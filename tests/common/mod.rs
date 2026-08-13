@@ -82,6 +82,7 @@ pub fn make_deps(
         config: GitAutomateConfig {
             projects,
             concurrency: None,
+            github_token: None,
         },
         github,
         shell: mock_shell(),

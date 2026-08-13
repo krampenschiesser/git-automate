@@ -79,12 +79,14 @@ pub struct FieldIds {
 #[derive(Clone)]
 pub struct ShellDeps {
     pub shell: ShellFn,
+    pub github_token: Option<String>,
 }
 
 impl std::fmt::Debug for ShellDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShellDeps")
             .field("shell", &"<shell_fn>")
+            .field("github_token", &"<redacted>")
             .finish()
     }
 }
@@ -119,6 +121,7 @@ impl WorkflowContext {
     pub fn shell_deps(&self) -> ShellDeps {
         ShellDeps {
             shell: self.shell.clone(),
+            github_token: self.config.github_token.clone(),
         }
     }
 
@@ -235,7 +238,12 @@ pub async fn clone_repo_if_needed(
         .expect("clone path always has a parent");
     std::fs::create_dir_all(parent)?;
 
-    let token = std::env::var("GITHUB_TOKEN").ok();
+    let token = deps
+        .github_token
+        .as_ref()
+        .filter(|t| !t.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()));
     let repo_url = if let Some(t) = token {
         format!(
             "https://x-access-token:{}@github.com/{}/{}.git",
@@ -865,6 +873,7 @@ mod tests {
         let mut config = GitAutomateConfig {
             projects: std::collections::BTreeMap::new(),
             concurrency: None,
+            github_token: None,
         };
 
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
@@ -1033,6 +1042,7 @@ mod tests {
         GitAutomateConfig {
             projects,
             concurrency: None,
+            github_token: None,
         }
     }
 
@@ -1956,6 +1966,7 @@ mod tests {
             config: GitAutomateConfig {
                 projects: std::collections::BTreeMap::new(),
                 concurrency: None,
+                github_token: None,
             },
             github: None,
             shell: shell.clone(),
@@ -1972,6 +1983,7 @@ mod tests {
         let config = GitAutomateConfig {
             projects: std::collections::BTreeMap::new(),
             concurrency: None,
+            github_token: None,
         };
         let deps = WorkflowContext {
             config: config.clone(),
