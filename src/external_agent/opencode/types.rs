@@ -64,3 +64,56 @@ impl From<Agent> for AgentInfo {
         }
     }
 }
+
+// ─── Session messages (GET /session/{id}/message) ──────────────────
+
+/// A message entry returned by `GET /session/{id}/message`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionMessage {
+    pub info: SessionMessageInfo,
+    #[serde(default)]
+    pub parts: Vec<SessionMessagePart>,
+}
+
+impl SessionMessage {
+    pub fn is_user(&self) -> bool {
+        self.info.role == "user"
+    }
+
+    pub fn text(&self) -> String {
+        let mut result = String::new();
+        for part in &self.parts {
+            if let SessionMessagePart::Text { text } = part
+                && !text.is_empty()
+            {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(text);
+            }
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SessionMessageInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default, rename = "sessionID")]
+    pub session_id: String,
+    #[serde(default)]
+    pub time: Option<SessionTime>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SessionMessagePart {
+    Text {
+        text: String,
+    },
+    #[serde(other)]
+    Other,
+}
