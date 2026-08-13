@@ -17,8 +17,7 @@ pub struct Agent {
     pub name: String,
     pub description: Option<String>,
     pub mode: AgentMode,
-    #[serde(rename = "builtIn")]
-    pub built_in: bool,
+    pub native: bool,
 }
 
 /// Timestamps associated with a session.
@@ -49,7 +48,7 @@ pub struct HealthResponse {
 
 /// Non-serde info struct returned by `get_agents`.
 ///
-/// Strips the `mode` and `built_in` fields, projecting an [`Agent`] down to
+/// Strips the `mode` and `native` fields, projecting an [`Agent`] down to
 /// just the user-facing `name` and `description`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgentInfo {

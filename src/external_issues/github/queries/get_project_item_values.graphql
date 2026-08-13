@@ -3,12 +3,91 @@ query GetProjectItemValues($id: ID!) {
         ... on ProjectV2Item {
             fieldValues(first: 100) {
                 nodes {
-                    name
+                    __typename
                     ... on ProjectV2ItemFieldTextValue {
                         text
+                        field {
+                            ... on ProjectV2Field {
+                                name
+                            }
+                            ... on ProjectV2SingleSelectField {
+                                name
+                            }
+                            ... on ProjectV2IterationField {
+                                name
+                            }
+                            ... on ProjectV2MultiSelectField {
+                                name
+                            }
+                        }
                     }
                     ... on ProjectV2ItemFieldSingleSelectValue {
-                        option
+                        name
+                        field {
+                            ... on ProjectV2Field {
+                                name
+                            }
+                            ... on ProjectV2SingleSelectField {
+                                name
+                            }
+                            ... on ProjectV2IterationField {
+                                name
+                            }
+                            ... on ProjectV2MultiSelectField {
+                                name
+                            }
+                        }
+                    }
+                    ... on ProjectV2ItemFieldNumberValue {
+                        number
+                        field {
+                            ... on ProjectV2Field {
+                                name
+                            }
+                            ... on ProjectV2SingleSelectField {
+                                name
+                            }
+                            ... on ProjectV2IterationField {
+                                name
+                            }
+                            ... on ProjectV2MultiSelectField {
+                                name
+                            }
+                        }
+                    }
+                    ... on ProjectV2ItemFieldDateValue {
+                        date
+                        field {
+                            ... on ProjectV2Field {
+                                name
+                            }
+                            ... on ProjectV2SingleSelectField {
+                                name
+                            }
+                            ... on ProjectV2IterationField {
+                                name
+                            }
+                            ... on ProjectV2MultiSelectField {
+                                name
+                            }
+                        }
+                    }
+                    ... on ProjectV2ItemFieldIterationValue {
+                        title
+                        field {
+                            ... on ProjectV2Field {
+                                name
+                            }
+                            ... on ProjectV2SingleSelectField {
+                                name
+                            }
+                            ... on ProjectV2IterationField {
+                                name
+                            }
+                            ... on ProjectV2MultiSelectField {
+                                name
+                            }
+                        }
                     }
                 }
             }

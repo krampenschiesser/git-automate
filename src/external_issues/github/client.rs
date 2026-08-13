@@ -421,11 +421,12 @@ impl GitHubClient {
             .filter(|item| item.content.is_some())
             .filter_map(|item| {
                 let content = item.content?;
+                let number = content.number?;
                 Some(ProjectItem {
                     id: item.id,
                     content_node_id: content.id,
                     content_type: content.typename,
-                    content_number: content.number,
+                    content_number: number,
                 })
             })
             .collect();
@@ -450,7 +451,7 @@ impl GitHubClient {
                     "projectId": project_id,
                     "itemId": item_id,
                     "fieldId": field_id,
-                    "value": { "optionId": option_id },
+                    "value": { "singleSelectOptionId": option_id },
                 }
             })),
         )
@@ -522,8 +523,39 @@ impl GitHubClient {
 
         if let Some(node) = result.node {
             for field in node.field_values.nodes {
-                let Some(name) = field.name else { continue };
-                let value = field.text.or(field.option);
+                let (name, value) = match field {
+                    NodeFieldValueNode::Text { text, field } => {
+                        let Some(name) = field.and_then(|f| f.name) else {
+                            continue;
+                        };
+                        (name, text)
+                    }
+                    NodeFieldValueNode::SingleSelect { name: value, field } => {
+                        let Some(name) = field.and_then(|f| f.name) else {
+                            continue;
+                        };
+                        (name, value)
+                    }
+                    NodeFieldValueNode::Number { number, field } => {
+                        let Some(name) = field.and_then(|f| f.name) else {
+                            continue;
+                        };
+                        (name, number.map(|n| n.to_string()))
+                    }
+                    NodeFieldValueNode::Date { date, field } => {
+                        let Some(name) = field.and_then(|f| f.name) else {
+                            continue;
+                        };
+                        (name, date)
+                    }
+                    NodeFieldValueNode::Iteration { title, field } => {
+                        let Some(name) = field.and_then(|f| f.name) else {
+                            continue;
+                        };
+                        (name, title)
+                    }
+                    NodeFieldValueNode::Other => continue,
+                };
                 values.insert(name, value);
             }
         }
@@ -796,7 +828,7 @@ mod tests {
             .await;
 
         let result: CreateProjectV2Result = client
-            .graphql(include_str!("queries/test_create_project_v2.graphql"), None)
+            .graphql(include_str!("queries/create_project.graphql"), None)
             .await
             .expect("graphql should succeed");
 
@@ -818,7 +850,7 @@ mod tests {
             .await;
 
         let result: Result<CreateProjectV2Result, _> = client
-            .graphql(include_str!("queries/test_create_project_v2.graphql"), None)
+            .graphql(include_str!("queries/create_project.graphql"), None)
             .await;
 
         assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
@@ -839,7 +871,7 @@ mod tests {
             .await;
 
         let result: Result<CreateProjectV2Result, _> = client
-            .graphql(include_str!("queries/test_create_project_v2.graphql"), None)
+            .graphql(include_str!("queries/create_project.graphql"), None)
             .await;
 
         match result {
@@ -865,7 +897,7 @@ mod tests {
             .await;
 
         let result: Result<CreateProjectV2Result, _> = client
-            .graphql(include_str!("queries/test_create_project_v2.graphql"), None)
+            .graphql(include_str!("queries/create_project.graphql"), None)
             .await;
 
         assert!(result.is_err());
@@ -1250,8 +1282,22 @@ mod tests {
                     "node": {
                         "fieldValues": {
                             "nodes": [
-                                { "name": "Status", "text": "Triage" },
-                                { "name": "sessionId" }
+                                {
+                                    "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                                    "name": "Triage",
+                                    "field": {
+                                        "__typename": "ProjectV2Field",
+                                        "name": "Status"
+                                    }
+                                },
+                                {
+                                    "__typename": "ProjectV2ItemFieldTextValue",
+                                    "text": null,
+                                    "field": {
+                                        "__typename": "ProjectV2Field",
+                                        "name": "sessionId"
+                                    }
+                                }
                             ]
                         }
                     }

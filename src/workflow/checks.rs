@@ -492,6 +492,24 @@ mod tests {
         }
     }
 
+    /// Build a field-value node for a text field (e.g. `sessionId`).
+    fn text_field_value(name: &str, text: Option<&str>) -> serde_json::Value {
+        json!({
+            "__typename": "ProjectV2ItemFieldTextValue",
+            "text": text,
+            "field": {"__typename": "ProjectV2Field", "name": name}
+        })
+    }
+
+    /// Build a field-value node for a single-select field (e.g. `Status`).
+    fn single_select_field_value(name: &str, option_name: &str) -> serde_json::Value {
+        json!({
+            "__typename": "ProjectV2ItemFieldSingleSelectValue",
+            "name": option_name,
+            "field": {"__typename": "ProjectV2Field", "name": name}
+        })
+    }
+
     /// Mount common GitHub mocks needed by the triage check.
     async fn mount_triage_github_mocks(
         server: &MockServer,
@@ -1203,7 +1221,7 @@ mod tests {
         // Issue already has a session → should NOT start new OpenCode session
         let field_values = json!({
             "nodes": [
-                {"name": "sessionId", "text": "existing-session-id"}
+                text_field_value("sessionId", Some("existing-session-id"))
             ]
         });
 
@@ -1294,7 +1312,7 @@ mod tests {
         // Status = Todo, no session
         let field_values = json!({
             "nodes": [
-                {"name": "Status", "option": "Todo"},
+                single_select_field_value("Status", "Todo"),
             ]
         });
 
@@ -1327,7 +1345,7 @@ mod tests {
         });
         let field_values = json!({
             "nodes": [
-                {"name": "Status", "option": "Todo"},
+                single_select_field_value("Status", "Todo"),
             ]
         });
 
@@ -1360,7 +1378,7 @@ mod tests {
         });
         let field_values = json!({
             "nodes": [
-                {"name": "Status", "option": "Todo"},
+                single_select_field_value("Status", "Todo"),
             ]
         });
 
@@ -1417,7 +1435,7 @@ mod tests {
         });
         let field_values = json!({
             "nodes": [
-                {"name": "Status", "option": "Todo"},
+                single_select_field_value("Status", "Todo"),
             ]
         });
 
@@ -1517,7 +1535,7 @@ mod tests {
         });
         let field_values = json!({
             "nodes": [
-                {"name": "Status", "option": "Review Technical"},
+                single_select_field_value("Status", "Review Technical"),
             ]
         });
         let status_options = vec![
@@ -1576,7 +1594,7 @@ mod tests {
         });
         let field_values = json!({
             "nodes": [
-                {"name": "Status", "option": "QA"},
+                single_select_field_value("Status", "QA"),
             ]
         });
         let status_options = vec![
@@ -1636,7 +1654,7 @@ mod tests {
         });
         let field_values = json!({
             "nodes": [
-                {"name": "Status", "option": "Review Product"},
+                single_select_field_value("Status", "Review Product"),
             ]
         });
         let status_options = vec![
@@ -1908,8 +1926,8 @@ mod tests {
         // Status = "Review Technical" AND has a session
         let field_values = json!({
             "nodes": [
-                {"name": "Status", "option": "Review Technical"},
-                {"name": "sessionId", "text": "existing-session"},
+                single_select_field_value("Status", "Review Technical"),
+                text_field_value("sessionId", Some("existing-session")),
             ]
         });
         let status_options = vec![

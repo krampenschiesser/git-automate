@@ -232,31 +232,62 @@ pub struct ListProjectItemContent {
     #[serde(rename = "__typename")]
     pub typename: String,
     pub id: String,
-    pub number: i64,
+    pub number: Option<i64>,
 }
 
 /// Response for `get_project_item_values` query.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct NodeFieldValuesResult {
     pub node: Option<NodeFieldValuesNode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct NodeFieldValuesNode {
     #[serde(rename = "fieldValues")]
     pub field_values: NodeFieldValuesList,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct NodeFieldValuesList {
     pub nodes: Vec<NodeFieldValueNode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "__typename")]
+pub enum NodeFieldValueNode {
+    #[serde(rename = "ProjectV2ItemFieldTextValue")]
+    Text {
+        text: Option<String>,
+        field: Option<FieldName>,
+    },
+    #[serde(rename = "ProjectV2ItemFieldSingleSelectValue")]
+    SingleSelect {
+        name: Option<String>,
+        field: Option<FieldName>,
+    },
+    #[serde(rename = "ProjectV2ItemFieldNumberValue")]
+    Number {
+        number: Option<f64>,
+        field: Option<FieldName>,
+    },
+    #[serde(rename = "ProjectV2ItemFieldDateValue")]
+    Date {
+        date: Option<String>,
+        field: Option<FieldName>,
+    },
+    #[serde(rename = "ProjectV2ItemFieldIterationValue")]
+    Iteration {
+        title: Option<String>,
+        field: Option<FieldName>,
+    },
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
-pub struct NodeFieldValueNode {
+pub struct FieldName {
+    #[serde(default)]
     pub name: Option<String>,
-    pub text: Option<String>,
-    pub option: Option<String>,
 }
 
 // ─── REST response structs ───────────────────────────────────
