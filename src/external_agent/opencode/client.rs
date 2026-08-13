@@ -3,7 +3,9 @@ use reqwest::Client;
 use serde_json::json;
 use thiserror::Error;
 
-use crate::external_agent::opencode::types::{Agent, AgentInfo, HealthResponse, Session};
+use crate::external_agent::opencode::types::{
+    Agent, AgentInfo, HealthResponse, Session, SessionMessage,
+};
 
 const OPENCODE_USERNAME: &str = "opencode";
 
@@ -20,6 +22,8 @@ pub enum OpenCodeError {
     CreateSession(String),
     #[error("Session creation returned no data")]
     NoSessionData,
+    #[error("Failed to fetch session messages: {0}")]
+    FetchSessionMessages(String),
 }
 
 impl From<reqwest::Error> for OpenCodeError {
@@ -162,6 +166,33 @@ impl OpenCodeClient {
         let statuses: std::collections::HashMap<String, serde_json::Value> =
             response.json().await?;
         Ok(statuses.len())
+    }
+
+    /// `GET /session/{id}/message` — list messages in a session.
+    ///
+    /// Each entry has `info` (id, role, sessionID, time) and `parts` (content).
+    /// Use [`SessionMessage::text`] to extract prompt text.
+    pub async fn get_session_messages(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Vec<SessionMessage>, OpenCodeError> {
+        let mut request = self
+            .client
+            .get(format!("{}/session/{}/message", self.base_url, session_id))
+            .header("Authorization", &self.auth_header);
+        if let Some(dir) = directory {
+            request = request.query(&[("directory", dir)]);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(OpenCodeError::FetchSessionMessages(format!(
+                "HTTP status {}",
+                response.status().as_u16()
+            )));
+        }
+        let messages: Vec<SessionMessage> = response.json().await?;
+        Ok(messages)
     }
 }
 
@@ -649,5 +680,112 @@ mod tests {
 
         let client = client(&server);
         client.count_active_sessions().await.unwrap();
+    }
+
+    // --- get_session_messages (tests 20-24) ------------------------------
+
+    #[tokio::test]
+    async fn test_get_session_messages_returns_user_prompt() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/sess1/message"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "info": {
+                        "id": "msg1",
+                        "role": "user",
+                        "sessionID": "sess1",
+                        "time": { "created": 1, "updated": 1 }
+                    },
+                    "parts": [{ "type": "text", "text": "issue body content" }]
+                },
+                {
+                    "info": {
+                        "id": "msg2",
+                        "role": "assistant",
+                        "sessionID": "sess1",
+                        "time": { "created": 2, "updated": 2 }
+                    },
+                    "parts": [{ "type": "text", "text": "response" }]
+                }
+            ])))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let messages = client.get_session_messages("sess1", None).await.unwrap();
+
+        assert_eq!(messages.len(), 2);
+        let user_msg = messages.iter().find(|m| m.is_user()).unwrap();
+        assert_eq!(user_msg.info.id, "msg1");
+        assert_eq!(user_msg.text(), "issue body content");
+        assert!(
+            !messages
+                .iter()
+                .any(|m| !m.is_user() && m.text() == "issue body content")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_empty_array() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/sess1/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let messages = client.get_session_messages("sess1", None).await.unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_500_returns_error() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/sess1/message"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.get_session_messages("sess1", None).await;
+        assert!(matches!(
+            result,
+            Err(OpenCodeError::FetchSessionMessages(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_with_directory_query_param() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/sess1/message"))
+            .and(query_param("directory", "/d"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        client
+            .get_session_messages("sess1", Some("/d"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_session_message_text_concatenates_parts() {
+        let body = json!([{
+            "info": { "id": "m1", "role": "user", "sessionID": "s" },
+            "parts": [
+                { "type": "text", "text": "first" },
+                { "type": "text", "text": "second" }
+            ]
+        }]);
+        let msg: SessionMessage = serde_json::from_value(body[0].clone()).unwrap();
+        assert_eq!(msg.text(), "first\nsecond");
+        assert!(msg.is_user());
     }
 }

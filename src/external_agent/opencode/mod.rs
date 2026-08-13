@@ -10,4 +10,6 @@ pub mod types;
 
 // Convenience re-exports
 pub use client::{OpenCodeClient, OpenCodeError, encode_basic_auth};
-pub use types::{Agent, AgentInfo, HealthResponse, Session, SessionTime};
+pub use types::{
+    Agent, AgentInfo, HealthResponse, Session, SessionMessage, SessionMessageInfo, SessionTime,
+};
