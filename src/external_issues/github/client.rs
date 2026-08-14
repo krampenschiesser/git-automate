@@ -799,6 +799,53 @@ impl GitHubClient {
             Err(e) => Err(e),
         }
     }
+
+    // ── PR comment methods ─────────────────────────────────────
+
+    /// List all review threads (file+line comments) on a pull request.
+    pub async fn list_pr_review_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<ReviewThreadNode>, GitHubError> {
+        let result = self
+            .graphql::<ReviewThreadsResult>(
+                include_str!("queries/list_pr_review_threads.graphql"),
+                Some(&json!({ "owner": owner, "repo": repo, "prNumber": pr_number })),
+            )
+            .await?;
+
+        Ok(result.repository.pull_request.review_threads.nodes)
+    }
+
+    /// List all normal (issue-style) comments on a pull request.
+    pub async fn list_pr_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<IssueCommentNode>, GitHubError> {
+        let result = self
+            .graphql::<IssueCommentsResult>(
+                include_str!("queries/list_pr_comments.graphql"),
+                Some(&json!({ "owner": owner, "repo": repo, "prNumber": pr_number })),
+            )
+            .await?;
+
+        Ok(result.repository.pull_request.comments.nodes)
+    }
+
+    /// Resolve a review thread (file+line comment thread) by thread node ID.
+    pub async fn resolve_review_thread(&self, thread_id: &str) -> Result<(), GitHubError> {
+        self.graphql::<ResolveReviewThreadResult>(
+            include_str!("queries/resolve_review_thread.graphql"),
+            Some(&json!({ "input": { "threadId": thread_id } })),
+        )
+        .await?;
+
+        Ok(())
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────
@@ -1705,6 +1752,217 @@ mod tests {
             .add_project_status_options("status-field-id", &options)
             .await;
 
+        assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
+    }
+
+    // ── PR comment methods ──────────────────────────────────
+
+    /// T28: list_pr_review_comments → returns threads with comments
+    #[tokio::test]
+    async fn list_pr_review_comments_returns_threads() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("reviewThreads"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [
+                                    {
+                                        "id": "thread1",
+                                        "path": "src/main.rs",
+                                        "line": 42,
+                                        "originalLine": 38,
+                                        "isResolved": false,
+                                        "diffSide": "RIGHT",
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "id": "comment1",
+                                                    "body": "This needs a fix",
+                                                    "createdAt": "2024-01-01T00:00:00Z",
+                                                    "author": {"login": "reviewer"}
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    {
+                                        "id": "thread2",
+                                        "path": "src/lib.rs",
+                                        "line": null,
+                                        "originalLine": null,
+                                        "isResolved": true,
+                                        "diffSide": "LEFT",
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "id": "comment2",
+                                                    "body": "LGTM",
+                                                    "createdAt": "2024-01-02T00:00:00Z",
+                                                    "author": null
+                                                }
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .list_pr_review_comments("owner", "repo", 1)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id, "thread1");
+        assert_eq!(result[0].path, "src/main.rs");
+        assert_eq!(result[0].line, Some(42));
+        assert_eq!(result[0].is_resolved, false);
+        assert_eq!(result[0].comments.nodes.len(), 1);
+        assert_eq!(result[0].comments.nodes[0].body, "This needs a fix");
+        assert_eq!(
+            result[0].comments.nodes[0].author.as_ref().unwrap().login,
+            "reviewer"
+        );
+        assert_eq!(result[1].is_resolved, true);
+        assert!(result[1].comments.nodes[0].author.is_none());
+    }
+
+    /// T29: list_pr_review_comments 500 → Err(HttpStatus(500))
+    #[tokio::test]
+    async fn list_pr_review_comments_500_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("reviewThreads"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "Internal Server Error"
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.list_pr_review_comments("owner", "repo", 1).await;
+        assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
+    }
+
+    /// T30: list_pr_comments → returns normal comments
+    #[tokio::test]
+    async fn list_pr_comments_returns_comments() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("ListPrComments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "comments": {
+                                "nodes": [
+                                    {
+                                        "id": "comment1",
+                                        "body": "Nice PR!",
+                                        "createdAt": "2024-01-01T00:00:00Z",
+                                        "author": {"login": "reviewer1"}
+                                    },
+                                    {
+                                        "id": "comment2",
+                                        "body": "LGTM",
+                                        "createdAt": "2024-01-02T00:00:00Z",
+                                        "author": {"login": "reviewer2"}
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .list_pr_comments("owner", "repo", 1)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id, "comment1");
+        assert_eq!(result[0].body, "Nice PR!");
+        assert_eq!(result[0].author.as_ref().unwrap().login, "reviewer1");
+        assert_eq!(result[1].id, "comment2");
+        assert_eq!(result[1].author.as_ref().unwrap().login, "reviewer2");
+    }
+
+    /// T31: list_pr_comments 500 → Err(HttpStatus(500))
+    #[tokio::test]
+    async fn list_pr_comments_500_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("ListPrComments"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "Internal Server Error"
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.list_pr_comments("owner", "repo", 1).await;
+        assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
+    }
+
+    /// T32: resolve_review_thread → Ok(()) on success
+    #[tokio::test]
+    async fn resolve_review_thread_succeeds() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("resolveReviewThread"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "resolveReviewThread": {
+                        "thread": {"id": "thread1"}
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.resolve_review_thread("thread1").await;
+        assert!(result.is_ok());
+    }
+
+    /// T33: resolve_review_thread 500 → Err(HttpStatus(500))
+    #[tokio::test]
+    async fn resolve_review_thread_500_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("resolveReviewThread"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "message": "Internal Server Error"
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client.resolve_review_thread("thread1").await;
         assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
     }
 }

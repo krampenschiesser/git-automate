@@ -1,0 +1,28 @@
+query ListPrReviewThreads($owner: String!, $repo: String!, $prNumber: Int!) {
+    repository(owner: $owner, name: $repo) {
+        pullRequest(number: $prNumber) {
+            reviewThreads(first: 100) {
+                nodes {
+                    id
+                    path
+                    line
+                    originalLine
+                    isResolved
+                    diffSide
+                    comments(first: 100) {
+                        nodes {
+                            id
+                            body
+                            createdAt
+                            author {
+                                ... on User { login }
+                                ... on Bot { login }
+                                ... on Organization { login }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

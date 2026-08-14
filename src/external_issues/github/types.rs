@@ -1,7 +1,7 @@
 //! Domain types and GraphQL/REST response structs for the GitHub API client.
 //! - REST response shapes: derived from octokit response.data usage
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ─── Domain types ───────────────────────────────────────────
 
@@ -435,4 +435,150 @@ impl From<IssueWithParentNode> for IssueWithParent {
             parent_number: node.parent_issue.map(|p| p.number),
         }
     }
+}
+
+// ─── PR comment types ──────────────────────────────────────────
+
+/// The author of a comment, extracted from `Actor` inline fragments
+/// (`... on User { login }`, `... on Bot { login }`, `... on Organization { login }`).
+/// All three implementor types expose `login`, so the JSON is always `{"login": "..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct CommentAuthor {
+    #[serde(default)]
+    pub login: String,
+}
+
+// ── Review threads (file+line comments) ──────────────────────────
+
+/// A single comment node within a review thread.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ReviewCommentNode {
+    pub id: String,
+    pub body: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    pub author: Option<CommentAuthor>,
+}
+
+/// A single review thread containing file+line comments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ReviewThreadNode {
+    pub id: String,
+    pub path: String,
+    pub line: Option<i64>,
+    #[serde(rename = "originalLine")]
+    pub original_line: Option<i64>,
+    #[serde(rename = "isResolved")]
+    pub is_resolved: bool,
+    #[serde(rename = "diffSide")]
+    pub diff_side: String,
+    pub comments: ReviewCommentListNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ReviewCommentListNode {
+    pub nodes: Vec<ReviewCommentNode>,
+}
+
+/// GraphQL response for `list_pr_review_threads`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ReviewThreadsResult {
+    pub repository: ReviewThreadsRepo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ReviewThreadsRepo {
+    #[serde(rename = "pullRequest")]
+    pub pull_request: ReviewThreadsPullRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ReviewThreadsPullRequest {
+    #[serde(rename = "reviewThreads")]
+    pub review_threads: ReviewThreadList,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ReviewThreadList {
+    pub nodes: Vec<ReviewThreadNode>,
+}
+
+// ── Normal PR comments ──────────────────────────────────────────
+
+/// A normal PR comment (issue-style comment).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct IssueCommentNode {
+    pub id: String,
+    pub body: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    pub author: Option<CommentAuthor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct IssueCommentList {
+    pub nodes: Vec<IssueCommentNode>,
+}
+
+/// GraphQL response for `list_pr_comments`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct IssueCommentsResult {
+    pub repository: IssueCommentsRepo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct IssueCommentsRepo {
+    #[serde(rename = "pullRequest")]
+    pub pull_request: IssueCommentsPullRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct IssueCommentsPullRequest {
+    #[serde(rename = "comments")]
+    pub comments: IssueCommentList,
+}
+
+/// GraphQL response for `resolve_review_thread` mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ResolveReviewThreadResult {
+    #[serde(rename = "resolveReviewThread")]
+    pub resolve_review_thread: ResolveReviewThreadInner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct ResolveReviewThreadInner {
+    pub thread: Option<IdHolder>,
+}
+
+// ── Domain types ─────────────────────────────────────────────────
+
+/// Flattened view of a file+line review comment for LLM prompt building.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReviewCommentInfo {
+    pub thread_id: String,
+    pub comment_id: String,
+    pub path: String,
+    pub line: Option<i64>,
+    pub original_line: Option<i64>,
+    pub diff_side: String,
+    pub is_resolved: bool,
+    pub body: String,
+    pub author: String,
+    pub created_at: String,
+}
+
+/// Flattened view of a normal PR comment for LLM prompt building.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct PRCommentInfo {
+    pub id: String,
+    pub body: String,
+    pub author: String,
+    pub created_at: String,
+}
+
+/// Aggregated PR comments: both file+line review comments and normal comments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PRComments {
+    pub review_comments: Vec<ReviewCommentInfo>,
+    pub normal_comments: Vec<PRCommentInfo>,
 }
