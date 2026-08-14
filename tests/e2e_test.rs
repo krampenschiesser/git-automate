@@ -749,17 +749,13 @@ async fn e2e_failed_review_recovery_flow() {
     let config_path = project_root.join("git-automate.yml");
     let config = parse_config(&config_path).expect("Failed to parse git-automate.yml");
 
-    let (project_name, project_config) = config
-        .projects
-        .iter()
-        .find(|(_, c)| c.opencode.is_some())
-        .expect("No project with opencode settings found in config");
-    let _project_name = project_name.clone();
+    let project_config = &config.git;
+    let _project_name = project_config.repository.clone();
 
-    let oc_config = project_config
+    let oc_config = config
         .opencode
         .as_ref()
-        .expect("Project config missing opencode settings");
+        .expect("Config missing global opencode settings");
 
     let parsed =
         parse_repository_url(&project_config.repository).expect("Failed to parse repository URL");

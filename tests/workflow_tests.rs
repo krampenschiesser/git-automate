@@ -10,7 +10,7 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::*;
-use git_automate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig, parse_config};
+use git_automate::config::{GitAutomateConfig, GitSection, OpencodeConfig, parse_config};
 use git_automate::workflow::Workflow;
 use git_automate::workflow::checks::{OpencodeSessionConfig, run_review_check};
 use git_automate::workflow::helpers::{ProjectContext, WorkflowContext, write_project_id};
@@ -1006,14 +1006,10 @@ fn failed_review_test_ctx(
     _review_state: &str,
     _session_id: &str,
 ) -> (WorkflowContext, ProjectContext, OpencodeSessionConfig) {
-    let project_config = ProjectConfig {
+    let project_config = GitSection {
         repository: "https://github.com/owner/repo".to_string(),
         project_id: Some("PID-123".to_string()),
         directory: None,
-        opencode: Some(OpencodeConfig {
-            url: "http://localhost:8081".to_string(),
-            pw: "pw".to_string(),
-        }),
         issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
@@ -1021,14 +1017,15 @@ fn failed_review_test_ctx(
         trello_board_id: None,
     };
 
-    let mut projects = std::collections::BTreeMap::new();
-    projects.insert("test-proj".to_string(), project_config.clone());
-
     let deps = WorkflowContext {
         config: GitAutomateConfig {
-            projects,
+            git: project_config.clone(),
             concurrency: None,
             github_token: None,
+            opencode: Some(OpencodeConfig {
+                url: "http://localhost:8081".to_string(),
+                pw: "pw".to_string(),
+            }),
         },
         github: None,
         shell: mock_shell(),
