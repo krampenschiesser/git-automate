@@ -8,7 +8,7 @@
 pub mod checks;
 pub mod helpers;
 
-use crate::config::ProjectConfig;
+use crate::config::GitSection;
 use crate::external_agent::opencode::AgentInfo;
 use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::repo::parse_repository_url;
@@ -190,13 +190,10 @@ impl Workflow {
             return Ok(());
         };
 
-        for (project_name, project_config) in &self.deps.config.projects {
-            if let Err(e) = self
-                .setup_project(project_name, project_config, persist)
-                .await
-            {
-                tracing::error!("Setup check failed for {}: {}", project_name, e);
-            }
+        let git = &self.deps.config.git;
+        let project_name = Self::derive_project_name(git);
+        if let Err(e) = self.setup_project(&project_name, git, persist).await {
+            tracing::error!("Setup check failed for {}: {}", project_name, e);
         }
         Ok(())
     }
@@ -204,14 +201,14 @@ impl Workflow {
     /// For each project with an OpenCode config: check server health and
     /// verify required agents are present.
     pub async fn run_opencode_check(&self) -> Result<(), WorkflowError> {
-        for (project_name, project_config) in &self.deps.config.projects {
-            if project_config.opencode.is_none() {
-                continue;
-            }
-            let oc = self.opencode_config(project_config);
-            if let Err(e) = self.check_opencode(&oc).await {
-                tracing::error!("OpenCode check failed for {}: {}", project_name, e);
-            }
+        if self.deps.config.opencode.is_none() {
+            return Ok(());
+        }
+        let git = &self.deps.config.git;
+        let project_name = Self::derive_project_name(git);
+        let oc = self.opencode_config(git);
+        if let Err(e) = self.check_opencode(&oc).await {
+            tracing::error!("OpenCode check failed for {}: {}", project_name, e);
         }
         Ok(())
     }
@@ -224,20 +221,20 @@ impl Workflow {
             return Ok(());
         };
 
-        for (project_name, project_config) in &self.deps.config.projects {
-            if project_config.opencode.is_none() {
-                continue;
-            }
-            let result = async {
-                let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
-                    .await?;
-                let oc = self.opencode_config(project_config);
-                run_triage_check(&self.deps, &ctx, &oc).await
-            }
-            .await;
-            if let Err(e) = result {
-                tracing::error!("Triage check failed for {}: {}", project_name, e);
-            }
+        if self.deps.config.opencode.is_none() {
+            return Ok(());
+        }
+
+        let git = &self.deps.config.git;
+        let project_name = Self::derive_project_name(git);
+        let result = async {
+            let ctx = resolve_context(&self.deps.context_deps(), &project_name, git).await?;
+            let oc = self.opencode_config(git);
+            run_triage_check(&self.deps, &ctx, &oc).await
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::error!("Triage check failed for {}: {}", project_name, e);
         }
         Ok(())
     }
@@ -250,20 +247,20 @@ impl Workflow {
             return Ok(());
         };
 
-        for (project_name, project_config) in &self.deps.config.projects {
-            if project_config.opencode.is_none() {
-                continue;
-            }
-            let result = async {
-                let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
-                    .await?;
-                let oc = self.opencode_config(project_config);
-                run_todo_check(&self.deps, &ctx, &oc).await
-            }
-            .await;
-            if let Err(e) = result {
-                tracing::error!("Todo check failed for {}: {}", project_name, e);
-            }
+        if self.deps.config.opencode.is_none() {
+            return Ok(());
+        }
+
+        let git = &self.deps.config.git;
+        let project_name = Self::derive_project_name(git);
+        let result = async {
+            let ctx = resolve_context(&self.deps.context_deps(), &project_name, git).await?;
+            let oc = self.opencode_config(git);
+            run_todo_check(&self.deps, &ctx, &oc).await
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::error!("Todo check failed for {}: {}", project_name, e);
         }
         Ok(())
     }
@@ -276,20 +273,20 @@ impl Workflow {
             return Ok(());
         };
 
-        for (project_name, project_config) in &self.deps.config.projects {
-            if project_config.opencode.is_none() {
-                continue;
-            }
-            let result = async {
-                let ctx = resolve_context(&self.deps.context_deps(), project_name, project_config)
-                    .await?;
-                let oc = self.opencode_config(project_config);
-                run_review_check(&self.deps, &ctx, &oc).await
-            }
-            .await;
-            if let Err(e) = result {
-                tracing::error!("Review check failed for {}: {}", project_name, e);
-            }
+        if self.deps.config.opencode.is_none() {
+            return Ok(());
+        }
+
+        let git = &self.deps.config.git;
+        let project_name = Self::derive_project_name(git);
+        let result = async {
+            let ctx = resolve_context(&self.deps.context_deps(), &project_name, git).await?;
+            let oc = self.opencode_config(git);
+            run_review_check(&self.deps, &ctx, &oc).await
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::error!("Review check failed for {}: {}", project_name, e);
         }
         Ok(())
     }
@@ -297,26 +294,44 @@ impl Workflow {
     pub async fn run_doctor_check(&self) -> Result<(), WorkflowError> {
         let _ = self.run_setup_check_impl(false).await;
 
-        for (project_name, project_config) in &self.deps.config.projects {
-            if project_config.opencode.is_none() {
-                continue;
-            }
-            let oc = self.opencode_config(project_config);
-            if let Err(e) = self.check_opencode(&oc).await {
-                tracing::error!("Doctor check failed for {}: {}", project_name, e);
-            }
+        if self.deps.config.opencode.is_none() {
+            return Ok(());
+        }
+
+        let git = &self.deps.config.git;
+        let project_name = Self::derive_project_name(git);
+        let oc = self.opencode_config(git);
+        if let Err(e) = self.check_opencode(&oc).await {
+            tracing::error!("Doctor check failed for {}: {}", project_name, e);
         }
         Ok(())
     }
 
     // ── Helpers ─────────────────────────────────────────────────
 
-    fn opencode_config(&self, project: &ProjectConfig) -> OpencodeSessionConfig {
-        let opencode = project.opencode.as_ref().expect("opencode config present");
+    fn derive_project_name(git: &GitSection) -> String {
+        parse_repository_url(&git.repository)
+            .map(|p| p.repo)
+            .unwrap_or_else(|_| {
+                git.repository
+                    .split('/')
+                    .next_back()
+                    .unwrap_or(&git.repository)
+                    .to_string()
+            })
+    }
+
+    fn opencode_config(&self, git: &GitSection) -> OpencodeSessionConfig {
+        let opencode = self
+            .deps
+            .config
+            .opencode
+            .as_ref()
+            .expect("opencode config present");
         OpencodeSessionConfig {
             url: opencode.url.clone(),
             pw: opencode.pw.clone(),
-            directory: project.directory.clone(),
+            directory: git.directory.clone(),
         }
     }
 
@@ -332,10 +347,10 @@ impl Workflow {
     async fn setup_project(
         &self,
         name: &str,
-        config: &ProjectConfig,
+        git: &GitSection,
         persist: bool,
     ) -> Result<(), WorkflowError> {
-        let ParsedRepo { owner, repo } = parse_repository_url(&config.repository)
+        let ParsedRepo { owner, repo } = parse_repository_url(&git.repository)
             .map_err(|e| WorkflowError::Other(e.to_string()))?;
 
         let github = self
@@ -347,7 +362,7 @@ impl Workflow {
         // Numeric project IDs (e.g. "1") are resolved to global node IDs at runtime.
         // The config file is NOT modified — the original numeric ID is preserved
         // so users can keep `projectId: 1` and have it resolved each time.
-        let project_id = if let Some(pid) = &config.project_id {
+        let project_id = if let Some(pid) = &git.project_id {
             resolve_project_id(github, &owner, pid).await?.0
         } else {
             tracing::info!("Creating project {} for {}/{}", name, owner, repo);
@@ -425,21 +440,18 @@ impl Workflow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig};
+    use crate::config::{GitAutomateConfig, GitSection};
     use crate::test_utils::{gh_client, make_deps, mock_shell};
-    use std::collections::BTreeMap;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── Test helpers ──────────────────────────────────────────
 
-    /// Build a project config without opencode.
-    fn make_project_no_opencode() -> ProjectConfig {
-        ProjectConfig {
+    fn make_project_no_opencode() -> GitSection {
+        GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: Some("PID-123".to_string()),
             directory: None,
-            opencode: None,
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -514,30 +526,23 @@ mod tests {
     async fn run_all_calls_all_checks_in_order() {
         // One project with opencode config + github=None → all 5 checks log:
         // setup(skip), opencode(not healthy), triage(skip), todo(skip), review(skip).
-        let oc_mock = MockServer::start().await;
-
-        let project = ProjectConfig {
-            repository: "https://github.com/owner/repo".to_string(),
-            project_id: Some("PID-123".to_string()),
-            directory: None,
-            opencode: Some(OpencodeConfig {
-                url: oc_mock.uri(),
-                pw: "test-pw".to_string(),
-            }),
-            issue_provider: "github".to_string(),
-            title_pattern: "@ai.*".to_string(),
-            trello_api_key: None,
-            trello_token: None,
-            trello_board_id: None,
-        };
-        let mut projects = BTreeMap::new();
-        projects.insert("test-proj".to_string(), project);
+        let _oc_mock = MockServer::start().await;
 
         let deps = WorkflowContext {
             config: GitAutomateConfig {
-                projects,
+                git: GitSection {
+                    repository: "https://github.com/owner/repo".to_string(),
+                    project_id: Some("PID-123".to_string()),
+                    directory: None,
+                    issue_provider: "github".to_string(),
+                    title_pattern: "@ai.*".to_string(),
+                    trello_api_key: None,
+                    trello_token: None,
+                    trello_board_id: None,
+                },
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github: None,
             shell: mock_shell(),
@@ -628,32 +633,28 @@ mod tests {
             .await;
 
         // Project without projectId → triggers create_project
-        let project = ProjectConfig {
-            repository: "https://github.com/owner/repo".to_string(),
-            project_id: None,
-            directory: None,
-            opencode: None,
-            issue_provider: "github".to_string(),
-            title_pattern: "@ai.*".to_string(),
-            trello_api_key: None,
-            trello_token: None,
-            trello_board_id: None,
-        };
-        let mut projects = BTreeMap::new();
-        projects.insert("test-proj".to_string(), project.clone());
-
         let deps = WorkflowContext {
             config: GitAutomateConfig {
-                projects,
+                git: GitSection {
+                    repository: "https://github.com/owner/repo".to_string(),
+                    project_id: None,
+                    directory: None,
+                    issue_provider: "github".to_string(),
+                    title_pattern: "@ai.*".to_string(),
+                    trello_api_key: None,
+                    trello_token: None,
+                    trello_board_id: None,
+                },
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github: Some(client),
             shell: mock_shell(),
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n";
+        let yaml = "git:\n  repository: https://github.com/owner/repo\n";
         std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = std::env::current_dir().unwrap();
@@ -686,25 +687,21 @@ mod tests {
             .await;
 
         let client = gh_client(&mock);
-        let project = ProjectConfig {
-            repository: "https://github.com/owner/repo".to_string(),
-            project_id: Some("PID-1".to_string()),
-            directory: None,
-            opencode: None,
-            issue_provider: "github".to_string(),
-            title_pattern: "@ai.*".to_string(),
-            trello_api_key: None,
-            trello_token: None,
-            trello_board_id: None,
-        };
-        let mut projects = BTreeMap::new();
-        projects.insert("proj-a".to_string(), project);
-
         let deps = WorkflowContext {
             config: GitAutomateConfig {
-                projects,
+                git: GitSection {
+                    repository: "https://github.com/owner/repo".to_string(),
+                    project_id: Some("PID-1".to_string()),
+                    directory: None,
+                    issue_provider: "github".to_string(),
+                    title_pattern: "@ai.*".to_string(),
+                    trello_api_key: None,
+                    trello_token: None,
+                    trello_board_id: None,
+                },
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github: Some(client),
             shell: mock_shell(),
@@ -722,15 +719,12 @@ mod tests {
     async fn run_triage_check_skips_project_without_opencode() {
         let mock = MockServer::start().await;
         let client = gh_client(&mock);
-        let project = make_project_no_opencode();
-        let mut projects = BTreeMap::new();
-        projects.insert("no-opencode-proj".to_string(), project);
-
         let deps = WorkflowContext {
             config: GitAutomateConfig {
-                projects,
+                git: make_project_no_opencode(),
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github: Some(client),
             shell: mock_shell(),
@@ -822,11 +816,10 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let project = ProjectConfig {
+        let git = GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: None,
             directory: None,
-            opencode: None,
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -836,27 +829,24 @@ mod tests {
 
         let deps = WorkflowContext {
             config: GitAutomateConfig {
-                projects: {
-                    let mut m = BTreeMap::new();
-                    m.insert("test-proj".to_string(), project.clone());
-                    m
-                },
+                git: git.clone(),
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github: Some(client),
             shell: mock_shell(),
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n";
+        let yaml = "git:\n  repository: https://github.com/owner/repo\n";
         std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
         let workflow = Workflow::new(deps);
-        let result = workflow.setup_project("test-proj", &project, true).await;
+        let result = workflow.setup_project("test-proj", &git, true).await;
 
         std::env::set_current_dir(&original_dir).unwrap();
 
@@ -922,11 +912,10 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let project = ProjectConfig {
+        let git = GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: Some("PID-123".to_string()),
             directory: None,
-            opencode: None,
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -936,20 +925,17 @@ mod tests {
 
         let deps = WorkflowContext {
             config: GitAutomateConfig {
-                projects: {
-                    let mut m = BTreeMap::new();
-                    m.insert("test-proj".to_string(), project.clone());
-                    m
-                },
+                git: git.clone(),
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github: Some(client),
             shell: mock_shell(),
         };
 
         let workflow = Workflow::new(deps);
-        let result = workflow.setup_project("test-proj", &project, true).await;
+        let result = workflow.setup_project("test-proj", &git, true).await;
 
         assert!(result.is_ok());
     }
@@ -1019,11 +1005,10 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let project = ProjectConfig {
+        let git = GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: Some("1".to_string()),
             directory: None,
-            opencode: None,
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -1033,27 +1018,24 @@ mod tests {
 
         let deps = WorkflowContext {
             config: GitAutomateConfig {
-                projects: {
-                    let mut m = BTreeMap::new();
-                    m.insert("test-proj".to_string(), project.clone());
-                    m
-                },
+                git: git.clone(),
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github: Some(client),
             shell: mock_shell(),
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let yaml = "projects:\n  test-proj:\n    repository: https://github.com/owner/repo\n    projectId: 1\n";
+        let yaml = "git:\n  repository: https://github.com/owner/repo\n  projectId: 1\n";
         std::fs::write(tmp.path().join("git-automate.yml"), yaml).unwrap();
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
         let workflow = Workflow::new(deps);
-        let result = workflow.setup_project("test-proj", &project, true).await;
+        let result = workflow.setup_project("test-proj", &git, true).await;
 
         std::env::set_current_dir(&original_dir).unwrap();
 
