@@ -51,6 +51,75 @@ fn real_shell() -> ShellFn {
     })
 }
 
+/// Resolve the project's Status field ID and build a lookup from status name
+/// to option ID.
+///
+/// Uses the real GitHub API — only valid in e2e tests with a live client.
+async fn resolve_status_field_ids(
+    github: &GitHubClient,
+    project_id: &str,
+) -> Result<
+    (String, std::collections::HashMap<String, String>),
+    git_automate::external_issues::github::client::GitHubError,
+> {
+    let status_field = github
+        .get_project_status_field(project_id)
+        .await?
+        .expect("Status field must exist");
+
+    let option_map: std::collections::HashMap<String, String> = status_field
+        .options
+        .into_iter()
+        .map(|opt| (opt.name, opt.id))
+        .collect();
+
+    Ok((status_field.id, option_map))
+}
+
+/// Simulate an agent completing its work by transitioning the project item
+/// to `next_status` and clearing the `sessionId` field so the next workflow
+/// check can start a new session.
+async fn simulate_agent_completion(
+    github: &GitHubClient,
+    project_id: &str,
+    item_id: &str,
+    status_field_id: &str,
+    session_field_id: &str,
+    next_status: &str,
+    option_map: &std::collections::HashMap<String, String>,
+) -> Result<(), git_automate::external_issues::github::client::GitHubError> {
+    let option_id = option_map
+        .get(next_status)
+        .expect(&format!("status option '{}' must exist", next_status));
+
+    github
+        .update_project_item_status(project_id, item_id, status_field_id, option_id)
+        .await?;
+
+    github
+        .update_project_item_session_id(project_id, item_id, session_field_id, None)
+        .await?;
+
+    Ok(())
+}
+
+/// Resolve the sessionId field ID for a project.
+async fn resolve_session_field_id(
+    github: &GitHubClient,
+    project_id: &str,
+) -> Result<String, git_automate::external_issues::github::client::GitHubError> {
+    let fields = github.get_project_fields(project_id).await?;
+    fields
+        .iter()
+        .find(|f| f.name == "sessionId")
+        .map(|f| f.id.clone())
+        .ok_or_else(|| {
+            git_automate::external_issues::github::client::GitHubError::Other(
+                "sessionId field not found".to_string(),
+            )
+        })
+}
+
 #[tokio::test]
 async fn e2e_triage_flow_creates_session() {
     // ── 1. Load .env ──────────────────────────────────────────────
@@ -295,5 +364,364 @@ async fn e2e_triage_flow_creates_session() {
     eprintln!(
         "e2e test passed: issue #{}, Status=Triage, sessionId={}",
         created_issue.number, session_id
+    );
+}
+
+/// End-to-end test: drives the full workflow state flow from Triage to Done.
+///
+/// Verifies that each workflow check starts the correct agent session and that
+/// simulating agent completion (status transition + sessionId clear) allows the
+/// next check to pick up the item and start a new session.
+///
+/// State flow:
+///   Triage → Todo → In Development → Review Technical → Review Product → QA → Done
+#[tokio::test]
+async fn e2e_full_workflow_state_flow() {
+    dotenv().ok();
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
+    let opencode_pw = std::env::var("OPENCODE_PW").unwrap_or_default();
+
+    if token.is_empty() || opencode_pw.is_empty() {
+        eprintln!("e2e test skipped: GITHUB_TOKEN or OPENCODE_PW is not set in .env");
+        return;
+    }
+
+    // ── 1. Parse config ───────────────────────────────────────────
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config_path = project_root.join("git-automate.yml");
+    let config = parse_config(&config_path).expect("Failed to parse git-automate.yml");
+
+    let (project_name, project_config) = config
+        .projects
+        .iter()
+        .find(|(_, c)| c.opencode.is_some())
+        .expect("No project with opencode settings found in config");
+    let _project_name = project_name.clone();
+
+    let oc_config = project_config
+        .opencode
+        .as_ref()
+        .expect("Project config missing opencode settings");
+
+    let parsed =
+        parse_repository_url(&project_config.repository).expect("Failed to parse repository URL");
+
+    // ── 2. Create clients ─────────────────────────────────────────
+    let github = GitHubClient::new(token.clone()).expect("Failed to create GitHub client");
+    let opencode = OpenCodeClient::new(oc_config.url.clone(), oc_config.pw.clone());
+
+    // Skip if required agents are not installed.
+    let required_agents = [
+        "git-automate-triage",
+        "git-automate-taskmanager",
+        "git-automate-developer",
+        "git-automate-reviewer",
+        "git-automate-product",
+        "git-automate-qa",
+    ];
+    let installed_agents = match opencode.get_agents(None).await {
+        Ok(agents) => agents
+            .into_iter()
+            .map(|a| a.name)
+            .collect::<std::collections::HashSet<_>>(),
+        Err(e) => {
+            eprintln!("e2e test skipped: failed to list OpenCode agents: {}", e);
+            return;
+        }
+    };
+    let missing: Vec<_> = required_agents
+        .iter()
+        .filter(|name| !installed_agents.contains(**name))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "e2e test skipped: required OpenCode agents missing: {}",
+            missing.join(", ")
+        );
+        return;
+    }
+
+    // ── 3. Create a unique @ai issue ──────────────────────────────
+    let issue_title = format!(
+        "@ai e2e test: full workflow state flow {}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let issue_body = "This is an e2e test issue for the full workflow state flow test.";
+
+    let created_issue = github
+        .create_issue(&parsed.owner, &parsed.repo, &issue_title, issue_body)
+        .await
+        .expect("Failed to create GitHub issue");
+
+    eprintln!(
+        "Created issue #{} ('{}') in {}/{}",
+        created_issue.number, issue_title, parsed.owner, parsed.repo
+    );
+
+    // Wait for the issue to be visible.
+    let mut visible = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match github.list_repo_issues(&parsed.owner, &parsed.repo).await {
+            Ok(issues) if issues.iter().any(|i| i.number == created_issue.number) => {
+                visible = true;
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(
+        visible,
+        "Created issue #{} not visible in repo issues",
+        created_issue.number
+    );
+
+    // ── 4. Setup: cwd + workflow context ──────────────────────────
+    let _cwd_guard = SET_CWD_MUTEX.lock().await;
+    let original_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&project_root)
+        .unwrap_or_else(|e| panic!("Failed to set cwd to {:?}: {}", project_root, e));
+
+    let deps = WorkflowContext {
+        config: config.clone(),
+        github: Some(github.clone()),
+        shell: real_shell(),
+    };
+    let workflow = Workflow::new(deps);
+
+    // ── 5. Resolve project ID and field IDs ───────────────────────
+    let config_project_id = project_config
+        .project_id
+        .as_ref()
+        .expect("Project ID missing from config");
+    let project_id = resolve_project_id(&github, &parsed.owner, config_project_id)
+        .await
+        .expect("Failed to resolve project ID")
+        .0;
+
+    let (status_field_id, status_option_map) = resolve_status_field_ids(&github, &project_id)
+        .await
+        .expect("Failed to resolve status field IDs");
+
+    let session_field_id = resolve_session_field_id(&github, &project_id)
+        .await
+        .expect("Failed to resolve session field ID");
+
+    // ── 6. Run triage check ───────────────────────────────────────
+    workflow
+        .run_triage_check()
+        .await
+        .expect("triage check failed");
+
+    let items = github
+        .list_project_items(&project_id)
+        .await
+        .expect("Failed to list project items");
+    let item = items
+        .iter()
+        .find(|i| i.content_number == created_issue.number)
+        .unwrap_or_else(|| panic!("Issue #{} not in project", created_issue.number));
+
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+
+    assert_eq!(
+        values.get("Status").and_then(|v| v.as_deref()),
+        Some("Triage"),
+        "Expected Status=Triage after triage check"
+    );
+    let triage_session_id = values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .expect("Expected sessionId after triage check");
+    assert!(!triage_session_id.is_empty());
+    eprintln!("Triage: Status=Triage, sessionId={}", triage_session_id);
+
+    // ── 7. Simulate triage agent completion → Todo ────────────────
+    simulate_agent_completion(
+        &github,
+        &project_id,
+        &item.id,
+        &status_field_id,
+        &session_field_id,
+        "Todo",
+        &status_option_map,
+    )
+    .await
+    .expect("Failed to transition to Todo");
+
+    // ── 8. Run todo check ─────────────────────────────────────────
+    workflow.run_todo_check().await.expect("todo check failed");
+
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+    let todo_session_id = values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .expect("Expected sessionId after todo check");
+    assert!(!todo_session_id.is_empty());
+    eprintln!("Todo: sessionId={}", todo_session_id);
+
+    // ── 9. Simulate developer agent completion → Review Technical ─
+    // Developer agent sets In Development then Review Technical in one go.
+    simulate_agent_completion(
+        &github,
+        &project_id,
+        &item.id,
+        &status_field_id,
+        &session_field_id,
+        "Review Technical",
+        &status_option_map,
+    )
+    .await
+    .expect("Failed to transition to Review Technical");
+
+    // ── 10. Run review check (Review Technical) ───────────────────
+    workflow
+        .run_review_check()
+        .await
+        .expect("review check failed");
+
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+    let reviewer_session_id = values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .expect("Expected sessionId after review check (Technical)");
+    assert!(!reviewer_session_id.is_empty());
+    eprintln!("Review Technical: sessionId={}", reviewer_session_id);
+
+    // ── 11. Simulate reviewer agent completion → Review Product ───
+    simulate_agent_completion(
+        &github,
+        &project_id,
+        &item.id,
+        &status_field_id,
+        &session_field_id,
+        "Review Product",
+        &status_option_map,
+    )
+    .await
+    .expect("Failed to transition to Review Product");
+
+    // ── 12. Run review check (Review Product) ─────────────────────
+    workflow
+        .run_review_check()
+        .await
+        .expect("review check failed");
+
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+    let product_session_id = values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .expect("Expected sessionId after review check (Product)");
+    assert!(!product_session_id.is_empty());
+    eprintln!("Review Product: sessionId={}", product_session_id);
+
+    // ── 13. Simulate product agent completion → QA ────────────────
+    simulate_agent_completion(
+        &github,
+        &project_id,
+        &item.id,
+        &status_field_id,
+        &session_field_id,
+        "QA",
+        &status_option_map,
+    )
+    .await
+    .expect("Failed to transition to QA");
+
+    // ── 14. Run review check (QA) ─────────────────────────────────
+    workflow
+        .run_review_check()
+        .await
+        .expect("review check failed");
+
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+    let qa_session_id = values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .expect("Expected sessionId after review check (QA)");
+    assert!(!qa_session_id.is_empty());
+    eprintln!("QA: sessionId={}", qa_session_id);
+
+    // ── 15. Simulate QA agent completion → Done ───────────────────
+    simulate_agent_completion(
+        &github,
+        &project_id,
+        &item.id,
+        &status_field_id,
+        &session_field_id,
+        "Done",
+        &status_option_map,
+    )
+    .await
+    .expect("Failed to transition to Done");
+
+    // ── 16. Run review check — should NOT start a new session ─────
+    let active_before = opencode
+        .count_active_sessions()
+        .await
+        .expect("Failed to count active sessions");
+
+    workflow
+        .run_review_check()
+        .await
+        .expect("review check failed");
+
+    let active_after = opencode
+        .count_active_sessions()
+        .await
+        .expect("Failed to count active sessions");
+
+    assert_eq!(
+        active_before, active_after,
+        "Expected no new session after Done; active sessions changed from {} to {}",
+        active_before, active_after
+    );
+
+    // ── 17. Final verification: Status = Done, sessionId cleared ──
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+    assert_eq!(
+        values.get("Status").and_then(|v| v.as_deref()),
+        Some("Done"),
+        "Expected Status=Done at end of workflow"
+    );
+    let final_session = values.get("sessionId").and_then(|v| v.as_deref());
+    assert!(
+        final_session.map(|s| s.is_empty()).unwrap_or(true),
+        "Expected sessionId to be empty after Done, got: {:?}",
+        final_session
+    );
+
+    // ── 18. Cleanup ───────────────────────────────────────────────
+    std::env::set_current_dir(&original_dir)
+        .unwrap_or_else(|e| panic!("Failed to restore cwd: {}", e));
+    drop(_cwd_guard);
+
+    eprintln!(
+        "e2e full workflow test passed: issue #{} reached Done",
+        created_issue.number
     );
 }
