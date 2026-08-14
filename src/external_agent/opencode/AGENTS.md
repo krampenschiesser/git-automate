@@ -9,6 +9,7 @@ src/external_agent/opencode/
 ├── mod.rs      (13)  Module decls + re-exports (OpenCodeClient, OpenCodeError)
 ├── client.rs   (653)  HTTP client + ExternalAgent impl
 ├── agent.rs    (1079) Agent definitions + prompt handling
+├── api-spec.json OpenApi specification of opencode
 └── types.rs    (66)  Serde response types
 ```
 
