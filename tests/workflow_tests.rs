@@ -10,9 +10,10 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::*;
-use git_automate::config::parse_config;
+use git_automate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig, parse_config};
 use git_automate::workflow::Workflow;
-use git_automate::workflow::helpers::{WorkflowContext, write_project_id};
+use git_automate::workflow::checks::{OpencodeSessionConfig, run_review_check};
+use git_automate::workflow::helpers::{ProjectContext, WorkflowContext, write_project_id};
 
 // ─── Test 1: Full triage flow with mocks ──────────────────────
 
@@ -979,4 +980,294 @@ projects:
         "projectId in YAML should still be the original value '4', got: {:?}",
         pid
     );
+}
+
+// ─── Failed Review Flow Integration Tests ──────────────────────
+
+async fn mount_failed_review_github_mocks(
+    server: &MockServer,
+    review_state: &str,
+    session_id: &str,
+) {
+    mount_status_field_mock(server).await;
+    mount_project_fields_mock(server).await;
+    mount_add_item_mock(server).await;
+    mount_update_field_mock(server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("items(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "items": {
+                        "nodes": [
+                            {
+                                "id": "item-42",
+                                "content": {
+                                    "__typename": "Issue",
+                                    "id": "issue-node-42",
+                                    "number": 42
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fieldValues(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fieldValues": {
+                        "nodes": [
+                            {"__typename": "ProjectV2ItemFieldSingleSelectValue", "name": review_state, "field": {"name": "Status"}},
+                            {"__typename": "ProjectV2ItemFieldTextValue", "text": session_id, "field": {"name": "sessionId"}}
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+fn failed_review_test_ctx(
+    _review_state: &str,
+    _session_id: &str,
+) -> (WorkflowContext, ProjectContext, OpencodeSessionConfig) {
+    let project_config = ProjectConfig {
+        repository: "https://github.com/owner/repo".to_string(),
+        project_id: Some("PID-123".to_string()),
+        directory: None,
+        opencode: Some(OpencodeConfig {
+            url: "http://localhost:8081".to_string(),
+            pw: "pw".to_string(),
+        }),
+        issue_provider: "github".to_string(),
+        title_pattern: "@ai.*".to_string(),
+        trello_api_key: None,
+        trello_token: None,
+        trello_board_id: None,
+    };
+
+    let mut projects = std::collections::BTreeMap::new();
+    projects.insert("test-proj".to_string(), project_config.clone());
+
+    let deps = WorkflowContext {
+        config: GitAutomateConfig {
+            projects,
+            concurrency: None,
+            github_token: None,
+        },
+        github: None,
+        shell: mock_shell(),
+    };
+
+    let ctx = ProjectContext {
+        name: "test-proj".to_string(),
+        config: project_config,
+        owner: "owner".to_string(),
+        repo: "repo".to_string(),
+        project_id: "PID-123".to_string(),
+    };
+
+    let oc = OpencodeSessionConfig {
+        url: "http://localhost:8081".to_string(),
+        pw: "pw".to_string(),
+        directory: None,
+    };
+
+    (deps, ctx, oc)
+}
+
+#[tokio::test]
+async fn test_failed_review_technical_transitions_to_in_dev() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+
+    mount_failed_review_github_mocks(&gh_mock, "Review Technical", "old-review-session").await;
+
+    Mock::given(method("GET"))
+        .and(path("/session/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "dev-sess-999",
+            "projectID": "p1",
+            "directory": "/d",
+            "title": "Review Technical: Fix login",
+            "version": "1",
+            "time": {"created": 1, "updated": 2}
+        })))
+        .expect(1)
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session/dev-sess-999/prompt_async"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&oc_mock)
+        .await;
+
+    let client = gh_client(&gh_mock);
+    let (mut deps, ctx, mut oc) = failed_review_test_ctx("Review Technical", "old-review-session");
+    deps.github = Some(client.clone());
+    oc.url = oc_mock.uri();
+    let result = run_review_check(&deps, &ctx, &oc).await;
+    assert!(
+        result.is_ok(),
+        "run_review_check failed: {:?}",
+        result.err()
+    );
+    oc_mock.verify().await;
+}
+
+#[tokio::test]
+async fn test_failed_review_product_transitions_to_in_dev() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+
+    mount_failed_review_github_mocks(&gh_mock, "Review Product", "old-review-session").await;
+
+    Mock::given(method("GET"))
+        .and(path("/session/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "dev-sess-999",
+            "projectID": "p1",
+            "directory": "/d",
+            "title": "Review Product: Fix",
+            "version": "1",
+            "time": {"created": 1, "updated": 2}
+        })))
+        .expect(1)
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session/dev-sess-999/prompt_async"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&oc_mock)
+        .await;
+
+    let client = gh_client(&gh_mock);
+    let (mut deps, ctx, mut oc) = failed_review_test_ctx("Review Product", "old-review-session");
+    deps.github = Some(client.clone());
+    oc.url = oc_mock.uri();
+    let result = run_review_check(&deps, &ctx, &oc).await;
+    assert!(
+        result.is_ok(),
+        "run_review_check failed: {:?}",
+        result.err()
+    );
+    oc_mock.verify().await;
+}
+
+#[tokio::test]
+async fn test_failed_review_qa_transitions_to_in_dev() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+
+    mount_failed_review_github_mocks(&gh_mock, "QA", "old-review-session").await;
+
+    Mock::given(method("GET"))
+        .and(path("/session/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "dev-sess-999",
+            "projectID": "p1",
+            "directory": "/d",
+            "title": "QA: Test integration",
+            "version": "1",
+            "time": {"created": 1, "updated": 2}
+        })))
+        .expect(1)
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session/dev-sess-999/prompt_async"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&oc_mock)
+        .await;
+
+    let client = gh_client(&gh_mock);
+    let (mut deps, ctx, mut oc) = failed_review_test_ctx("QA", "old-review-session");
+    deps.github = Some(client.clone());
+    oc.url = oc_mock.uri();
+    let result = run_review_check(&deps, &ctx, &oc).await;
+    assert!(
+        result.is_ok(),
+        "run_review_check failed: {:?}",
+        result.err()
+    );
+    oc_mock.verify().await;
+}
+
+#[tokio::test]
+async fn test_active_review_session_not_recovered() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+
+    mount_failed_review_github_mocks(&gh_mock, "Review Technical", "active-session").await;
+
+    Mock::given(method("GET"))
+        .and(path("/session/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active-session": {"type": "busy"}
+        })))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "should-not-happen",
+            "projectID": "p", "directory": "/d", "title": "t",
+            "version": "1", "time": {"created": 1, "updated": 2}
+        })))
+        .expect(0)
+        .mount(&oc_mock)
+        .await;
+
+    let client = gh_client(&gh_mock);
+    let (mut deps, ctx, mut oc) = failed_review_test_ctx("Review Technical", "active-session");
+    deps.github = Some(client.clone());
+    oc.url = oc_mock.uri();
+    let result = run_review_check(&deps, &ctx, &oc).await;
+    assert!(
+        result.is_ok(),
+        "run_review_check failed: {:?}",
+        result.err()
+    );
+    oc_mock.verify().await;
 }
