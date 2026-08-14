@@ -154,6 +154,14 @@ impl OpenCodeClient {
     /// Sessions present in the status map (idle, busy, retry) are considered active.
     /// Sessions absent from the map are Done and do not count.
     pub async fn count_active_sessions(&self) -> Result<usize, OpenCodeError> {
+        self.get_session_statuses().await.map(|m| m.len())
+    }
+
+    /// `GET /session/status` — return all active session IDs and their statuses.
+    /// Session IDs absent from the returned map have completed.
+    pub async fn get_session_statuses(
+        &self,
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>, OpenCodeError> {
         let response = self
             .client
             .get(format!("{}/session/status", self.base_url))
@@ -165,7 +173,7 @@ impl OpenCodeClient {
         }
         let statuses: std::collections::HashMap<String, serde_json::Value> =
             response.json().await?;
-        Ok(statuses.len())
+        Ok(statuses)
     }
 
     /// `GET /session/{id}/message` — list messages in a session.
@@ -680,6 +688,57 @@ mod tests {
 
         let client = client(&server);
         client.count_active_sessions().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_session_statuses_returns_full_map() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sess1": { "type": "idle" },
+                "sess2": { "type": "busy" },
+                "sess3": { "type": "retry", "attempt": 1 }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let statuses = client.get_session_statuses().await.unwrap();
+        assert_eq!(statuses.len(), 3);
+        assert!(statuses.contains_key("sess1"));
+        assert!(statuses.contains_key("sess2"));
+        assert!(statuses.contains_key("sess3"));
+        // A completed session should NOT be in the map
+        assert!(!statuses.contains_key("sess-done"));
+    }
+
+    #[tokio::test]
+    async fn test_get_session_statuses_empty_map() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let statuses = client.get_session_statuses().await.unwrap();
+        assert!(statuses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_session_statuses_500_returns_error() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.get_session_statuses().await;
+        assert!(result.is_err());
     }
 
     // --- get_session_messages (tests 20-24) ------------------------------
