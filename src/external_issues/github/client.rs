@@ -461,12 +461,16 @@ impl GitHubClient {
     }
 
     /// Set a text field (e.g. session ID) value on a project item.
+    ///
+    /// Pass `Some(id)` to set the text value, or `None` to clear it (sends
+    /// `null` to the GitHub GraphQL API, which properly removes the value
+    /// so that `get_project_item_values` returns `None` for the field).
     pub async fn update_project_item_session_id(
         &self,
         project_id: &str,
         item_id: &str,
         field_id: &str,
-        session_id: &str,
+        session_id: Option<&str>,
     ) -> Result<(), GitHubError> {
         self.graphql::<UpdateItemFieldValueResult>(
             include_str!("queries/update_project_item_session_id.graphql"),

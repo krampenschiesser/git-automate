@@ -210,7 +210,7 @@ pub async fn run_triage_check(
                     &ctx.project_id,
                     &item_id,
                     &session_field_id,
-                    &session_id,
+                    Some(&session_id),
                 )
                 .await?;
         }
@@ -312,7 +312,7 @@ pub async fn run_todo_check(
                 &ctx.project_id,
                 item_id,
                 &session_field_id,
-                &session_id,
+                Some(&session_id),
             )
             .await?;
     }
@@ -439,7 +439,7 @@ pub async fn run_review_check(
                     &ctx.project_id,
                     &item.id,
                     &session_field_id,
-                    &session_id,
+                    Some(&session_id),
                 )
                 .await?;
         }
