@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod issues;
+pub mod pr_comments;
 pub mod project;
 pub mod repo;
 pub mod types;
