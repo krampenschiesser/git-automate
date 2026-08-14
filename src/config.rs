@@ -66,6 +66,8 @@ pub struct GitAutomateConfig {
     pub projects: BTreeMap<String, ProjectConfig>,
     #[serde(default)]
     pub concurrency: Option<usize>,
+    #[serde(rename = "githubToken", default)]
+    pub github_token: Option<String>,
 }
 
 /// Compiled regex for `${env:VAR}` patterns, cached via `OnceLock`.
@@ -177,6 +179,13 @@ mod tests {
     const ENV_PW: &str = "GA_TEST_PW";
     const ENV_TRELLO_KEY: &str = "GA_TEST_TRELLO_KEY";
     const ENV_TRELLO_TOKEN: &str = "GA_TEST_TRELLO_TOKEN";
+    const ENV_GH_TOKEN: &str = "GA_TEST_GH_TOKEN";
+    const ENV_GH_TOKEN_ALL: &str = "GA_TEST_GH_TOKEN_ALL";
+    const ENV_GH_TOKEN_UNSET: &str = "GA_TEST_GH_TOKEN_UNSET";
+    const ENV_OPENCODE_URL_ALL: &str = "GA_TEST_OPENCODE_URL_ALL";
+    const ENV_PW_ALL: &str = "GA_TEST_PW_ALL";
+    const ENV_PW_PER_PROJECT: &str = "GA_TEST_PW_PER_PROJECT";
+    const ENV_OPENCODE_URL: &str = "GA_TEST_OPENCODE_URL";
 
     // --- substitute_env tests ---
 
@@ -579,9 +588,153 @@ projects:
         let config = GitAutomateConfig {
             projects: BTreeMap::new(),
             concurrency: Some(4),
+            github_token: Some("ghp_testtoken123456789".to_string()),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: GitAutomateConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.concurrency, Some(4));
+        assert_eq!(
+            parsed.github_token.as_deref(),
+            Some("ghp_testtoken123456789")
+        );
+    }
+
+    // --- github_token substitution tests ---
+
+    // Test: parse_config with githubToken: ${env:VAR} → github_token is substituted
+    #[test]
+    fn parse_config_substitutes_github_token() {
+        unsafe {
+            std::env::set_var(ENV_GH_TOKEN, "ghp_from_env_substitution");
+        }
+        let yaml = format!(
+            "
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+githubToken: ${{env:{}}}
+",
+            ENV_GH_TOKEN
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(
+            config.github_token.as_deref(),
+            Some("ghp_from_env_substitution")
+        );
+    }
+
+    // Test: parse_config without githubToken → github_token is None
+    #[test]
+    fn parse_config_without_github_token_is_none() {
+        let yaml = r#"
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(config.github_token, None);
+    }
+
+    // Test: parse_config with githubToken: ${env:VAR} where VAR unset → github_token is Some("")
+    #[test]
+    fn parse_config_github_token_unset_var_becomes_empty_string() {
+        unsafe {
+            std::env::remove_var(ENV_GH_TOKEN_UNSET);
+        }
+        let yaml = format!(
+            "
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+githubToken: ${{env:{}}}
+",
+            ENV_GH_TOKEN_UNSET
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(config.github_token.as_deref(), Some(""));
+    }
+
+    // Test: parse_config with ALL env vars substituted simultaneously
+    // (OPENCODE_URL, OPENCODE_PW, GITHUB_TOKEN) — end-to-end substitution
+    #[test]
+    fn parse_config_substitutes_all_env_vars_together() {
+        unsafe {
+            std::env::set_var(ENV_OPENCODE_URL_ALL, "http://localhost:8081");
+            std::env::set_var(ENV_PW_ALL, "secret123");
+            std::env::set_var(ENV_GH_TOKEN_ALL, "ghp_all_vars_work");
+        }
+        let yaml = format!(
+            "
+concurrency: 2
+githubToken: ${{env:{}}}
+projects:
+  my-repo:
+    repository: https://github.com/user/repo
+    opencode:
+      url: ${{env:{}}}
+      pw: ${{env:{}}}
+",
+            ENV_GH_TOKEN_ALL, ENV_OPENCODE_URL_ALL, ENV_PW_ALL
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(config.concurrency, Some(2));
+        assert_eq!(config.github_token.as_deref(), Some("ghp_all_vars_work"));
+
+        let project = config.projects.get("my-repo").unwrap();
+        assert_eq!(
+            project.opencode.as_ref().unwrap().url,
+            "http://localhost:8081"
+        );
+        assert_eq!(project.opencode.as_ref().unwrap().pw, "secret123");
+    }
+
+    // Test: parse_config with per-project opencode.pw using ${env:VAR}
+    // alongside top-level githubToken — both substituted independently
+    #[test]
+    fn parse_config_substitutes_per_project_opencode_pw() {
+        unsafe {
+            std::env::set_var(ENV_PW_PER_PROJECT, "project_level_pw");
+        }
+        let yaml = format!(
+            "
+projects:
+  svc-a:
+    repository: https://github.com/user/svc-a
+    opencode:
+      url: http://localhost:8081
+      pw: ${{env:{}}}
+  svc-b:
+    repository: https://github.com/user/svc-b
+    opencode:
+      url: http://localhost:8082
+      pw: literal-password
+",
+            ENV_PW_PER_PROJECT
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let svc_a = config.projects.get("svc-a").unwrap();
+        assert_eq!(svc_a.opencode.as_ref().unwrap().pw, "project_level_pw");
+        let svc_b = config.projects.get("svc-b").unwrap();
+        assert_eq!(svc_b.opencode.as_ref().unwrap().pw, "literal-password");
     }
 }

@@ -58,6 +58,7 @@ pub mod test_utils {
             config: crate::config::GitAutomateConfig {
                 projects: std::collections::BTreeMap::new(),
                 concurrency: None,
+                github_token: None,
             },
             github,
             shell: mock_shell(),

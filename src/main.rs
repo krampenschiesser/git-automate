@@ -94,11 +94,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error>> {
     let config = parse_config(config_path)?;
 
-    let token = std::env::var("GITHUB_TOKEN")
-        .map_err(|_| "GITHUB_TOKEN environment variable is not set — cannot start daemon")?;
-    if token.is_empty() {
-        return Err("GITHUB_TOKEN environment variable is empty — cannot start daemon".into());
-    }
+    // Prefer the config's github_token (substituted from ${env:GITHUB_TOKEN}),
+    // falling back to the GITHUB_TOKEN environment variable for backward compatibility.
+    let token = config
+        .github_token
+        .as_ref()
+        .filter(|t| !t.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()))
+        .ok_or("GITHUB_TOKEN environment variable is not set — cannot start daemon")?;
     let github = GitHubClient::new(token)?;
 
     let shell = create_shell_fn();
@@ -116,15 +120,25 @@ async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error
 
 /// One-shot setup wizard implementing the flow in `docs/src/cli.md`.
 async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let token = std::env::var("GITHUB_TOKEN")
-        .map_err(|_| "GITHUB_TOKEN environment variable is not set — cannot run doctor")?;
-    if token.is_empty() {
-        return Err("GITHUB_TOKEN environment variable is empty — cannot run doctor".into());
-    }
+    // Parse config first (if it exists) to access github_token via ${env:VAR} substitution
+    let config = if config_path.exists() {
+        Some(parse_config(config_path)?)
+    } else {
+        None
+    };
+
+    // Prefer the config's github_token (substituted from ${env:GITHUB_TOKEN}),
+    // falling back to the GITHUB_TOKEN environment variable for backward compatibility.
+    let token = config
+        .as_ref()
+        .and_then(|c| c.github_token.as_ref())
+        .filter(|t| !t.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()))
+        .ok_or("GITHUB_TOKEN environment variable is not set — cannot run doctor")?;
     let github = GitHubClient::new(token)?;
 
-    let (owner, repo, existing_project_id) = if config_path.exists() {
-        let config = parse_config(config_path)?;
+    let (owner, repo, existing_project_id) = if let Some(config) = config {
         let first = config
             .projects
             .values()
@@ -309,6 +323,41 @@ mod tests {
 
         let result = setup(&config_path).await;
         assert!(result.is_ok(), "setup should succeed: {:?}", result.err());
+
+        if let Some(val) = saved {
+            unsafe {
+                std::env::set_var("GITHUB_TOKEN", val);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("GITHUB_TOKEN");
+            }
+        }
+    }
+
+    // T-n: setup with githubToken: ${env:GITHUB_TOKEN} in config → substitution works
+    #[tokio::test]
+    async fn setup_with_github_token_substituted_in_config() {
+        let _guard = ENV_LOCK.lock().await;
+        let saved = std::env::var("GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "ghp_from_config_substitution");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("git-automate.yml");
+        std::fs::write(
+            &config_path,
+            "projects:\n  test:\n    repository: owner/repo\ngithubToken: ${env:GITHUB_TOKEN}\n",
+        )
+        .expect("write config");
+
+        let result = setup(&config_path).await;
+        assert!(
+            result.is_ok(),
+            "setup should succeed with substituted githubToken: {:?}",
+            result.err()
+        );
 
         if let Some(val) = saved {
             unsafe {
