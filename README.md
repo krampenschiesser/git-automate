@@ -25,24 +25,24 @@ git-automate health --url http://localhost:8081 --pw <password>
 
 ## Configuration
 
-The config file (`git-automate.yml`) defines projects to monitor:
+The config file (`git-automate.yml`) defines a git project to monitor:
 
 ```yaml
-projects:
-  my-project:
-    repository: https://github.com/owner/repo
-    projectId: 1
-    titlePattern: '@ai.*'
-    directory: /path/to/repo
-    opencode:
-      url: http://localhost:8081
-      pw: ${env:OPENCODE_PW}
+opencode:
+  url: http://localhost:8081
+  pw: ${env:OPENCODE_PW}
+git:
+  repository: https://github.com/owner/repo
+  projectId: 1
+  titlePattern: '@ai.*'
+  directory: /path/to/repo
 ```
 
 ### Environment Variables
 
 - `GITHUB_TOKEN` -- GitHub API token. If unset, GitHub operations are skipped.
 - `OPENCODE_PW` -- OpenCode server password (referenced in config via `${env:OPENCODE_PW}`).
+- `GIT_AUTOMATE_CONFIG` -- Path to the config file. Used as fallback when `--config` is not explicitly passed.
 
 Variables can also be set in a `.env` file in the working directory; values already
 set in the environment take precedence.
@@ -52,12 +52,12 @@ set in the environment take precedence.
 | Field            | Required | Description                                      |
 |------------------|----------|--------------------------------------------------|
 | `concurrency`    | no       | Limits total active OpenCode agent sessions. When set, skips session creation if active session count >= limit (default: no limit) |
+| `opencode.url`   | yes      | OpenCode server base URL                         |
+| `opencode.pw`    | yes      | OpenCode server password (use `${env:VAR}`)      |
 | `repository`     | yes      | GitHub repo URL or `owner/repo` shorthand        |
 | `projectId`      | no       | GitHub Project V2 ID (created automatically if absent) |
 | `directory`      | no       | Working directory for OpenCode agent sessions     |
-| `opencode.url`   | yes      | OpenCode server base URL                         |
 | `titlePattern`   | no       | Regex to match issue titles for triage (default `@ai.*`) |
-| `opencode.pw`    | yes      | OpenCode server password (use `${env:VAR}`)      |
 
 ## Workflow
 
