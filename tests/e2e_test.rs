@@ -725,3 +725,337 @@ async fn e2e_full_workflow_state_flow() {
         created_issue.number
     );
 }
+
+/// End-to-end test: failed review recovery flow.
+///
+/// Verifies that when a review session ends without a status transition,
+/// `run_failed_review_check` detects the stale session, transitions the item
+/// back to Todo, clears the session, and starts a new developer session.
+///
+/// Flow:
+///   1. Create @ai issue, run triage → Status=Triage, sessionId set
+///   2. Simulate triage completion → Todo, run todo check → dev session
+///   3. Simulate dev completion → Review Technical, run review check → reviewer session
+///   4. Simulate reviewer session ending (set stale session ID)
+///   5. Run review check again → run_failed_review_check recovers:
+///      - Status transitions to Todo
+///      - Old session ID cleared
+///      - New developer session started
+#[tokio::test]
+async fn e2e_failed_review_recovery_flow() {
+    dotenv().ok();
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
+    let opencode_pw = std::env::var("OPENCODE_PW").unwrap_or_default();
+
+    if token.is_empty() || opencode_pw.is_empty() {
+        eprintln!("e2e test skipped: GITHUB_TOKEN or OPENCODE_PW is not set in .env");
+        return;
+    }
+
+    // ── 1. Parse config ───────────────────────────────────────────
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config_path = project_root.join("git-automate.yml");
+    let config = parse_config(&config_path).expect("Failed to parse git-automate.yml");
+
+    let (project_name, project_config) = config
+        .projects
+        .iter()
+        .find(|(_, c)| c.opencode.is_some())
+        .expect("No project with opencode settings found in config");
+    let _project_name = project_name.clone();
+
+    let oc_config = project_config
+        .opencode
+        .as_ref()
+        .expect("Project config missing opencode settings");
+
+    let parsed =
+        parse_repository_url(&project_config.repository).expect("Failed to parse repository URL");
+
+    // ── 2. Create clients ─────────────────────────────────────────
+    let github = GitHubClient::new(token.clone()).expect("Failed to create GitHub client");
+    let opencode = OpenCodeClient::new(oc_config.url.clone(), oc_config.pw.clone());
+
+    // Skip if required agents are not installed.
+    let required_agents = [
+        "git-automate-triage",
+        "git-automate-taskmanager",
+        "git-automate-developer",
+        "git-automate-reviewer",
+        "git-automate-product",
+        "git-automate-qa",
+    ];
+    let installed_agents = match opencode.get_agents(None).await {
+        Ok(agents) => agents
+            .into_iter()
+            .map(|a| a.name)
+            .collect::<std::collections::HashSet<_>>(),
+        Err(e) => {
+            eprintln!("e2e test skipped: failed to list OpenCode agents: {}", e);
+            return;
+        }
+    };
+    let missing: Vec<_> = required_agents
+        .iter()
+        .filter(|name| !installed_agents.contains(**name))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "e2e test skipped: required OpenCode agents missing: {}",
+            missing.join(", ")
+        );
+        return;
+    }
+
+    // ── 3. Create a unique @ai issue ──────────────────────────────
+    let issue_title = format!(
+        "@ai e2e test: failed review recovery {}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let issue_body = "This is an e2e test issue for the failed review recovery flow. \
+        It verifies that run_failed_review_check detects stale sessions and starts new dev work.";
+
+    let created_issue = github
+        .create_issue(&parsed.owner, &parsed.repo, &issue_title, issue_body)
+        .await
+        .expect("Failed to create GitHub issue");
+
+    eprintln!(
+        "Created issue #{} in {}/{}",
+        created_issue.number, parsed.owner, parsed.repo
+    );
+
+    // Wait for the issue to be visible.
+    let mut visible = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match github.list_repo_issues(&parsed.owner, &parsed.repo).await {
+            Ok(issues) if issues.iter().any(|i| i.number == created_issue.number) => {
+                visible = true;
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(
+        visible,
+        "Created issue #{} not visible in repo issues",
+        created_issue.number
+    );
+
+    // ── 4. Setup: cwd + workflow context ──────────────────────────
+    let _cwd_guard = SET_CWD_MUTEX.lock().await;
+    let original_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&project_root)
+        .unwrap_or_else(|e| panic!("Failed to set cwd to {:?}: {}", project_root, e));
+
+    let deps = WorkflowContext {
+        config: config.clone(),
+        github: Some(github.clone()),
+        shell: real_shell(),
+    };
+    let workflow = Workflow::new(deps);
+
+    // Resolve project ID and field IDs.
+    let config_project_id = project_config
+        .project_id
+        .as_ref()
+        .expect("Project ID missing from config");
+    let project_id = resolve_project_id(&github, &parsed.owner, config_project_id)
+        .await
+        .expect("Failed to resolve project ID")
+        .0;
+
+    let (status_field_id, status_option_map) = resolve_status_field_ids(&github, &project_id)
+        .await
+        .expect("Failed to resolve status field IDs");
+
+    let session_field_id = resolve_session_field_id(&github, &project_id)
+        .await
+        .expect("Failed to resolve session field ID");
+
+    // ── 5. Run triage check ───────────────────────────────────────
+    workflow
+        .run_triage_check()
+        .await
+        .expect("triage check failed");
+
+    let items = github
+        .list_project_items(&project_id)
+        .await
+        .expect("Failed to list project items");
+    let item = items
+        .iter()
+        .find(|i| i.content_number == created_issue.number)
+        .unwrap_or_else(|| panic!("Issue #{} not in project", created_issue.number));
+
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+
+    assert_eq!(
+        values.get("Status").and_then(|v| v.as_deref()),
+        Some("Triage"),
+        "Expected Status=Triage after triage check"
+    );
+    eprintln!("Triage: Status=Triage");
+
+    // ── 6. Simulate triage completion → Todo ──────────────────────
+    simulate_agent_completion(
+        &github,
+        &project_id,
+        &item.id,
+        &status_field_id,
+        &session_field_id,
+        "Todo",
+        &status_option_map,
+    )
+    .await
+    .expect("Failed to transition to Todo");
+
+    // ── 7. Run todo check ─────────────────────────────────────────
+    workflow.run_todo_check().await.expect("todo check failed");
+
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+    let dev_session_id = values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .expect("Expected sessionId after todo check");
+    assert!(!dev_session_id.is_empty());
+    eprintln!("Todo: dev session started, sessionId={}", dev_session_id);
+
+    // ── 8. Simulate developer completion → Review Technical ───────
+    simulate_agent_completion(
+        &github,
+        &project_id,
+        &item.id,
+        &status_field_id,
+        &session_field_id,
+        "Review Technical",
+        &status_option_map,
+    )
+    .await
+    .expect("Failed to transition to Review Technical");
+
+    // ── 9. Run review check (Review Technical) ────────────────────
+    workflow
+        .run_review_check()
+        .await
+        .expect("review check failed");
+
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+    let reviewer_session_id = values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .expect("Expected sessionId after review check (Technical)");
+    assert!(!reviewer_session_id.is_empty());
+    assert_ne!(
+        reviewer_session_id, dev_session_id,
+        "Reviewer session should differ from dev session"
+    );
+    eprintln!(
+        "Review Technical: reviewer session started, sessionId={}",
+        reviewer_session_id
+    );
+
+    // Verify the reviewer session is active.
+    let active_count = opencode
+        .count_active_sessions()
+        .await
+        .expect("Failed to count active sessions");
+    assert!(active_count > 0, "Expected active reviewer session");
+    eprintln!("Active sessions: {}", active_count);
+
+    // ── 10. Simulate reviewer session ending ──────────────────────
+    github
+        .update_project_item_session_id(
+            &project_id,
+            &item.id,
+            &session_field_id,
+            Some("stale-session-id-that-no-longer-exists"),
+        )
+        .await
+        .expect("Failed to set stale session ID");
+
+    eprintln!("Set stale session ID on item #{}", created_issue.number);
+
+    // ── 11. Run review check again ─────────────────────────────────
+    // This should trigger run_failed_review_check which detects the stale
+    // session, transitions the item to Todo, clears the session, and starts
+    // a new developer session.
+    workflow
+        .run_review_check()
+        .await
+        .expect("review check with failed review failed");
+
+    // ── 12. Verify: recovery completed ────────────────────────────
+    // After run_failed_review_check:
+    // - Status should have changed from "Review Technical" to "Todo"
+    // - The old stale session ID should be cleared
+    // - A new developer session should have been started
+    let values = github
+        .get_project_item_values(&item.id)
+        .await
+        .expect("Failed to get item values");
+
+    let recovered_status = values
+        .get("Status")
+        .and_then(|v| v.as_deref())
+        .expect("Status should be set after recovery");
+    assert_eq!(
+        recovered_status, "Todo",
+        "Expected Status=Todo after failed review recovery, got '{}'",
+        recovered_status
+    );
+    eprintln!("Recovery: Status=Todo");
+
+    let recovered_session_id = values
+        .get("sessionId")
+        .and_then(|v| v.as_deref())
+        .expect("sessionId should be set after recovery");
+    assert!(
+        !recovered_session_id.is_empty(),
+        "sessionId should be non-empty after recovery (new dev session started)"
+    );
+    assert_ne!(
+        recovered_session_id, "stale-session-id-that-no-longer-exists",
+        "sessionId should be replaced with new dev session ID"
+    );
+    assert_ne!(
+        recovered_session_id, reviewer_session_id,
+        "Recovered session should differ from the stale reviewer session"
+    );
+    // The new session should be a developer session (different from the
+    // reviewer session we set earlier).
+    assert_ne!(
+        recovered_session_id, reviewer_session_id,
+        "New dev session ID should differ from reviewer session"
+    );
+    eprintln!(
+        "Recovery: new dev session started, sessionId={}",
+        recovered_session_id
+    );
+
+    // ── 13. Cleanup ───────────────────────────────────────────────
+    std::env::set_current_dir(&original_dir)
+        .unwrap_or_else(|e| panic!("Failed to restore cwd: {}", e));
+    drop(_cwd_guard);
+
+    eprintln!(
+        "e2e failed review recovery test passed: issue #{}, recovered with new dev session",
+        created_issue.number
+    );
+}
