@@ -90,7 +90,7 @@ async fn simulate_agent_completion(
 ) -> Result<(), git_automate::external_issues::github::client::GitHubError> {
     let option_id = option_map
         .get(next_status)
-        .expect(&format!("status option '{}' must exist", next_status));
+        .unwrap_or_else(|| panic!("status option '{}' must exist", next_status));
 
     github
         .update_project_item_status(project_id, item_id, status_field_id, option_id)
@@ -139,19 +139,13 @@ async fn e2e_triage_flow_creates_session() {
     let config_path = project_root.join("git-automate.yml");
     let config = parse_config(&config_path).expect("Failed to parse git-automate.yml");
 
-    // Pick a project with OpenCode settings: BTreeMap iteration is sorted, so
-    // `keys().next()` is not guaranteed to return the project intended for e2e.
-    let (project_name, project_config) = config
-        .projects
-        .iter()
-        .find(|(_, c)| c.opencode.is_some())
-        .expect("No project with opencode settings found in config");
-    let _project_name = project_name.clone();
+    let project_config = &config.git;
+    let _project_name = project_config.repository.clone();
 
-    let oc_config = project_config
+    let oc_config = config
         .opencode
         .as_ref()
-        .expect("Project config missing opencode settings");
+        .expect("Config missing global opencode settings");
 
     // Parse repository URL → owner/repo
     let parsed =
@@ -393,17 +387,13 @@ async fn e2e_full_workflow_state_flow() {
     let config_path = project_root.join("git-automate.yml");
     let config = parse_config(&config_path).expect("Failed to parse git-automate.yml");
 
-    let (project_name, project_config) = config
-        .projects
-        .iter()
-        .find(|(_, c)| c.opencode.is_some())
-        .expect("No project with opencode settings found in config");
-    let _project_name = project_name.clone();
+    let project_config = &config.git;
+    let _project_name = project_config.repository.clone();
 
-    let oc_config = project_config
+    let oc_config = config
         .opencode
         .as_ref()
-        .expect("Project config missing opencode settings");
+        .expect("Config missing global opencode settings");
 
     let parsed =
         parse_repository_url(&project_config.repository).expect("Failed to parse repository URL");
