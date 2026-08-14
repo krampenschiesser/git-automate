@@ -17,7 +17,7 @@ use crate::external_issues::github::types::IssueInfo;
 use super::helpers::{
     ProjectContext, WorkflowContext, WorkflowError, clone_repo_if_needed, extract_session_id,
     fill_prompt, get_issue_body_map, issue_body_or_title, load_prompt_template, resolve_field_ids,
-    resolve_status_option_and_session,
+    resolve_option_id, resolve_status_option_and_session,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -442,6 +442,149 @@ pub async fn run_review_check(
                     Some(&session_id),
                 )
                 .await?;
+        }
+    }
+
+    run_failed_review_check(deps, ctx, oc).await?;
+
+    Ok(())
+}
+
+/// Detect review sessions that completed without a status transition and
+/// recover the item: back to Todo → new dev session → In Development.
+pub async fn run_failed_review_check(
+    deps: &WorkflowContext,
+    ctx: &ProjectContext,
+    oc: &OpencodeSessionConfig,
+) -> Result<(), WorkflowError> {
+    let github = deps
+        .github
+        .as_ref()
+        .ok_or_else(|| WorkflowError::NoGitHub(ctx.name.clone()))?;
+
+    let field_ids = resolve_field_ids(github, &ctx.project_id).await?;
+    let session_field_id = field_ids
+        .session_field_id
+        .ok_or_else(|| WorkflowError::NoSessionField(ctx.project_id.clone()))?;
+
+    let project_items = github.list_project_items(&ctx.project_id).await?;
+    if project_items.is_empty() {
+        tracing::info!("{}: no project items for failed review check", ctx.name);
+        return Ok(());
+    }
+
+    let issue_map = get_issue_body_map(github, &ctx.owner, &ctx.repo).await?;
+    let work_dir = clone_repo_if_needed(&deps.shell_deps(), &ctx.owner, &ctx.repo).await?;
+    let status_field = github.get_project_status_field(&ctx.project_id).await?;
+
+    let Some(status_field) = status_field else {
+        tracing::warn!(
+            "{}: no Status field found for failed review check",
+            ctx.name
+        );
+        return Ok(());
+    };
+
+    let todo_option_id = resolve_option_id(&status_field.options, "Todo");
+    let in_dev_option_id = resolve_option_id(&status_field.options, "In Development");
+
+    let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
+    let active_sessions = oc_client.get_session_statuses().await.unwrap_or_else(|e| {
+        tracing::warn!(
+            "{}: could not fetch OpenCode session statuses for failed review check: {}",
+            ctx.name,
+            e
+        );
+        std::collections::HashMap::new()
+    });
+
+    let mut item_values = Vec::new();
+    for item in &project_items {
+        item_values.push(github.get_project_item_values(&item.id).await?);
+    }
+
+    for state in &REVIEW_STATES {
+        for (item, values) in project_items.iter().zip(&item_values) {
+            let current_status = values.get("Status").and_then(|v| v.as_deref());
+            if current_status != Some(state.status()) {
+                continue;
+            }
+
+            let session_id = match extract_session_id(values) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            if active_sessions.contains_key(&session_id) {
+                continue;
+            }
+
+            tracing::warn!(
+                "{}: review session {} for issue #{} has completed without status transition, recovering",
+                ctx.name,
+                session_id,
+                item.content_number
+            );
+
+            if let Some(todo_id) = &todo_option_id {
+                github
+                    .update_project_item_status(
+                        &ctx.project_id,
+                        &item.id,
+                        &field_ids.status_field_id,
+                        todo_id,
+                    )
+                    .await?;
+            }
+            github
+                .update_project_item_session_id(&ctx.project_id, &item.id, &session_field_id, None)
+                .await?;
+
+            let issue_number = item.content_number;
+            let title = issue_map
+                .get(&issue_number)
+                .map(|i| i.title.clone())
+                .unwrap_or_else(|| format!("Dev work for issue #{}", issue_number));
+            let message = issue_map
+                .get(&issue_number)
+                .map(issue_body_or_title)
+                .unwrap_or_else(|| format!("Issue #{}", issue_number));
+
+            tracing::info!(
+                "{}: starting developer session for failed review #{}",
+                ctx.name,
+                issue_number
+            );
+
+            let new_session_id = start_opencode_session(
+                oc,
+                oc.directory_or(&work_dir),
+                &title,
+                "git-automate-developer",
+                &message,
+                deps.config.concurrency,
+            )
+            .await?;
+
+            github
+                .update_project_item_session_id(
+                    &ctx.project_id,
+                    &item.id,
+                    &session_field_id,
+                    Some(&new_session_id),
+                )
+                .await?;
+
+            if let Some(in_dev_id) = &in_dev_option_id {
+                github
+                    .update_project_item_status(
+                        &ctx.project_id,
+                        &item.id,
+                        &field_ids.status_field_id,
+                        in_dev_id,
+                    )
+                    .await?;
+            }
         }
     }
 
@@ -1938,6 +2081,15 @@ mod tests {
 
         mount_review_github_mocks(&mock, project_items, issues, field_values, status_options).await;
 
+        // GET /session/status → session still active
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "existing-session": {"type": "busy"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
         // OpenCode should never be called
         Mock::given(method("POST"))
             .and(path("/session"))
@@ -2276,6 +2428,222 @@ mod tests {
         let oc = make_oc_config("http://localhost:8081".to_string());
 
         let result = run_review_check(&deps, &ctx, &oc).await;
+        assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    // ── Failed Review Check Tests ──────────────────────────────
+
+    fn all_status_options() -> Vec<serde_json::Value> {
+        vec![
+            json!({"id": "triage-id", "name": "Triage"}),
+            json!({"id": "todo-id", "name": "Todo"}),
+            json!({"id": "in-dev-id", "name": "In Development"}),
+            json!({"id": "review-tech-id", "name": "Review Technical"}),
+            json!({"id": "review-prod-id", "name": "Review Product"}),
+            json!({"id": "qa-id", "name": "QA"}),
+            json!({"id": "done-id", "name": "Done"}),
+        ]
+    }
+
+    fn review_field_values(status: &str, session_id: &str) -> serde_json::Value {
+        json!({
+            "nodes": [
+                single_select_field_value("Status", status),
+                text_field_value("sessionId", Some(session_id)),
+            ]
+        })
+    }
+
+    async fn mount_failed_review_opencode_mocks(server: &MockServer) {
+        // GET /session/status → empty map (no active sessions → review session completed)
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(server)
+            .await;
+
+        // POST /session → developer session created
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123", "projectID": "p1", "directory": "/d", "title": "t",
+                "version": "1", "time": {"created": 1, "updated": 2}
+            })))
+            .mount(server)
+            .await;
+
+        // POST /session/sess123/prompt_async → 204
+        Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+    }
+
+    // T14: Failed Technical review → transitions to Todo, starts dev session, → In Development
+    #[tokio::test]
+    async fn failed_review_technical_transitions_to_in_dev() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix login", "body": "Login broken", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Technical", "review-session-1");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_failed_review_opencode_mocks(&oc_mock).await;
+
+        let result = run_failed_review_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T15: Failed Product review → same recovery flow
+    #[tokio::test]
+    async fn failed_review_product_transitions_to_in_dev() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Update pricing", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Product", "review-session-2");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_failed_review_opencode_mocks(&oc_mock).await;
+
+        let result = run_failed_review_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+    }
+
+    // T16: Failed QA review → same recovery flow
+    #[tokio::test]
+    async fn failed_review_qa_transitions_to_in_dev() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Test integration", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("QA", "review-session-3");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_failed_review_opencode_mocks(&oc_mock).await;
+
+        let result = run_failed_review_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+    }
+
+    // T17: Active review session → no recovery action taken
+    #[tokio::test]
+    async fn failed_review_active_session_is_ignored() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Technical", "review-session-1");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+
+        // GET /session/status → returns the session as active
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "review-session-1": {"type": "busy"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
+        // POST /session should NOT be called (session is still active)
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "should-not-happen",
+                "projectID": "p", "directory": "/d", "title": "t",
+                "version": "1", "time": {"created": 1, "updated": 2}
+            })))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_failed_review_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T18: Failed review — no GitHub client → returns NoGitHub error
+    #[tokio::test]
+    async fn failed_review_no_github_client_returns_error() {
+        let deps = make_deps(None);
+        let ctx = make_context();
+        let oc = make_oc_config("http://localhost:8081".to_string());
+
+        let result = run_failed_review_check(&deps, &ctx, &oc).await;
         assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
     }
 }
