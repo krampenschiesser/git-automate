@@ -157,40 +157,6 @@ async fn e2e_triage_flow_creates_session() {
     // ── 4. Create OpenCode client (for verification) ──────────────
     let opencode = OpenCodeClient::new(oc_config.url.clone(), oc_config.pw.clone());
 
-    // Skip if the required git-automate agents are not installed. The agents
-    // must be present in the OpenCode server's agents directory for the
-    // workflow to start triage/todo/review sessions.
-    let required_agents = [
-        "git-automate-triage",
-        "git-automate-taskmanager",
-        "git-automate-developer",
-        "git-automate-reviewer",
-        "git-automate-product",
-        "git-automate-qa",
-    ];
-    let installed_agents = match opencode.get_agents(None).await {
-        Ok(agents) => agents
-            .into_iter()
-            .map(|a| a.name)
-            .collect::<std::collections::HashSet<_>>(),
-        Err(e) => {
-            eprintln!("e2e test skipped: failed to list OpenCode agents: {}", e);
-            return;
-        }
-    };
-    let missing: Vec<_> = required_agents
-        .iter()
-        .filter(|name| !installed_agents.contains(**name))
-        .copied()
-        .collect();
-    if !missing.is_empty() {
-        eprintln!(
-            "e2e test skipped: required OpenCode agents missing: {}",
-            missing.join(", ")
-        );
-        return;
-    }
-
     // ── 5. Create a unique @ai issue ──────────────────────────────
     let issue_title = format!(
         "@ai e2e test: verify triage flow {}",
@@ -401,38 +367,6 @@ async fn e2e_full_workflow_state_flow() {
     // ── 2. Create clients ─────────────────────────────────────────
     let github = GitHubClient::new(token.clone()).expect("Failed to create GitHub client");
     let opencode = OpenCodeClient::new(oc_config.url.clone(), oc_config.pw.clone());
-
-    // Skip if required agents are not installed.
-    let required_agents = [
-        "git-automate-triage",
-        "git-automate-taskmanager",
-        "git-automate-developer",
-        "git-automate-reviewer",
-        "git-automate-product",
-        "git-automate-qa",
-    ];
-    let installed_agents = match opencode.get_agents(None).await {
-        Ok(agents) => agents
-            .into_iter()
-            .map(|a| a.name)
-            .collect::<std::collections::HashSet<_>>(),
-        Err(e) => {
-            eprintln!("e2e test skipped: failed to list OpenCode agents: {}", e);
-            return;
-        }
-    };
-    let missing: Vec<_> = required_agents
-        .iter()
-        .filter(|name| !installed_agents.contains(**name))
-        .copied()
-        .collect();
-    if !missing.is_empty() {
-        eprintln!(
-            "e2e test skipped: required OpenCode agents missing: {}",
-            missing.join(", ")
-        );
-        return;
-    }
 
     // ── 3. Create a unique @ai issue ──────────────────────────────
     let issue_title = format!(
@@ -763,38 +697,6 @@ async fn e2e_failed_review_recovery_flow() {
     // ── 2. Create clients ─────────────────────────────────────────
     let github = GitHubClient::new(token.clone()).expect("Failed to create GitHub client");
     let opencode = OpenCodeClient::new(oc_config.url.clone(), oc_config.pw.clone());
-
-    // Skip if required agents are not installed.
-    let required_agents = [
-        "git-automate-triage",
-        "git-automate-taskmanager",
-        "git-automate-developer",
-        "git-automate-reviewer",
-        "git-automate-product",
-        "git-automate-qa",
-    ];
-    let installed_agents = match opencode.get_agents(None).await {
-        Ok(agents) => agents
-            .into_iter()
-            .map(|a| a.name)
-            .collect::<std::collections::HashSet<_>>(),
-        Err(e) => {
-            eprintln!("e2e test skipped: failed to list OpenCode agents: {}", e);
-            return;
-        }
-    };
-    let missing: Vec<_> = required_agents
-        .iter()
-        .filter(|name| !installed_agents.contains(**name))
-        .copied()
-        .collect();
-    if !missing.is_empty() {
-        eprintln!(
-            "e2e test skipped: required OpenCode agents missing: {}",
-            missing.join(", ")
-        );
-        return;
-    }
 
     // ── 3. Create a unique @ai issue ──────────────────────────────
     let issue_title = format!(
