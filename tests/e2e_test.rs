@@ -13,8 +13,10 @@
 //!    - An OpenCode session exists (`GET /session/status` reports active sessions)
 //!    - The session's initial prompt contains the issue body (`GET /session/{id}/message`)
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use dotenv::dotenv;
 
@@ -243,6 +245,7 @@ async fn e2e_triage_flow_creates_session() {
         config: config.clone(),
         github: Some(github.clone()),
         shell: real_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let workflow = Workflow::new(deps);
@@ -482,6 +485,7 @@ async fn e2e_full_workflow_state_flow() {
         config: config.clone(),
         github: Some(github.clone()),
         shell: real_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);
 
@@ -845,6 +849,7 @@ async fn e2e_failed_review_recovery_flow() {
         config: config.clone(),
         github: Some(github.clone()),
         shell: real_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);
 

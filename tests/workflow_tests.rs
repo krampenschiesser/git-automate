@@ -4,6 +4,10 @@
 
 mod common;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
 use serde_json::json;
 use tempfile::tempdir;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -299,6 +303,7 @@ git:
         config,
         github: Some(client),
         shell: mock_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
@@ -455,6 +460,7 @@ git:
         config,
         github: Some(client),
         shell: mock_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let workflow = Workflow::new(deps);
@@ -575,6 +581,7 @@ git:
         config,
         github: Some(client),
         shell: mock_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let workflow = Workflow::new(deps);
@@ -730,6 +737,7 @@ git:
         config,
         github: Some(client),
         shell: mock_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
@@ -897,6 +905,7 @@ git:
         config,
         github: Some(client),
         shell: mock_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
@@ -1029,6 +1038,7 @@ fn failed_review_test_ctx(
         },
         github: None,
         shell: mock_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let ctx = ProjectContext {

@@ -5,6 +5,10 @@
 //! boilerplate. Each test file in `tests/` that needs these helpers declares
 //! `mod common;` and then uses `common::*` or `common::specific_fn`.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -91,6 +95,7 @@ pub fn make_deps(
         },
         github,
         shell: mock_shell(),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 
