@@ -596,7 +596,7 @@ pub async fn run_failed_review_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProjectConfig;
+    use crate::config::GitSection;
     use crate::test_utils::{gh_client, make_deps};
     use crate::workflow::helpers::ProjectContext;
     use serde_json::json;
@@ -609,11 +609,10 @@ mod tests {
     fn make_context() -> ProjectContext {
         ProjectContext {
             name: "test-project".to_string(),
-            config: ProjectConfig {
+            config: GitSection {
                 repository: "https://github.com/owner/repo".to_string(),
                 project_id: Some("PID-123".to_string()),
                 directory: None,
-                opencode: None,
                 issue_provider: "github".to_string(),
                 title_pattern: "@ai.*".to_string(),
                 trello_api_key: None,

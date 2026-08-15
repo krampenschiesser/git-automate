@@ -5,13 +5,11 @@
 //! boilerplate. Each test file in `tests/` that needs these helpers declares
 //! `mod common;` and then uses `common::*` or `common::specific_fn`.
 
-use std::collections::BTreeMap;
-
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use git_automate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig};
+use git_automate::config::{GitAutomateConfig, GitSection, OpencodeConfig};
 use git_automate::external_agent::opencode::OpenCodeClient;
 use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::workflow::helpers::WorkflowContext;
@@ -31,15 +29,11 @@ pub fn gh_client(server: &MockServer) -> GitHubClient {
 pub fn oc_client(server: &MockServer) -> OpenCodeClient {
     OpenCodeClient::new(server.uri(), "pw".to_string())
 }
-pub fn project_with_opencode(url: String) -> ProjectConfig {
-    ProjectConfig {
+pub fn project_with_opencode(_url: String) -> GitSection {
+    GitSection {
         repository: "https://github.com/owner/repo".to_string(),
         project_id: Some("PID-123".to_string()),
         directory: None,
-        opencode: Some(OpencodeConfig {
-            url,
-            pw: "pw".to_string(),
-        }),
         issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
@@ -48,13 +42,12 @@ pub fn project_with_opencode(url: String) -> ProjectConfig {
     }
 }
 
-/// Build a `ProjectConfig` without opencode config.
-pub fn project_without_opencode() -> ProjectConfig {
-    ProjectConfig {
+/// Build a `GitSection` without opencode config.
+pub fn project_without_opencode() -> GitSection {
+    GitSection {
         repository: "https://github.com/owner/repo".to_string(),
         project_id: Some("PID-123".to_string()),
         directory: None,
-        opencode: None,
         issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
@@ -71,18 +64,30 @@ pub fn make_deps(
     opencode_url: Option<String>,
 ) -> WorkflowContext {
     let project = if with_opencode {
-        project_with_opencode(opencode_url.expect("opencode_url must be set when with_opencode"))
+        project_with_opencode(
+            opencode_url
+                .as_ref()
+                .expect("opencode_url must be set when with_opencode")
+                .clone(),
+        )
     } else {
         project_without_opencode()
     };
-    let mut projects = BTreeMap::new();
-    projects.insert("test-proj".to_string(), project);
+    let opencode = if with_opencode {
+        Some(OpencodeConfig {
+            url: opencode_url.expect("opencode_url must be set when with_opencode"),
+            pw: "pw".to_string(),
+        })
+    } else {
+        None
+    };
 
     WorkflowContext {
         config: GitAutomateConfig {
-            projects,
+            git: project,
             concurrency: None,
             github_token: None,
+            opencode,
         },
         github,
         shell: mock_shell(),

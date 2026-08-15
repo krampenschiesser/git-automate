@@ -1826,14 +1826,14 @@ mod tests {
         assert_eq!(result[0].id, "thread1");
         assert_eq!(result[0].path, "src/main.rs");
         assert_eq!(result[0].line, Some(42));
-        assert_eq!(result[0].is_resolved, false);
+        assert!(!result[0].is_resolved);
         assert_eq!(result[0].comments.nodes.len(), 1);
         assert_eq!(result[0].comments.nodes[0].body, "This needs a fix");
         assert_eq!(
             result[0].comments.nodes[0].author.as_ref().unwrap().login,
             "reviewer"
         );
-        assert_eq!(result[1].is_resolved, true);
+        assert!(result[1].is_resolved);
         assert!(result[1].comments.nodes[0].author.is_none());
     }
 

@@ -45,7 +45,7 @@ enum Commands {
     /// Run the git-automate daemon (polls GitHub + OpenCode every 30s)
     Serve {
         /// Path to the git-automate.yml config file
-        #[arg(long, default_value = git_automate::config::DEFAULT_CONFIG_FILE)]
+        #[arg(long, env = "GIT_AUTOMATE_CONFIG", default_value = git_automate::config::DEFAULT_CONFIG_FILE)]
         config: PathBuf,
         /// Run a single workflow cycle and exit (no polling loop)
         #[arg(long)]
@@ -61,7 +61,7 @@ enum Commands {
     /// Set up or fix a project: create config, find/create GitHub project, ensure fields
     Doctor {
         /// Path to the git-automate.yml config file
-        #[arg(long, default_value = git_automate::config::DEFAULT_CONFIG_FILE)]
+        #[arg(long, env = "GIT_AUTOMATE_CONFIG", default_value = git_automate::config::DEFAULT_CONFIG_FILE)]
         config: PathBuf,
     },
 }
@@ -139,14 +139,9 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let github = GitHubClient::new(token)?;
 
     let (owner, repo, existing_project_id) = if let Some(config) = config {
-        let first = config
-            .projects
-            .values()
-            .next()
-            .ok_or("No projects defined in config")?;
-        let parsed = parse_repository_url(&first.repository)
+        let parsed = parse_repository_url(&config.git.repository)
             .map_err(|e| format!("Invalid repository URL: {}", e))?;
-        (parsed.owner, parsed.repo, first.project_id.clone())
+        (parsed.owner, parsed.repo, config.git.project_id.clone())
     } else {
         match detect_git_remote() {
             Some(p) => (p.owner, p.repo, None),
@@ -282,11 +277,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("git-automate.yml");
-        std::fs::write(
-            &config_path,
-            "projects:\n  test:\n    repository: owner/repo\n",
-        )
-        .expect("write config");
+        std::fs::write(&config_path, "git:\n  repository: owner/repo\n").expect("write config");
 
         let result = setup(&config_path).await;
         assert!(result.is_err(), "setup should fail when token is unset");
@@ -315,11 +306,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("git-automate.yml");
-        std::fs::write(
-            &config_path,
-            "projects:\n  test:\n    repository: owner/repo\n",
-        )
-        .expect("write config");
+        std::fs::write(&config_path, "git:\n  repository: owner/repo\n").expect("write config");
 
         let result = setup(&config_path).await;
         assert!(result.is_ok(), "setup should succeed: {:?}", result.err());
@@ -348,7 +335,7 @@ mod tests {
         let config_path = dir.path().join("git-automate.yml");
         std::fs::write(
             &config_path,
-            "projects:\n  test:\n    repository: owner/repo\ngithubToken: ${env:GITHUB_TOKEN}\n",
+            "git:\n  repository: owner/repo\ngithubToken: ${env:GITHUB_TOKEN}\n",
         )
         .expect("write config");
 
@@ -690,17 +677,15 @@ mod tests {
         let data: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
 
         let pid = data
-            .get("projects")
-            .and_then(|p| p.get("my-repo"))
-            .and_then(|p| p.get("projectId"))
+            .get("git")
+            .and_then(|g| g.get("projectId"))
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(pid, "PID-123");
 
         let repo = data
-            .get("projects")
-            .and_then(|p| p.get("my-repo"))
-            .and_then(|p| p.get("repository"))
+            .get("git")
+            .and_then(|g| g.get("repository"))
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(repo, "https://github.com/owner/my-repo");
@@ -713,7 +698,7 @@ mod tests {
         let config_path = dir.path().join("git-automate.yml");
         std::fs::write(
             &config_path,
-            "projects:\n  my-repo:\n    repository: https://github.com/owner/my-repo\n",
+            "git:\n  repository: https://github.com/owner/my-repo\n",
         )
         .unwrap();
 
@@ -746,7 +731,7 @@ mod tests {
         assert!(content.contains("projectId: 1"));
 
         let parsed = git_automate::config::parse_config(&config_path).unwrap();
-        let project = parsed.projects.get("my-repo").unwrap();
+        let project = &parsed.git;
         assert_eq!(project.project_id.as_deref(), Some("1"));
     }
 
@@ -764,13 +749,9 @@ issueProvider: github
 opencode:
   url: http://localhost:8081
   pw: ${env:OPENCODE_PW}
-projects:
-  my-repo:
-    repository: https://github.com/owner/my-repo
-    issueProvider: github
-    opencode:
-      url: http://localhost:8081
-      pw: ${env:OPENCODE_PW}
+git:
+  repository: https://github.com/owner/my-repo
+  issueProvider: github
 "#,
         )
         .unwrap();
@@ -802,11 +783,7 @@ projects:
             Some("${env:OPENCODE_PW}")
         );
 
-        let project = data
-            .get("projects")
-            .and_then(|p| p.get("my-repo"))
-            .and_then(|p| p.as_mapping())
-            .unwrap();
+        let project = data.get("git").and_then(|g| g.as_mapping()).unwrap();
         assert_eq!(
             project.get("projectId").and_then(|v| v.as_str()),
             Some("PID-789")
@@ -814,18 +791,6 @@ projects:
         assert_eq!(
             project.get("issueProvider").and_then(|v| v.as_str()),
             Some("github")
-        );
-        let proj_opencode = project
-            .get("opencode")
-            .and_then(|v| v.as_mapping())
-            .unwrap();
-        assert_eq!(
-            proj_opencode.get("url").and_then(|v| v.as_str()),
-            Some("http://localhost:8081")
-        );
-        assert_eq!(
-            proj_opencode.get("pw").and_then(|v| v.as_str()),
-            Some("${env:OPENCODE_PW}")
         );
     }
 }

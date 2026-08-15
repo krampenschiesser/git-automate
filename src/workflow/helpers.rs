@@ -11,7 +11,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::WorkflowStatus;
-use crate::config::{GitAutomateConfig, ProjectConfig};
+use crate::config::{GitAutomateConfig, GitSection};
 use crate::external_issues::github::client::{GitHubClient, GitHubError};
 use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::{IssueInfo, ParsedRepo, StatusOption};
@@ -62,7 +62,7 @@ pub enum WorkflowError {
 #[derive(Debug, Clone)]
 pub struct ProjectContext {
     pub name: String,
-    pub config: ProjectConfig,
+    pub config: GitSection,
     pub owner: String,
     pub repo: String,
     pub project_id: String,
@@ -267,17 +267,18 @@ pub async fn clone_repo_if_needed(
     Ok(clone_path)
 }
 
-/// Read `git-automate.yml`, set the `projectId` for a named project, and
-/// write it back to disk — also updating the in-memory config.
+/// Read `git-automate.yml`, set `git.projectId`, and write it back to disk —
+/// also updating the in-memory config.
 ///
 /// Equivalent to TS `writeProjectId`. Uses `serde_yaml::Value` for
 /// round-trip preservation of the YAML structure.
 pub async fn write_project_id(
-    project_name: &str,
+    _project_name: &str,
     project_id: &str,
     config: &mut GitAutomateConfig,
 ) -> Result<(), WorkflowError> {
-    let config_path = std::env::current_dir()?.join(crate::config::DEFAULT_CONFIG_FILE);
+    let config_path = crate::config::resolve_config_path()
+        .map_err(|e| WorkflowError::ConfigNotFound(e.to_string()))?;
     if !config_path.exists() {
         return Err(WorkflowError::ConfigNotFound(
             config_path.display().to_string(),
@@ -292,35 +293,21 @@ pub async fn write_project_id(
         .as_mapping_mut()
         .ok_or_else(|| WorkflowError::Other("config root is not a mapping".to_string()))?;
 
-    // Ensure "projects" exists.
-    let proj_key = serde_yaml::Value::String("projects".to_string());
-    if !root.contains_key(&proj_key) {
+    // Ensure "git" exists as a mapping.
+    let git_key = serde_yaml::Value::String("git".to_string());
+    if !root.contains_key(&git_key) {
         root.insert(
-            proj_key.clone(),
+            git_key.clone(),
             serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
         );
     }
 
-    let projects = root
-        .get_mut(&proj_key)
+    let git_section = root
+        .get_mut(&git_key)
         .and_then(|v| v.as_mapping_mut())
-        .ok_or_else(|| WorkflowError::Other("projects is not a mapping".to_string()))?;
+        .ok_or_else(|| WorkflowError::Other("git is not a mapping".to_string()))?;
 
-    // Ensure the named project entry exists.
-    let name_key = serde_yaml::Value::String(project_name.to_string());
-    if !projects.contains_key(&name_key) {
-        projects.insert(
-            name_key.clone(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-        );
-    }
-
-    let project = projects
-        .get_mut(&name_key)
-        .and_then(|v| v.as_mapping_mut())
-        .ok_or_else(|| WorkflowError::Other("project entry is not a mapping".to_string()))?;
-
-    project.insert(
+    git_section.insert(
         serde_yaml::Value::String("projectId".to_string()),
         serde_yaml::Value::String(project_id.to_string()),
     );
@@ -330,9 +317,7 @@ pub async fn write_project_id(
     std::fs::write(&config_path, yaml_content)?;
 
     // Keep in-memory config in sync.
-    if let Some(p) = config.projects.get_mut(project_name) {
-        p.project_id = Some(project_id.to_string());
-    }
+    config.git.project_id = Some(project_id.to_string());
 
     Ok(())
 }
@@ -409,20 +394,20 @@ pub async fn resolve_project_id(
 pub async fn resolve_context(
     deps: &ContextDeps,
     project_name: &str,
-    project_config: &ProjectConfig,
+    git_section: &GitSection,
 ) -> Result<ProjectContext, WorkflowError> {
     let github = deps
         .github
         .as_ref()
         .ok_or_else(|| WorkflowError::NoGitHub(project_name.to_string()))?;
 
-    let ParsedRepo { owner, repo } = parse_repository_url(&project_config.repository)
+    let ParsedRepo { owner, repo } = parse_repository_url(&git_section.repository)
         .map_err(|e| WorkflowError::Other(e.to_string()))?;
 
     // Numeric project IDs (e.g. "1") are resolved to global node IDs at runtime.
     // The config file is NOT modified — the original numeric ID is preserved
     // so users can keep `projectId: 1` and have it resolved each time.
-    let project_id = if let Some(pid) = &project_config.project_id {
+    let project_id = if let Some(pid) = &git_section.project_id {
         resolve_project_id(github, &owner, pid).await?.0
     } else {
         tracing::info!("Creating project {} for {}/{}", project_name, owner, repo);
@@ -439,7 +424,7 @@ pub async fn resolve_context(
 
     Ok(ProjectContext {
         name: project_name.to_string(),
-        config: project_config.clone(),
+        config: git_section.clone(),
         owner,
         repo,
         project_id,
@@ -572,7 +557,7 @@ pub fn detect_git_remote() -> Option<ParsedRepo> {
 
 pub fn write_doctor_config(
     config_path: &Path,
-    project_name: &str,
+    _project_name: &str,
     repository: &str,
     project_id: &str,
 ) -> Result<(), WorkflowError> {
@@ -587,33 +572,21 @@ pub fn write_doctor_config(
         .as_mapping_mut()
         .ok_or_else(|| WorkflowError::Other("config root is not a mapping".to_string()))?;
 
-    let proj_key = serde_yaml::Value::String("projects".to_string());
-    if !root.contains_key(&proj_key) {
+    // Ensure "git" exists as a mapping.
+    let git_key = serde_yaml::Value::String("git".to_string());
+    if !root.contains_key(&git_key) {
         root.insert(
-            proj_key.clone(),
+            git_key.clone(),
             serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
         );
     }
 
-    let projects = root
-        .get_mut(&proj_key)
+    let git_section = root
+        .get_mut(&git_key)
         .and_then(|v| v.as_mapping_mut())
-        .ok_or_else(|| WorkflowError::Other("projects is not a mapping".to_string()))?;
+        .ok_or_else(|| WorkflowError::Other("git is not a mapping".to_string()))?;
 
-    let name_key = serde_yaml::Value::String(project_name.to_string());
-    if !projects.contains_key(&name_key) {
-        projects.insert(
-            name_key.clone(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-        );
-    }
-
-    let project = projects
-        .get_mut(&name_key)
-        .and_then(|v| v.as_mapping_mut())
-        .ok_or_else(|| WorkflowError::Other("project entry is not a mapping".to_string()))?;
-
-    project.insert(
+    git_section.insert(
         serde_yaml::Value::String("repository".to_string()),
         serde_yaml::Value::String(repository.to_string()),
     );
@@ -623,7 +596,7 @@ pub fn write_doctor_config(
     } else {
         serde_yaml::Value::String(project_id.to_string())
     };
-    project.insert(
+    git_section.insert(
         serde_yaml::Value::String("projectId".to_string()),
         project_id_value,
     );
@@ -823,16 +796,16 @@ mod tests {
 
     #[tokio::test]
     async fn write_project_id_creates_and_updates() {
-        let yaml = "projects:\n  my-repo:\n    repository: https://github.com/user/repo\n";
+        let yaml = "git:\n  repository: https://github.com/user/repo\n";
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("git-automate.yml");
         std::fs::write(&config_path, yaml).unwrap();
 
-        // Load config so the HashMap has the project entry.
+        // Load config so the git section is populated.
         let mut config = crate::config::parse_config(&config_path)
             .map_err(|e| format!("parse failed: {}", e))
             .unwrap();
-        assert_eq!(config.projects.get("my-repo").unwrap().project_id, None);
+        assert_eq!(config.git.project_id, None);
 
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = env::current_dir().unwrap();
@@ -845,23 +818,14 @@ mod tests {
         env::set_current_dir(&original_dir).unwrap();
 
         // Verify in-memory config updated.
-        assert_eq!(
-            config
-                .projects
-                .get("my-repo")
-                .unwrap()
-                .project_id
-                .as_deref(),
-            Some("PID-123")
-        );
+        assert_eq!(config.git.project_id.as_deref(), Some("PID-123"));
 
         // Verify on-disk YAML updated.
         let written = std::fs::read_to_string(&config_path).unwrap();
         let data: serde_yaml::Value = serde_yaml::from_str(&written).unwrap();
         let pid = data
-            .get("projects")
-            .and_then(|p| p.get("my-repo"))
-            .and_then(|p| p.get("projectId"))
+            .get("git")
+            .and_then(|g| g.get("projectId"))
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(pid, "PID-123");
@@ -871,9 +835,10 @@ mod tests {
     async fn write_project_id_missing_file() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut config = GitAutomateConfig {
-            projects: std::collections::BTreeMap::new(),
+            git: GitSection::default(),
             concurrency: None,
             github_token: None,
+            opencode: None,
         };
 
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
@@ -889,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_project_id_creates_new_project_entry() {
-        let yaml = "projects:\n  existing:\n    repository: https://github.com/u/r\n";
+        let yaml = "git:\n  repository: https://github.com/u/r\n";
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("git-automate.yml");
         std::fs::write(&config_path, yaml).unwrap();
@@ -897,7 +862,7 @@ mod tests {
         let mut config = crate::config::parse_config(&config_path)
             .map_err(|e| format!("parse failed: {}", e))
             .unwrap();
-        assert!(!config.projects.contains_key("new-project"));
+        assert_eq!(config.git.project_id, None);
 
         let _guard = crate::test_utils::SET_CWD_MUTEX.lock().await;
         let original_dir = env::current_dir().unwrap();
@@ -912,9 +877,8 @@ mod tests {
         let written = std::fs::read_to_string(&config_path).unwrap();
         let data: serde_yaml::Value = serde_yaml::from_str(&written).unwrap();
         let pid = data
-            .get("projects")
-            .and_then(|p| p.get("new-project"))
-            .and_then(|p| p.get("projectId"))
+            .get("git")
+            .and_then(|g| g.get("projectId"))
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(pid, "PID-NEW");
@@ -1022,12 +986,11 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn test_project_config(project_id: Option<&str>) -> ProjectConfig {
-        ProjectConfig {
+    fn test_git_section(project_id: Option<&str>) -> GitSection {
+        GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: project_id.map(String::from),
             directory: None,
-            opencode: None,
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -1037,12 +1000,12 @@ mod tests {
     }
 
     fn test_config(project_id: Option<&str>) -> GitAutomateConfig {
-        let mut projects = std::collections::BTreeMap::new();
-        projects.insert("test-project".to_string(), test_project_config(project_id));
+        let git = test_git_section(project_id);
         GitAutomateConfig {
-            projects,
+            git,
             concurrency: None,
             github_token: None,
+            opencode: None,
         }
     }
 
@@ -1111,9 +1074,9 @@ mod tests {
             github: Some(client),
             config: test_config(Some("PID-123")),
         };
-        let project_config = test_project_config(Some("PID-123"));
+        let git_section = test_git_section(Some("PID-123"));
 
-        let ctx = resolve_context(&deps, "test-project", &project_config)
+        let ctx = resolve_context(&deps, "test-project", &git_section)
             .await
             .expect("resolve_context should succeed with existing projectId");
         assert_eq!(ctx.name, "test-project");
@@ -1184,13 +1147,13 @@ mod tests {
             github: Some(client),
             config: test_config(Some("1")),
         };
-        let project_config = test_project_config(Some("1"));
+        let git_section = test_git_section(Some("1"));
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("git-automate.yml");
         std::fs::write(
             &config_path,
-            "projects:\n  test-project:\n    repository: https://github.com/owner/repo\n    projectId: 1\n",
+            "git:\n  repository: https://github.com/owner/repo\n  projectId: 1\n",
         )
         .unwrap();
 
@@ -1198,7 +1161,7 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp_dir.path()).unwrap();
 
-        let ctx = resolve_context(&deps, "test-project", &project_config)
+        let ctx = resolve_context(&deps, "test-project", &git_section)
             .await
             .expect("resolve_context should succeed");
 
@@ -1291,13 +1254,13 @@ mod tests {
             github: Some(client),
             config: test_config(None),
         };
-        let project_config = test_project_config(None);
+        let git_section = test_git_section(None);
 
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("git-automate.yml");
         std::fs::write(
             &config_path,
-            "projects:\n  test-project:\n    repository: https://github.com/owner/repo\n",
+            "git:\n  repository: https://github.com/owner/repo\n",
         )
         .unwrap();
 
@@ -1305,7 +1268,7 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp_dir.path()).unwrap();
 
-        let ctx = resolve_context(&deps, "test-project", &project_config)
+        let ctx = resolve_context(&deps, "test-project", &git_section)
             .await
             .expect("resolve_context should succeed");
 
@@ -1318,9 +1281,8 @@ mod tests {
         let written = std::fs::read_to_string(&config_path).unwrap();
         let data: serde_yaml::Value = serde_yaml::from_str(&written).unwrap();
         let pid = data
-            .get("projects")
-            .and_then(|p| p.get("test-project"))
-            .and_then(|p| p.get("projectId"))
+            .get("git")
+            .and_then(|g| g.get("projectId"))
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(pid, "NEW_PID");
@@ -1333,7 +1295,7 @@ mod tests {
             config: test_config(Some("PID-123")),
         };
         let result =
-            resolve_context(&deps, "test-project", &test_project_config(Some("PID-123"))).await;
+            resolve_context(&deps, "test-project", &test_git_section(Some("PID-123"))).await;
         assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
     }
 
@@ -1345,11 +1307,10 @@ mod tests {
             github: Some(client),
             config: test_config(Some("PID-123")),
         };
-        let project_config = ProjectConfig {
+        let git_section = GitSection {
             repository: "invalid-no-slash".to_string(),
             project_id: Some("PID-123".to_string()),
             directory: None,
-            opencode: None,
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -1357,7 +1318,7 @@ mod tests {
             trello_board_id: None,
         };
 
-        let result = resolve_context(&deps, "test-project", &project_config).await;
+        let result = resolve_context(&deps, "test-project", &git_section).await;
         assert!(matches!(result, Err(WorkflowError::Other(_))));
     }
 
@@ -1607,9 +1568,9 @@ mod tests {
             github: Some(client),
             config: test_config(Some("PID-123")),
         };
-        let project_config = test_project_config(Some("PID-123"));
+        let git_section = test_git_section(Some("PID-123"));
 
-        let ctx = resolve_context(&deps, "test-project", &project_config)
+        let ctx = resolve_context(&deps, "test-project", &git_section)
             .await
             .expect("resolve_context should succeed");
         assert_eq!(ctx.project_id, "PID-123");
@@ -1682,9 +1643,9 @@ mod tests {
             github: Some(client),
             config: test_config(Some("PID-123")),
         };
-        let project_config = test_project_config(Some("PID-123"));
+        let git_section = test_git_section(Some("PID-123"));
 
-        let ctx = resolve_context(&deps, "test-project", &project_config)
+        let ctx = resolve_context(&deps, "test-project", &git_section)
             .await
             .expect("resolve_context should succeed");
         assert_eq!(ctx.project_id, "PID-123");
@@ -1964,9 +1925,10 @@ mod tests {
         let shell = create_test_shell();
         let deps = WorkflowContext {
             config: GitAutomateConfig {
-                projects: std::collections::BTreeMap::new(),
+                git: GitSection::default(),
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github: None,
             shell: shell.clone(),
@@ -1981,9 +1943,10 @@ mod tests {
     async fn context_deps_returns_github_and_config() {
         let shell = create_test_shell();
         let config = GitAutomateConfig {
-            projects: std::collections::BTreeMap::new(),
+            git: GitSection::default(),
             concurrency: None,
             github_token: None,
+            opencode: None,
         };
         let deps = WorkflowContext {
             config: config.clone(),
@@ -1992,7 +1955,7 @@ mod tests {
         };
         let cd = deps.context_deps();
         assert!(cd.github.is_none());
-        assert_eq!(cd.config.projects.len(), 0);
+        assert!(cd.config.git.repository.is_empty());
     }
 
     fn create_test_shell() -> ShellFn {

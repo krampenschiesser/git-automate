@@ -56,9 +56,10 @@ pub mod test_utils {
     ) -> crate::workflow::helpers::WorkflowContext {
         crate::workflow::helpers::WorkflowContext {
             config: crate::config::GitAutomateConfig {
-                projects: std::collections::BTreeMap::new(),
+                git: crate::config::GitSection::default(),
                 concurrency: None,
                 github_token: None,
+                opencode: None,
             },
             github,
             shell: mock_shell(),

@@ -10,7 +10,7 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::*;
-use git_automate::config::{GitAutomateConfig, OpencodeConfig, ProjectConfig, parse_config};
+use git_automate::config::{GitAutomateConfig, GitSection, OpencodeConfig, parse_config};
 use git_automate::workflow::Workflow;
 use git_automate::workflow::checks::{OpencodeSessionConfig, run_review_check};
 use git_automate::workflow::helpers::{ProjectContext, WorkflowContext, write_project_id};
@@ -132,18 +132,17 @@ async fn test_write_project_id_persists_to_yaml() {
 
     // Write a config without projectId.
     let yaml = r#"
-projects:
-  my-proj:
-    repository: "https://github.com/owner/repo"
-    opencode:
-      url: "http://localhost"
-      pw: "pw"
+opencode:
+  url: "http://localhost"
+  pw: "pw"
+git:
+  repository: "https://github.com/owner/repo"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
 
-    // Parse the config so the in-memory BTreeMap has the project entry.
+    // Parse the config so the in-memory git section is populated.
     let mut config = parse_config(&config_path).expect("parse_config should succeed");
-    assert_eq!(config.projects.get("my-proj").unwrap().project_id, None);
+    assert_eq!(config.git.project_id, None);
 
     // write_project_id uses current_dir to find git-automate.yml.
     let _guard = SET_CWD_MUTEX.lock().await;
@@ -157,24 +156,15 @@ projects:
     std::env::set_current_dir(&original_dir).expect("restore cwd should succeed");
 
     // Verify in-memory config updated.
-    assert_eq!(
-        config
-            .projects
-            .get("my-proj")
-            .unwrap()
-            .project_id
-            .as_deref(),
-        Some("PID-999")
-    );
+    assert_eq!(config.git.project_id.as_deref(), Some("PID-999"));
 
     // Verify on-disk YAML was updated.
     let written = std::fs::read_to_string(&config_path).expect("read should succeed");
     let data: serde_yaml::Value =
         serde_yaml::from_str(&written).expect("yaml parse should succeed");
     let pid = data
-        .get("projects")
-        .and_then(|p| p.get("my-proj"))
-        .and_then(|p| p.get("projectId"))
+        .get("git")
+        .and_then(|g| g.get("projectId"))
         .and_then(|v| v.as_str())
         .expect("projectId should exist in YAML");
     assert_eq!(pid, "PID-999");
@@ -291,17 +281,15 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
     let tmp = tempdir().expect("tempdir should succeed");
     let config_path = tmp.path().join("git-automate.yml");
     let yaml = r#"
-projects:
-  my-proj:
-    repository: "https://github.com/owner/repo"
-    titlePattern: "@ai.*"
+git:
+  repository: "https://github.com/owner/repo"
+  titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
 
     let config = parse_config(&config_path).expect("parse_config should succeed");
     assert_eq!(
-        config.projects.get("my-proj").unwrap().project_id,
-        None,
+        config.git.project_id, None,
         "project should start without a projectId"
     );
 
@@ -331,9 +319,8 @@ projects:
     let data: serde_yaml::Value =
         serde_yaml::from_str(&written).expect("yaml parse should succeed");
     let pid = data
-        .get("projects")
-        .and_then(|p| p.get("my-proj"))
-        .and_then(|p| p.get("projectId"))
+        .get("git")
+        .and_then(|g| g.get("projectId"))
         .and_then(|v| v.as_str())
         .expect("projectId should exist in YAML after setup");
     assert_eq!(
@@ -448,22 +435,16 @@ async fn test_setup_initialization_idempotent_when_everything_exists() {
     let tmp = tempdir().expect("tempdir should succeed");
     let config_path = tmp.path().join("git-automate.yml");
     let yaml = r#"
-projects:
-  my-proj:
-    repository: "https://github.com/owner/repo"
-    projectId: "PID-123"
-    titlePattern: "@ai.*"
+git:
+  repository: "https://github.com/owner/repo"
+  projectId: "PID-123"
+  titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
 
     let config = parse_config(&config_path).expect("parse_config should succeed");
     assert_eq!(
-        config
-            .projects
-            .get("my-proj")
-            .unwrap()
-            .project_id
-            .as_deref(),
+        config.git.project_id.as_deref(),
         Some("PID-123"),
         "project should already have projectId"
     );
@@ -578,24 +559,15 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
     let tmp = tempdir().expect("tempdir should succeed");
     let config_path = tmp.path().join("git-automate.yml");
     let yaml = r#"
-projects:
-  my-proj:
-    repository: "https://github.com/owner/repo"
-    projectId: "PID-123"
-    titlePattern: "@ai.*"
+git:
+  repository: "https://github.com/owner/repo"
+  projectId: "PID-123"
+  titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
 
     let config = parse_config(&config_path).expect("parse_config should succeed");
-    assert_eq!(
-        config
-            .projects
-            .get("my-proj")
-            .unwrap()
-            .project_id
-            .as_deref(),
-        Some("PID-123")
-    );
+    assert_eq!(config.git.project_id.as_deref(), Some("PID-123"));
 
     // ── Act ─────────────────────────────────────────────────────
     let client = gh_client(&gh_mock);
@@ -738,22 +710,16 @@ async fn test_setup_resolves_numeric_project_id_to_global_id() {
     let tmp = tempdir().expect("tempdir should succeed");
     let config_path = tmp.path().join("git-automate.yml");
     let yaml = r#"
-projects:
-  my-proj:
-    repository: "https://github.com/owner/repo"
-    projectId: 4
-    titlePattern: "@ai.*"
+git:
+  repository: "https://github.com/owner/repo"
+  projectId: 4
+  titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
 
     let config = parse_config(&config_path).expect("parse_config should succeed");
     assert_eq!(
-        config
-            .projects
-            .get("my-proj")
-            .unwrap()
-            .project_id
-            .as_deref(),
+        config.git.project_id.as_deref(),
         Some("4"),
         "project should have numeric projectId '4'"
     );
@@ -911,22 +877,16 @@ async fn test_doctor_does_not_persist_resolved_project_id() {
     let tmp = tempdir().expect("tempdir should succeed");
     let config_path = tmp.path().join("git-automate.yml");
     let yaml = r#"
-projects:
-  my-proj:
-    repository: "https://github.com/owner/repo"
-    projectId: 4
-    titlePattern: "@ai.*"
+git:
+  repository: "https://github.com/owner/repo"
+  projectId: 4
+  titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
 
     let config = parse_config(&config_path).expect("parse_config should succeed");
     assert_eq!(
-        config
-            .projects
-            .get("my-proj")
-            .unwrap()
-            .project_id
-            .as_deref(),
+        config.git.project_id.as_deref(),
         Some("4"),
         "project should have numeric projectId '4'"
     );
@@ -963,9 +923,8 @@ projects:
     let data: serde_yaml::Value =
         serde_yaml::from_str(&written).expect("yaml parse should succeed");
     let pid = data
-        .get("projects")
-        .and_then(|p| p.get("my-proj"))
-        .and_then(|p| p.get("projectId"))
+        .get("git")
+        .and_then(|g| g.get("projectId"))
         .expect("projectId should still exist in YAML after doctor");
 
     // The value should be the original number/string "4", NOT "PVT-resolved".
@@ -1047,14 +1006,10 @@ fn failed_review_test_ctx(
     _review_state: &str,
     _session_id: &str,
 ) -> (WorkflowContext, ProjectContext, OpencodeSessionConfig) {
-    let project_config = ProjectConfig {
+    let project_config = GitSection {
         repository: "https://github.com/owner/repo".to_string(),
         project_id: Some("PID-123".to_string()),
         directory: None,
-        opencode: Some(OpencodeConfig {
-            url: "http://localhost:8081".to_string(),
-            pw: "pw".to_string(),
-        }),
         issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
@@ -1062,14 +1017,15 @@ fn failed_review_test_ctx(
         trello_board_id: None,
     };
 
-    let mut projects = std::collections::BTreeMap::new();
-    projects.insert("test-proj".to_string(), project_config.clone());
-
     let deps = WorkflowContext {
         config: GitAutomateConfig {
-            projects,
+            git: project_config.clone(),
             concurrency: None,
             github_token: None,
+            opencode: Some(OpencodeConfig {
+                url: "http://localhost:8081".to_string(),
+                pw: "pw".to_string(),
+            }),
         },
         github: None,
         shell: mock_shell(),

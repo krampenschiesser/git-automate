@@ -1,10 +1,9 @@
 concurrency: 4
 githubToken: ${env:GITHUB_TOKEN}
-projects:
-  git-automate:
-    repository: https://github.com/krampenschiesser/git-automate
-    projectId: 5
-    issueProvider: github
-    opencode:
-      url: ${env:OPENCODE_URL}
-      pw: ${env:OPENCODE_PW}
+opencode:
+  url: ${env:OPENCODE_URL}
+  pw: ${env:OPENCODE_PW}
+git:
+  repository: https://github.com/krampenschiesser/git-automate
+  projectId: 5
+  issueProvider: github

@@ -2,7 +2,6 @@ use regex::Regex;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use std::collections::BTreeMap;
 use std::path::Path;
 use thiserror::Error;
 
@@ -24,9 +23,9 @@ pub struct OpencodeConfig {
     pub pw: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectConfig {
+pub struct GitSection {
     pub repository: String,
     #[serde(
         rename = "projectId",
@@ -35,7 +34,6 @@ pub struct ProjectConfig {
     )]
     pub project_id: Option<String>,
     pub directory: Option<String>,
-    pub opencode: Option<OpencodeConfig>,
     #[serde(rename = "issueProvider", default = "default_issue_provider")]
     pub issue_provider: String,
     #[serde(
@@ -63,11 +61,12 @@ fn default_title_pattern() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitAutomateConfig {
-    pub projects: BTreeMap<String, ProjectConfig>,
+    pub git: GitSection,
     #[serde(default)]
     pub concurrency: Option<usize>,
     #[serde(rename = "githubToken", default)]
     pub github_token: Option<String>,
+    pub opencode: Option<OpencodeConfig>,
 }
 
 /// Compiled regex for `${env:VAR}` patterns, cached via `OnceLock`.
@@ -156,9 +155,18 @@ pub fn parse_config(file_path: &Path) -> Result<GitAutomateConfig, ConfigError> 
 /// Default config file name used by [`load_config`].
 pub const DEFAULT_CONFIG_FILE: &str = "git-automate.yml";
 
-pub fn load_config() -> Result<GitAutomateConfig, ConfigError> {
+/// Resolve the config file path: prefer `GIT_AUTOMATE_CONFIG` env var,
+/// fall back to [`DEFAULT_CONFIG_FILE`] in the current directory.
+pub fn resolve_config_path() -> Result<std::path::PathBuf, ConfigError> {
+    if let Ok(path_str) = std::env::var("GIT_AUTOMATE_CONFIG") {
+        return Ok(std::path::PathBuf::from(path_str));
+    }
     let cwd = std::env::current_dir().map_err(ConfigError::Io)?;
-    let file_path = cwd.join(DEFAULT_CONFIG_FILE);
+    Ok(cwd.join(DEFAULT_CONFIG_FILE))
+}
+
+pub fn load_config() -> Result<GitAutomateConfig, ConfigError> {
+    let file_path = resolve_config_path()?;
     parse_config(&file_path)
 }
 
@@ -185,7 +193,6 @@ mod tests {
     const ENV_OPENCODE_URL_ALL: &str = "GA_TEST_OPENCODE_URL_ALL";
     const ENV_PW_ALL: &str = "GA_TEST_PW_ALL";
     const ENV_PW_PER_PROJECT: &str = "GA_TEST_PW_PER_PROJECT";
-    const ENV_OPENCODE_URL: &str = "GA_TEST_OPENCODE_URL";
 
     // --- substitute_env tests ---
 
@@ -280,34 +287,23 @@ mod tests {
 
     // --- parse_config tests ---
 
-    // Test 7: parse_config with valid YAML → returns GitAutomateConfig with correct projects
+    // Test 7: parse_config with valid YAML → returns GitAutomateConfig with correct git section
     #[test]
     fn parse_config_valid_yaml() {
         let yaml = r#"
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
-    projectId: 42
-    directory: src
-    opencode:
-      url: http://localhost:8081
-      pw: secret123
+git:
+  repository: https://github.com/user/repo
+  projectId: 42
+  directory: src
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.projects.len(), 1);
-        let project = config.projects.get("my-repo").unwrap();
-        assert_eq!(project.repository, "https://github.com/user/repo");
-        assert_eq!(project.project_id.as_deref(), Some("42"));
-        assert_eq!(project.directory.as_deref(), Some("src"));
-        assert_eq!(
-            project.opencode.as_ref().unwrap().url,
-            "http://localhost:8081"
-        );
-        assert_eq!(project.opencode.as_ref().unwrap().pw, "secret123");
+        assert_eq!(config.git.repository, "https://github.com/user/repo");
+        assert_eq!(config.git.project_id.as_deref(), Some("42"));
+        assert_eq!(config.git.directory.as_deref(), Some("src"));
     }
 
     // Test 8: parse_config with missing file → ConfigError::FileNotFound
@@ -317,15 +313,14 @@ projects:
         assert!(matches!(result, Err(ConfigError::FileNotFound { .. })));
     }
 
-    // Test 12: parse_config with config missing opencode.url → YamlParse error
+    // Test 12: parse_config with global opencode missing url → YamlParse error
     #[test]
     fn parse_config_missing_opencode_url() {
         let yaml = r#"
-projects:
-  bad-repo:
-    repository: https://github.com/user/repo
-    opencode:
-      pw: secret123
+opencode:
+  pw: secret123
+git:
+  repository: https://github.com/user/repo
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -339,11 +334,10 @@ projects:
 
     // Test 9: parse_config with non-string repository → ConfigError::YamlParse
     #[test]
-    fn validate_project_non_string_repository() {
+    fn validate_git_non_string_repository() {
         let yaml = r#"
-projects:
-  bad-repo:
-    repository: 12345
+git:
+  repository: 12345
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -355,38 +349,34 @@ projects:
 
     // Test 10: parse_config with projectId as number (e.g. 42) → coerced to String("42")
     #[test]
-    fn validate_project_number_project_id_coerced() {
+    fn validate_git_number_project_id_coerced() {
         let yaml = r#"
-projects:
-  num-repo:
-    repository: https://github.com/user/repo
-    projectId: 42
+git:
+  repository: https://github.com/user/repo
+  projectId: 42
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        let project = config.projects.get("num-repo").unwrap();
-        assert_eq!(project.project_id.as_deref(), Some("42"));
+        assert_eq!(config.git.project_id.as_deref(), Some("42"));
     }
 
     // Test 11: parse_config with projectId as string → stays as string
     #[test]
-    fn validate_project_string_project_id_preserved() {
+    fn validate_git_string_project_id_preserved() {
         let yaml = r#"
-projects:
-  str-repo:
-    repository: https://github.com/user/repo
-    projectId: "P-123"
+git:
+  repository: https://github.com/user/repo
+  projectId: "P-123"
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        let project = config.projects.get("str-repo").unwrap();
-        assert_eq!(project.project_id.as_deref(), Some("P-123"));
+        assert_eq!(config.git.project_id.as_deref(), Some("P-123"));
     }
 
     // --- load_config tests ---
@@ -395,12 +385,11 @@ projects:
     #[tokio::test]
     async fn load_config_reads_from_cwd() {
         let yaml = r#"
-projects:
-  cwd-repo:
-    repository: https://github.com/cwd/repo
-    opencode:
-      url: http://localhost:8081
-      pw: ${env:GA_TEST_PW}
+opencode:
+  url: http://localhost:8081
+  pw: ${env:GA_TEST_PW}
+git:
+  repository: https://github.com/cwd/repo
 "#;
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("git-automate.yml");
@@ -419,9 +408,8 @@ projects:
         std::env::set_current_dir(&original_dir).unwrap();
 
         let config = result.unwrap();
-        let project = config.projects.get("cwd-repo").unwrap();
-        assert_eq!(project.repository, "https://github.com/cwd/repo");
-        assert_eq!(project.opencode.as_ref().unwrap().pw, "testpassword");
+        assert_eq!(config.git.repository, "https://github.com/cwd/repo");
+        assert_eq!(config.opencode.as_ref().unwrap().pw, "testpassword");
     }
 
     // --- issueProvider config tests ---
@@ -430,71 +418,64 @@ projects:
     #[test]
     fn parse_config_with_issue_provider_github() {
         let yaml = r#"
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
-    issueProvider: github
+git:
+  repository: https://github.com/user/repo
+  issueProvider: github
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        let project = config.projects.get("my-repo").unwrap();
-        assert_eq!(project.issue_provider, "github");
+        assert_eq!(config.git.issue_provider, "github");
     }
 
     // Test 16: parse_config without issueProvider → defaults to "github"
     #[test]
     fn parse_config_without_issue_provider_defaults_to_github() {
         let yaml = r#"
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
+git:
+  repository: https://github.com/user/repo
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        let project = config.projects.get("my-repo").unwrap();
-        assert_eq!(project.issue_provider, "github");
+        assert_eq!(config.git.issue_provider, "github");
     }
 
     // Test 17: parse_config with custom issueProvider → stored correctly
     #[test]
     fn parse_config_with_custom_issue_provider() {
         let yaml = r#"
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
-    issueProvider: jira
+git:
+  repository: https://github.com/user/repo
+  issueProvider: jira
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        let project = config.projects.get("my-repo").unwrap();
-        assert_eq!(project.issue_provider, "jira");
+        assert_eq!(config.git.issue_provider, "jira");
     }
 
-    // Test 18: ProjectConfig serde round-trip preserves issueProvider
+    // Test 18: GitSection serde round-trip preserves issueProvider
     #[test]
-    fn project_config_serde_round_trip_issue_provider() {
-        let pc = ProjectConfig {
+    fn git_section_serde_round_trip_issue_provider() {
+        let gs = GitSection {
             repository: "https://github.com/user/repo".to_string(),
             project_id: None,
             directory: None,
-            opencode: None,
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
             trello_token: None,
             trello_board_id: None,
         };
-        let yaml = serde_yaml::to_string(&pc).unwrap();
-        let parsed: ProjectConfig = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml::to_string(&gs).unwrap();
+        let parsed: GitSection = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.issue_provider, "github");
     }
 
@@ -507,14 +488,13 @@ projects:
         }
         let yaml = format!(
             "
-projects:
-  trello-board:
-    repository: https://github.com/user/repo
-    issueProvider: trello
-    titlePattern: \"@ai.*\"
-    trelloApiKey: ${{env:{}}}
-    trelloToken: ${{env:{}}}
-    trelloBoardId: BRD-123
+git:
+  repository: https://github.com/user/repo
+  issueProvider: trello
+  titlePattern: \"@ai.*\"
+  trelloApiKey: ${{env:{}}}
+  trelloToken: ${{env:{}}}
+  trelloBoardId: BRD-123
 ",
             ENV_TRELLO_KEY, ENV_TRELLO_TOKEN
         );
@@ -523,11 +503,10 @@ projects:
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        let project = config.projects.get("trello-board").unwrap();
-        assert_eq!(project.issue_provider, "trello");
-        assert_eq!(project.trello_api_key.as_deref(), Some("secret-key"));
-        assert_eq!(project.trello_token.as_deref(), Some("secret-token"));
-        assert_eq!(project.trello_board_id.as_deref(), Some("BRD-123"));
+        assert_eq!(config.git.issue_provider, "trello");
+        assert_eq!(config.git.trello_api_key.as_deref(), Some("secret-key"));
+        assert_eq!(config.git.trello_token.as_deref(), Some("secret-token"));
+        assert_eq!(config.git.trello_board_id.as_deref(), Some("BRD-123"));
     }
 
     // --- concurrency config tests ---
@@ -537,9 +516,8 @@ projects:
     fn parse_config_with_concurrency() {
         let yaml = r#"
 concurrency: 4
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
+git:
+  repository: https://github.com/user/repo
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -553,9 +531,8 @@ projects:
     #[test]
     fn parse_config_without_concurrency_defaults_to_none() {
         let yaml = r#"
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
+git:
+  repository: https://github.com/user/repo
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -570,9 +547,8 @@ projects:
     fn parse_config_with_concurrency_zero() {
         let yaml = r#"
 concurrency: 0
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
+git:
+  repository: https://github.com/user/repo
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -586,9 +562,19 @@ projects:
     #[test]
     fn git_automate_config_serde_round_trip_concurrency() {
         let config = GitAutomateConfig {
-            projects: BTreeMap::new(),
+            git: GitSection {
+                repository: String::new(),
+                project_id: None,
+                directory: None,
+                issue_provider: "github".to_string(),
+                title_pattern: "@ai.*".to_string(),
+                trello_api_key: None,
+                trello_token: None,
+                trello_board_id: None,
+            },
             concurrency: Some(4),
             github_token: Some("ghp_testtoken123456789".to_string()),
+            opencode: None,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: GitAutomateConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -609,9 +595,8 @@ projects:
         }
         let yaml = format!(
             "
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
+git:
+  repository: https://github.com/user/repo
 githubToken: ${{env:{}}}
 ",
             ENV_GH_TOKEN
@@ -631,9 +616,8 @@ githubToken: ${{env:{}}}
     #[test]
     fn parse_config_without_github_token_is_none() {
         let yaml = r#"
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
+git:
+  repository: https://github.com/user/repo
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -651,9 +635,8 @@ projects:
         }
         let yaml = format!(
             "
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
+git:
+  repository: https://github.com/user/repo
 githubToken: ${{env:{}}}
 ",
             ENV_GH_TOKEN_UNSET
@@ -679,12 +662,11 @@ githubToken: ${{env:{}}}
             "
 concurrency: 2
 githubToken: ${{env:{}}}
-projects:
-  my-repo:
-    repository: https://github.com/user/repo
-    opencode:
-      url: ${{env:{}}}
-      pw: ${{env:{}}}
+opencode:
+  url: ${{env:{}}}
+  pw: ${{env:{}}}
+git:
+  repository: https://github.com/user/repo
 ",
             ENV_GH_TOKEN_ALL, ENV_OPENCODE_URL_ALL, ENV_PW_ALL
         );
@@ -695,35 +677,27 @@ projects:
         let config = parse_config(tmp.path()).unwrap();
         assert_eq!(config.concurrency, Some(2));
         assert_eq!(config.github_token.as_deref(), Some("ghp_all_vars_work"));
-
-        let project = config.projects.get("my-repo").unwrap();
         assert_eq!(
-            project.opencode.as_ref().unwrap().url,
+            config.opencode.as_ref().unwrap().url,
             "http://localhost:8081"
         );
-        assert_eq!(project.opencode.as_ref().unwrap().pw, "secret123");
+        assert_eq!(config.opencode.as_ref().unwrap().pw, "secret123");
     }
 
-    // Test: parse_config with per-project opencode.pw using ${env:VAR}
+    // Test: parse_config with global opencode.pw using ${env:VAR}
     // alongside top-level githubToken — both substituted independently
     #[test]
-    fn parse_config_substitutes_per_project_opencode_pw() {
+    fn parse_config_substitutes_global_opencode_pw() {
         unsafe {
-            std::env::set_var(ENV_PW_PER_PROJECT, "project_level_pw");
+            std::env::set_var(ENV_PW_PER_PROJECT, "global_level_pw");
         }
         let yaml = format!(
             "
-projects:
-  svc-a:
-    repository: https://github.com/user/svc-a
-    opencode:
-      url: http://localhost:8081
-      pw: ${{env:{}}}
-  svc-b:
-    repository: https://github.com/user/svc-b
-    opencode:
-      url: http://localhost:8082
-      pw: literal-password
+opencode:
+  url: http://localhost:8081
+  pw: ${{env:{}}}
+git:
+  repository: https://github.com/user/repo
 ",
             ENV_PW_PER_PROJECT
         );
@@ -732,9 +706,6 @@ projects:
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        let svc_a = config.projects.get("svc-a").unwrap();
-        assert_eq!(svc_a.opencode.as_ref().unwrap().pw, "project_level_pw");
-        let svc_b = config.projects.get("svc-b").unwrap();
-        assert_eq!(svc_b.opencode.as_ref().unwrap().pw, "literal-password");
+        assert_eq!(config.opencode.as_ref().unwrap().pw, "global_level_pw");
     }
 }
