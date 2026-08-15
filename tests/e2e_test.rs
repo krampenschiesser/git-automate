@@ -24,34 +24,10 @@ use git_automate::config::parse_config;
 use git_automate::external_agent::opencode::client::OpenCodeClient;
 use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::external_issues::github::repo::parse_repository_url;
-use git_automate::shell::{ShellFn, ShellOutput};
 use git_automate::workflow::Workflow;
 use git_automate::workflow::helpers::{WorkflowContext, resolve_project_id};
 
 use git_automate::test_utils::SET_CWD_MUTEX;
-
-/// Build a shell function that delegates to the real `sh -c`.
-///
-/// Used so the workflow can clone repos and run git commands during the e2e run.
-fn real_shell() -> ShellFn {
-    Arc::new(|cmd: String| {
-        Box::pin(async move {
-            let output = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .output()
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("Failed to spawn shell command '{}': {}", cmd, e);
-                });
-            ShellOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
-            }
-        })
-    })
-}
 
 /// Resolve the project's Status field ID and build a lookup from status name
 /// to option ID.
@@ -210,7 +186,6 @@ async fn e2e_triage_flow_creates_session() {
     let deps = WorkflowContext {
         config: config.clone(),
         github: Some(github.clone()),
-        shell: real_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -418,7 +393,6 @@ async fn e2e_full_workflow_state_flow() {
     let deps = WorkflowContext {
         config: config.clone(),
         github: Some(github.clone()),
-        shell: real_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);
@@ -750,7 +724,6 @@ async fn e2e_failed_review_recovery_flow() {
     let deps = WorkflowContext {
         config: config.clone(),
         github: Some(github.clone()),
-        shell: real_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);

@@ -1,7 +1,7 @@
 //! Shared workflow helpers.
 //!
 //! Defines: shared types (`ProjectContext`, `FieldIds`, dependency structs),
-//! prompt template loading/filling, repo cloning, config writing, and
+//! prompt template loading/filling, config writing, and
 //! context + field resolution used by every workflow check.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -17,12 +17,8 @@ use crate::config::{GitAutomateConfig, GitSection};
 use crate::external_issues::github::client::{GitHubClient, GitHubError};
 use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::{IssueInfo, ParsedRepo, StatusOption};
-use crate::shell::{ShellFn, ShellOutput};
 
 // ─── Constants ────────────────────────────────────────────────
-
-/// Temporary working directory for cloned repos (`/tmp/git-automate-work`).
-pub const WORK_DIR: &str = "/tmp/git-automate-work";
 
 /// Name of the project's "Status" single-select field.
 pub const STATUS_FIELD_NAME: &str = "Status";
@@ -42,8 +38,6 @@ pub enum WorkflowError {
     NoSessionField(String),
     #[error("Status option '{0}' not found")]
     StatusOptionNotFound(String),
-    #[error("Failed to clone: {0}")]
-    CloneFailed(String),
     #[error("Config file not found: {0}")]
     ConfigNotFound(String),
     #[error("Prompt template '{0}' not found")]
@@ -77,22 +71,6 @@ pub struct FieldIds {
     pub session_field_id: Option<String>,
 }
 
-/// Dependencies for shell-based helpers (e.g. `clone_repo_if_needed`).
-#[derive(Clone)]
-pub struct ShellDeps {
-    pub shell: ShellFn,
-    pub github_token: Option<String>,
-}
-
-impl std::fmt::Debug for ShellDeps {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShellDeps")
-            .field("shell", &"<shell_fn>")
-            .field("github_token", &"<redacted>")
-            .finish()
-    }
-}
-
 /// Dependencies for context resolution (`resolve_context`).
 #[derive(Debug, Clone)]
 pub struct ContextDeps {
@@ -106,7 +84,6 @@ pub struct ContextDeps {
 pub struct WorkflowContext {
     pub config: GitAutomateConfig,
     pub github: Option<GitHubClient>,
-    pub shell: ShellFn,
     pub project_id_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -115,21 +92,12 @@ impl std::fmt::Debug for WorkflowContext {
         f.debug_struct("WorkflowContext")
             .field("config", &self.config)
             .field("github", &self.github)
-            .field("shell", &"<shell_fn>")
             .field("project_id_cache", &"<cache>")
             .finish()
     }
 }
 
 impl WorkflowContext {
-    /// Convenience: extract the shell-related dependencies.
-    pub fn shell_deps(&self) -> ShellDeps {
-        ShellDeps {
-            shell: self.shell.clone(),
-            github_token: self.config.github_token.clone(),
-        }
-    }
-
     /// Convenience: extract the context-resolution dependencies.
     pub fn context_deps(&self) -> ContextDeps {
         ContextDeps {
@@ -220,58 +188,7 @@ pub fn extract_session_id(field_values: &BTreeMap<String, Option<String>>) -> Op
         .map(String::from)
 }
 
-// ─── Repo & config helpers ────────────────────────────────────
-
-/// Clone a repository to [`WORK_DIR`] if not already present.
-/// Returns the local path (`{WORK_DIR}/{owner}-{repo}`).
-///
-/// Equivalent to TS `cloneRepoIfNeeded`: uses `GITHUB_TOKEN` env var for
-/// authenticated clone URL when set.
-pub async fn clone_repo_if_needed(
-    deps: &ShellDeps,
-    owner: &str,
-    repo: &str,
-) -> Result<String, WorkflowError> {
-    let clone_path = format!("{}/{}-{}", WORK_DIR, owner, repo);
-
-    if std::path::Path::new(&clone_path).exists() {
-        tracing::info!("Repo already cloned at {}", clone_path);
-        return Ok(clone_path);
-    }
-
-    let parent = std::path::Path::new(&clone_path)
-        .parent()
-        .expect("clone path always has a parent");
-    std::fs::create_dir_all(parent)?;
-
-    let token = deps
-        .github_token
-        .as_ref()
-        .filter(|t| !t.is_empty())
-        .cloned()
-        .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()));
-    let repo_url = if let Some(t) = token {
-        format!(
-            "https://x-access-token:{}@github.com/{}/{}.git",
-            t, owner, repo
-        )
-    } else {
-        format!("https://github.com/{}/{}.git", owner, repo)
-    };
-
-    let shell = deps.shell.clone();
-    let output: ShellOutput =
-        shell(format!("git clone --depth 1 {} {}", repo_url, clone_path)).await;
-    if output.exit_code != 0 {
-        return Err(WorkflowError::CloneFailed(format!(
-            "{}: {}",
-            repo_url, output.stderr
-        )));
-    }
-
-    tracing::info!("Cloned {}/{} to {}", owner, repo, clone_path);
-    Ok(clone_path)
-}
+// ─── Config helpers ───────────────────────────────────────────
 
 /// Read `git-automate.yml`, set `git.projectId`, and write it back to disk —
 /// also updating the in-memory config.
@@ -589,6 +506,7 @@ pub fn write_doctor_config(
     _project_name: &str,
     repository: &str,
     project_id: &str,
+    directory: &str,
 ) -> Result<(), WorkflowError> {
     let mut data: serde_yaml::Value = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)?;
@@ -618,6 +536,11 @@ pub fn write_doctor_config(
     git_section.insert(
         serde_yaml::Value::String("repository".to_string()),
         serde_yaml::Value::String(repository.to_string()),
+    );
+
+    git_section.insert(
+        serde_yaml::Value::String("directory".to_string()),
+        serde_yaml::Value::String(directory.to_string()),
     );
 
     let project_id_value = if project_id.chars().all(|c| c.is_ascii_digit()) {
@@ -816,7 +739,6 @@ mod tests {
     // Test 12: Constants match TS values
     #[test]
     fn constants_match_ts_values() {
-        assert_eq!(WORK_DIR, "/tmp/git-automate-work");
         assert_eq!(STATUS_FIELD_NAME, "Status");
         assert_eq!(SESSION_FIELD_NAME, "sessionId");
     }
@@ -825,7 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_project_id_creates_and_updates() {
-        let yaml = "git:\n  repository: https://github.com/user/repo\n";
+        let yaml = "git:\n  repository: https://github.com/user/repo\n  directory: /test-dir\n";
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("git-automate.yml");
         std::fs::write(&config_path, yaml).unwrap();
@@ -883,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_project_id_creates_new_project_entry() {
-        let yaml = "git:\n  repository: https://github.com/u/r\n";
+        let yaml = "git:\n  repository: https://github.com/u/r\n  directory: /test-dir\n";
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("git-automate.yml");
         std::fs::write(&config_path, yaml).unwrap();
@@ -1093,7 +1015,7 @@ mod tests {
         GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: project_id.map(String::from),
-            directory: None,
+            directory: "/test-work".to_string(),
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -1418,7 +1340,7 @@ mod tests {
         let git_section = GitSection {
             repository: "invalid-no-slash".to_string(),
             project_id: Some("PID-123".to_string()),
-            directory: None,
+            directory: "/test-work".to_string(),
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -2031,28 +1953,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn shell_deps_returns_shell() {
-        let shell = create_test_shell();
-        let deps = WorkflowContext {
-            config: GitAutomateConfig {
-                git: GitSection::default(),
-                concurrency: None,
-                github_token: None,
-                opencode: None,
-            },
-            github: None,
-            shell: shell.clone(),
-            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
-        };
-        let sd = deps.shell_deps();
-        // shell is an Arc<dyn Fn>, just verify it's the same by calling it
-        let result = (sd.shell)("echo test".to_string()).await;
-        assert_eq!(result.exit_code, 0);
-    }
-
-    #[tokio::test]
     async fn context_deps_returns_github_and_config() {
-        let shell = create_test_shell();
         let config = GitAutomateConfig {
             git: GitSection::default(),
             concurrency: None,
@@ -2062,17 +1963,10 @@ mod tests {
         let deps = WorkflowContext {
             config: config.clone(),
             github: None,
-            shell,
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let cd = deps.context_deps();
         assert!(cd.github.is_none());
         assert!(cd.config.git.repository.is_empty());
-    }
-
-    fn create_test_shell() -> ShellFn {
-        Arc::new(|command: String| {
-            Box::pin(async move { crate::shell::execute_shell(&command).await })
-        })
     }
 }

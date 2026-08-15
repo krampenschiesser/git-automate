@@ -23,7 +23,6 @@ use git_automate::config::parse_config;
 use git_automate::external_agent::opencode::OpenCodeClient;
 use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::external_issues::github::repo::parse_repository_url;
-use git_automate::shell::create_shell_fn;
 use git_automate::workflow::Workflow;
 use git_automate::workflow::helpers::{
     WorkflowContext, detect_git_remote, ensure_session_id_field, ensure_status_options,
@@ -108,11 +107,9 @@ async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error
         .ok_or("GITHUB_TOKEN environment variable is not set — cannot start daemon")?;
     let github = GitHubClient::new(token)?;
 
-    let shell = create_shell_fn();
     let deps = WorkflowContext {
         config,
         github: Some(github),
-        shell,
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);
@@ -142,6 +139,8 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("GITHUB_TOKEN environment variable is not set — cannot run doctor")?;
     let github = GitHubClient::new(token)?;
 
+    let existing_directory = config.as_ref().map(|c| c.git.directory.clone());
+
     let (owner, repo, existing_project_id) = if let Some(config) = config {
         let parsed = parse_repository_url(&config.git.repository)
             .map_err(|e| format!("Invalid repository URL: {}", e))?;
@@ -158,6 +157,18 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("Invalid repository name: {}", e))?;
                 (p.owner, p.repo, None)
             }
+        }
+    };
+
+    let directory = match existing_directory {
+        Some(d) => d,
+        None => {
+            let input =
+                prompt_input("Enter working directory for agent sessions (e.g. /home/user/repo): ");
+            if input.trim().is_empty() {
+                return Err("Working directory is required".into());
+            }
+            input.trim().to_string()
         }
     };
 
@@ -194,7 +205,13 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     ensure_status_options(&github, &resolved_project_id).await?;
     ensure_session_id_field(&github, &resolved_project_id).await?;
     let repository_url = format!("https://github.com/{}/{}", owner, repo);
-    write_doctor_config(config_path, &repo, &repository_url, &original_project_id)?;
+    write_doctor_config(
+        config_path,
+        &repo,
+        &repository_url,
+        &original_project_id,
+        &directory,
+    )?;
 
     tracing::info!(
         "Doctor setup complete — config written to {}",
@@ -281,7 +298,11 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("git-automate.yml");
-        std::fs::write(&config_path, "git:\n  repository: owner/repo\n").expect("write config");
+        std::fs::write(
+            &config_path,
+            "git:\n  repository: owner/repo\n  directory: /test-dir\n",
+        )
+        .expect("write config");
 
         let result = setup(&config_path).await;
         assert!(result.is_err(), "setup should fail when token is unset");
@@ -310,7 +331,11 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("git-automate.yml");
-        std::fs::write(&config_path, "git:\n  repository: owner/repo\n").expect("write config");
+        std::fs::write(
+            &config_path,
+            "git:\n  repository: owner/repo\n  directory: /test-dir\n",
+        )
+        .expect("write config");
 
         let result = setup(&config_path).await;
         assert!(result.is_ok(), "setup should succeed: {:?}", result.err());
@@ -339,7 +364,7 @@ mod tests {
         let config_path = dir.path().join("git-automate.yml");
         std::fs::write(
             &config_path,
-            "git:\n  repository: owner/repo\ngithubToken: ${env:GITHUB_TOKEN}\n",
+            "git:\n  repository: owner/repo\n  directory: /test-dir\ngithubToken: ${env:GITHUB_TOKEN}\n",
         )
         .expect("write config");
 
@@ -674,6 +699,7 @@ mod tests {
             "my-repo",
             "https://github.com/owner/my-repo",
             "PID-123",
+            "/test-work",
         );
         assert!(result.is_ok());
 
@@ -711,6 +737,7 @@ mod tests {
             "my-repo",
             "https://github.com/owner/my-repo",
             "PID-456",
+            "/test-work",
         );
         assert!(result.is_ok());
 
@@ -728,6 +755,7 @@ mod tests {
             "my-repo",
             "https://github.com/owner/my-repo",
             "1",
+            "/test-work",
         );
         assert!(result.is_ok());
 
@@ -765,6 +793,7 @@ git:
             "my-repo",
             "https://github.com/owner/my-repo",
             "PID-789",
+            "/test-work",
         );
         assert!(result.is_ok());
 

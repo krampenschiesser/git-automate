@@ -15,9 +15,9 @@ use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::types::IssueInfo;
 
 use super::helpers::{
-    ProjectContext, WorkflowContext, WorkflowError, clone_repo_if_needed, extract_session_id,
-    fill_prompt, get_issue_body_map, issue_body_or_title, load_agent_template,
-    load_prompt_template, resolve_field_ids, resolve_option_id, resolve_status_option_and_session,
+    ProjectContext, WorkflowContext, WorkflowError, extract_session_id, fill_prompt,
+    get_issue_body_map, issue_body_or_title, load_agent_template, load_prompt_template,
+    resolve_field_ids, resolve_option_id, resolve_status_option_and_session,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -70,15 +70,7 @@ pub const REVIEW_STATES: [ReviewState; 3] = [
 pub struct OpencodeSessionConfig {
     pub url: String,
     pub pw: String,
-    pub directory: Option<String>,
-}
-
-impl OpencodeSessionConfig {
-    /// Return the configured directory, or *fallback* if none was set.
-    #[must_use]
-    pub fn directory_or<'a>(&'a self, fallback: &'a str) -> &'a str {
-        self.directory.as_deref().unwrap_or(fallback)
-    }
+    pub directory: String,
 }
 
 // ─── start_opencode_session ────────────────────────────────────
@@ -169,8 +161,6 @@ pub async fn run_triage_check(
         existing_items.insert(item.content_number, item.id.clone());
     }
 
-    let work_dir = clone_repo_if_needed(&deps.shell_deps(), &ctx.owner, &ctx.repo).await?;
-
     for issue in &ai_issues {
         let item_id = if let Some(id) = existing_items.get(&issue.number) {
             id.clone()
@@ -213,7 +203,7 @@ pub async fn run_triage_check(
             let user_prompt = fill_prompt(&template, &values);
             let session_id = start_opencode_session(
                 oc,
-                oc.directory_or(&work_dir),
+                oc.directory.as_str(),
                 &issue.title,
                 &system_prompt,
                 &user_prompt,
@@ -236,8 +226,8 @@ pub async fn run_triage_check(
 
 // ── Todo Check ──
 
-/// Find items with "Todo" status, create branches if needed, clone the
-/// repo, and start a developer session for each item without a session.
+/// Find items with "Todo" status, create branches if needed, and start a
+/// developer session for each item without a session.
 pub async fn run_todo_check(
     deps: &WorkflowContext,
     ctx: &ProjectContext,
@@ -274,7 +264,6 @@ pub async fn run_todo_check(
         return Ok(());
     }
 
-    let work_dir = clone_repo_if_needed(&deps.shell_deps(), &ctx.owner, &ctx.repo).await?;
     let default_branch = github
         .get_repo_default_branch(&ctx.owner, &ctx.repo)
         .await?;
@@ -328,7 +317,7 @@ pub async fn run_todo_check(
         let user_prompt = fill_prompt(&template, &values);
         let session_id = start_opencode_session(
             oc,
-            oc.directory_or(&work_dir),
+            oc.directory.as_str(),
             &title,
             &system_prompt,
             &user_prompt,
@@ -369,8 +358,6 @@ pub async fn run_review_check(
         .ok_or_else(|| WorkflowError::NoSessionField(ctx.project_id.clone()))?;
     let project_items = github.list_project_items(&ctx.project_id).await?;
     let issue_map = get_issue_body_map(github, &ctx.owner, &ctx.repo).await?;
-
-    let work_dir = clone_repo_if_needed(&deps.shell_deps(), &ctx.owner, &ctx.repo).await?;
 
     let status_field = github.get_project_status_field(&ctx.project_id).await?;
 
@@ -456,7 +443,7 @@ pub async fn run_review_check(
 
             let session_id = start_opencode_session(
                 oc,
-                oc.directory_or(&work_dir),
+                oc.directory.as_str(),
                 &title,
                 &system_prompt,
                 &filled_prompt,
@@ -504,7 +491,6 @@ pub async fn run_failed_review_check(
     }
 
     let issue_map = get_issue_body_map(github, &ctx.owner, &ctx.repo).await?;
-    let work_dir = clone_repo_if_needed(&deps.shell_deps(), &ctx.owner, &ctx.repo).await?;
     let status_field = github.get_project_status_field(&ctx.project_id).await?;
 
     let Some(status_field) = status_field else {
@@ -602,7 +588,7 @@ pub async fn run_failed_review_check(
             let user_prompt = fill_prompt(&template, &values);
             let new_session_id = start_opencode_session(
                 oc,
-                oc.directory_or(&work_dir),
+                oc.directory.as_str(),
                 &title,
                 &system_prompt,
                 &user_prompt,
@@ -656,7 +642,7 @@ mod tests {
             config: GitSection {
                 repository: "https://github.com/owner/repo".to_string(),
                 project_id: Some("PID-123".to_string()),
-                directory: None,
+                directory: "/test-work".to_string(),
                 issue_provider: "github".to_string(),
                 title_pattern: "@ai.*".to_string(),
                 trello_api_key: None,
@@ -674,7 +660,7 @@ mod tests {
         OpencodeSessionConfig {
             url,
             pw: "pw".to_string(),
-            directory: None,
+            directory: "/test-work".to_string(),
         }
     }
 
@@ -1085,28 +1071,6 @@ mod tests {
         assert_eq!(REVIEW_STATES[2].prompt(), "qa");
     }
 
-    // Test: OpencodeSessionConfig::directory_or returns directory when set
-    #[test]
-    fn oc_config_directory_or_returns_directory() {
-        let oc = OpencodeSessionConfig {
-            url: "http://localhost:8081".to_string(),
-            pw: "pw".to_string(),
-            directory: Some("/my/dir".to_string()),
-        };
-        assert_eq!(oc.directory_or("/fallback"), "/my/dir");
-    }
-
-    // Test: OpencodeSessionConfig::directory_or returns fallback when None
-    #[test]
-    fn oc_config_directory_or_returns_fallback() {
-        let oc = OpencodeSessionConfig {
-            url: "http://localhost:8081".to_string(),
-            pw: "pw".to_string(),
-            directory: None,
-        };
-        assert_eq!(oc.directory_or("/fallback"), "/fallback");
-    }
-
     // ─── Pure logic tests (no HTTP) ────────────────────────────
 
     // Test 1: @ai filter — "@ai something" matches
@@ -1292,7 +1256,7 @@ mod tests {
 
     // ─── Triage Check Integration Tests ───────────────────────
 
-    // Test 1: No @ai issues → early return, no clone or session started
+    // Test 1: No @ai issues → early return, no session started
     #[tokio::test]
     async fn triage_no_ai_issues_early_return() {
         let mock = MockServer::start().await;
@@ -1984,7 +1948,7 @@ mod tests {
         let oc = OpencodeSessionConfig {
             url: mock.uri(),
             pw: "pw".to_string(),
-            directory: None,
+            directory: "/test-work".to_string(),
         };
 
         let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
@@ -2028,7 +1992,7 @@ mod tests {
         let oc = OpencodeSessionConfig {
             url: mock.uri(),
             pw: "pw".to_string(),
-            directory: None,
+            directory: "/test-work".to_string(),
         };
 
         // limit = Some(2), active = 4 → 4 >= 2 → should skip
@@ -2081,7 +2045,7 @@ mod tests {
         let oc = OpencodeSessionConfig {
             url: mock.uri(),
             pw: "pw".to_string(),
-            directory: None,
+            directory: "/test-work".to_string(),
         };
 
         // limit = Some(5), active = 2 → 2 < 5 → should proceed

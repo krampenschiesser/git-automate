@@ -141,6 +141,7 @@ opencode:
   pw: "pw"
 git:
   repository: "https://github.com/owner/repo"
+  directory: "/test-dir"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
 
@@ -287,6 +288,7 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
     let yaml = r#"
 git:
   repository: "https://github.com/owner/repo"
+  directory: "/test-dir"
   titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
@@ -302,7 +304,6 @@ git:
     let deps = WorkflowContext {
         config,
         github: Some(client),
-        shell: mock_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -443,6 +444,7 @@ async fn test_setup_initialization_idempotent_when_everything_exists() {
 git:
   repository: "https://github.com/owner/repo"
   projectId: "PID-123"
+  directory: "/test-dir"
   titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
@@ -459,7 +461,6 @@ git:
     let deps = WorkflowContext {
         config,
         github: Some(client),
-        shell: mock_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -568,6 +569,7 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
 git:
   repository: "https://github.com/owner/repo"
   projectId: "PID-123"
+  directory: "/test-dir"
   titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
@@ -580,7 +582,6 @@ git:
     let deps = WorkflowContext {
         config,
         github: Some(client),
-        shell: mock_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -720,6 +721,7 @@ async fn test_setup_resolves_numeric_project_id_to_global_id() {
 git:
   repository: "https://github.com/owner/repo"
   projectId: 4
+  directory: "/test-dir"
   titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
@@ -736,7 +738,6 @@ git:
     let deps = WorkflowContext {
         config,
         github: Some(client),
-        shell: mock_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -888,6 +889,7 @@ async fn test_doctor_does_not_persist_resolved_project_id() {
 git:
   repository: "https://github.com/owner/repo"
   projectId: 4
+  directory: "/test-dir"
   titlePattern: "@ai.*"
 "#;
     std::fs::write(&config_path, yaml).expect("write should succeed");
@@ -904,7 +906,6 @@ git:
     let deps = WorkflowContext {
         config,
         github: Some(client),
-        shell: mock_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -1018,7 +1019,7 @@ fn failed_review_test_ctx(
     let project_config = GitSection {
         repository: "https://github.com/owner/repo".to_string(),
         project_id: Some("PID-123".to_string()),
-        directory: None,
+        directory: "/test-work".to_string(),
         issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
@@ -1037,7 +1038,6 @@ fn failed_review_test_ctx(
             }),
         },
         github: None,
-        shell: mock_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -1052,7 +1052,7 @@ fn failed_review_test_ctx(
     let oc = OpencodeSessionConfig {
         url: "http://localhost:8081".to_string(),
         pw: "pw".to_string(),
-        directory: None,
+        directory: "/test-work".to_string(),
     };
 
     (deps, ctx, oc)

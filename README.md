@@ -56,7 +56,7 @@ set in the environment take precedence.
 | `opencode.pw`    | yes      | OpenCode server password (use `${env:VAR}`)      |
 | `repository`     | yes      | GitHub repo URL or `owner/repo` shorthand        |
 | `projectId`      | no       | GitHub Project V2 ID (created automatically if absent) |
-| `directory`      | no       | Working directory for OpenCode agent sessions     |
+| `directory`      | yes      | Working directory (existing checkout) for OpenCode agent sessions — **required** |
 | `titlePattern`   | no       | Regex to match issue titles for triage (default `@ai.*`) |
 
 ## Workflow
