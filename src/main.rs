@@ -10,8 +10,11 @@
 //!   - Polling `run_all()` → catch + log `"Polling runAll failed: {e}"`.
 //!   - SIGINT/SIGTERM → `"Received shutdown signal, exiting"`, break.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
@@ -110,6 +113,7 @@ async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error
         config,
         github: Some(github),
         shell,
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);
 

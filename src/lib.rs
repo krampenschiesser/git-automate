@@ -63,6 +63,7 @@ pub mod test_utils {
             },
             github,
             shell: mock_shell(),
+            project_id_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }

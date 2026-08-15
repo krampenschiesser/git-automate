@@ -16,7 +16,7 @@ use crate::external_issues::github::types::ParsedRepo;
 
 use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
 use self::helpers::{
-    WorkflowContext, WorkflowError, resolve_context, resolve_project_id, write_project_id,
+    WorkflowContext, WorkflowError, resolve_context, resolve_project_id_cached, write_project_id,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -363,7 +363,7 @@ impl Workflow {
         // The config file is NOT modified — the original numeric ID is preserved
         // so users can keep `projectId: 1` and have it resolved each time.
         let project_id = if let Some(pid) = &git.project_id {
-            resolve_project_id(github, &owner, pid).await?.0
+            resolve_project_id_cached(&self.deps.project_id_cache, github, &owner, pid).await?
         } else {
             tracing::info!("Creating project {} for {}/{}", name, owner, repo);
             let pid = github.create_project(&owner, name).await?;
@@ -442,6 +442,9 @@ mod tests {
     use super::*;
     use crate::config::{GitAutomateConfig, GitSection};
     use crate::test_utils::{gh_client, make_deps, mock_shell};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -546,6 +549,7 @@ mod tests {
             },
             github: None,
             shell: mock_shell(),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let workflow = Workflow::new(deps);
@@ -651,6 +655,7 @@ mod tests {
             },
             github: Some(client),
             shell: mock_shell(),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -705,6 +710,7 @@ mod tests {
             },
             github: Some(client),
             shell: mock_shell(),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let workflow = Workflow::new(deps);
@@ -728,6 +734,7 @@ mod tests {
             },
             github: Some(client),
             shell: mock_shell(),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let workflow = Workflow::new(deps);
@@ -836,6 +843,7 @@ mod tests {
             },
             github: Some(client),
             shell: mock_shell(),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -932,6 +940,7 @@ mod tests {
             },
             github: Some(client),
             shell: mock_shell(),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let workflow = Workflow::new(deps);
@@ -1025,6 +1034,7 @@ mod tests {
             },
             github: Some(client),
             shell: mock_shell(),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let tmp = tempfile::tempdir().unwrap();
