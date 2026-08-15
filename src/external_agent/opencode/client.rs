@@ -150,6 +150,41 @@ impl OpenCodeClient {
         .await
     }
 
+    /// Create a session and send a prompt with an optional system prompt.
+    ///
+    /// Like [`start_session`](Self::start_session) but uses a `system` field
+    /// for instructions and an *optional* `agent` field. When `agent` is empty
+    /// the field is omitted, so OpenCode uses its default agent with the
+    /// provided `system` instructions — enabling prompt construction from
+    /// embedded markdown without pre-installed agents.
+    pub async fn start_session_with_system(
+        &self,
+        directory: &str,
+        title: &str,
+        system_prompt: &str,
+        agent: &str,
+        message: &str,
+    ) -> Result<String, OpenCodeError> {
+        let mut prompt_body = json!({
+            "parts": [{ "type": "text", "text": message }]
+        });
+        if !system_prompt.is_empty() {
+            prompt_body["system"] = json!(system_prompt);
+        }
+        if !agent.is_empty() {
+            prompt_body["agent"] = json!(agent);
+        }
+        start_session_http(
+            &self.client,
+            &self.base_url,
+            &self.auth_header,
+            directory,
+            title,
+            prompt_body,
+        )
+        .await
+    }
+
     /// `GET /session/status` — count active (non-Done) sessions.
     /// Sessions present in the status map (idle, busy, retry) are considered active.
     /// Sessions absent from the map are Done and do not count.

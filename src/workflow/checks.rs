@@ -16,8 +16,8 @@ use crate::external_issues::github::types::IssueInfo;
 
 use super::helpers::{
     ProjectContext, WorkflowContext, WorkflowError, clone_repo_if_needed, extract_session_id,
-    fill_prompt, get_issue_body_map, issue_body_or_title, load_prompt_template, resolve_field_ids,
-    resolve_option_id, resolve_status_option_and_session,
+    fill_prompt, get_issue_body_map, issue_body_or_title, load_agent_template,
+    load_prompt_template, resolve_field_ids, resolve_option_id, resolve_status_option_and_session,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -83,9 +83,11 @@ impl OpencodeSessionConfig {
 
 // ─── start_opencode_session ────────────────────────────────────
 
-/// Start an OpenCode session with the given parameters.
+/// Start an OpenCode session with the given system prompt and user message.
 ///
-/// Creates a new [`OpenCodeClient`] per call.
+/// Creates a new [`OpenCodeClient`] per call. The `system_prompt` carries
+/// agent instructions; the `agent` field is omitted so OpenCode uses its
+/// default agent.
 ///
 /// When `concurrency` is `Some(limit)`, the active session count is queried
 /// first; if it meets or exceeds the limit the session is **not** created and
@@ -96,7 +98,7 @@ async fn start_opencode_session(
     oc: &OpencodeSessionConfig,
     directory: &str,
     title: &str,
-    agent: &str,
+    system_prompt: &str,
     message: &str,
     concurrency: Option<usize>,
 ) -> Result<String, WorkflowError> {
@@ -122,7 +124,7 @@ async fn start_opencode_session(
     }
 
     client
-        .start_session(directory, title, agent, message)
+        .start_session_with_system(directory, title, system_prompt, "", message)
         .await
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))
 }
@@ -196,12 +198,25 @@ pub async fn run_triage_check(
                 ctx.name,
                 issue.number
             );
+            let system_prompt = load_agent_template("triage")?;
+            let template = load_prompt_template("triage")?;
+            let values = HashMap::from([
+                ("ISSUE_TITLE".to_string(), issue.title.clone()),
+                ("ISSUE_NUMBER".to_string(), issue.number.to_string()),
+                (
+                    "ISSUE_BODY".to_string(),
+                    issue.body.clone().unwrap_or_default(),
+                ),
+                ("ISSUE_LABELS".to_string(), String::new()),
+                ("ISSUE_ASSIGNEE".to_string(), String::new()),
+            ]);
+            let user_prompt = fill_prompt(&template, &values);
             let session_id = start_opencode_session(
                 oc,
                 oc.directory_or(&work_dir),
                 &issue.title,
-                "git-automate-triage",
-                &issue_body_or_title(issue),
+                &system_prompt,
+                &user_prompt,
                 deps.config.concurrency,
             )
             .await?;
@@ -297,12 +312,26 @@ pub async fn run_todo_check(
             ctx.name,
             issue_number
         );
+        let system_prompt = load_agent_template("developer")?;
+        let template = load_prompt_template("developer")?;
+        let branch_name = format!("issue-{}", issue_number);
+        let values = HashMap::from([
+            ("ISSUE_TITLE".to_string(), title.clone()),
+            ("ISSUE_NUMBER".to_string(), issue_number.to_string()),
+            ("ISSUE_BODY".to_string(), message.clone()),
+            ("BRANCH_NAME".to_string(), branch_name),
+            (
+                "PROJECT_REPOSITORY".to_string(),
+                format!("{}/{}", ctx.owner, ctx.repo),
+            ),
+        ]);
+        let user_prompt = fill_prompt(&template, &values);
         let session_id = start_opencode_session(
             oc,
             oc.directory_or(&work_dir),
             &title,
-            "git-automate-developer",
-            &message,
+            &system_prompt,
+            &user_prompt,
             deps.config.concurrency,
         )
         .await?;
@@ -369,6 +398,7 @@ pub async fn run_review_check(
         };
 
         let template = load_prompt_template(state.prompt())?;
+        let system_prompt = load_agent_template(state.prompt())?;
 
         for (item, values) in project_items.iter().zip(&item_values) {
             let current_status = values.get("Status").and_then(|v| v.as_deref());
@@ -428,7 +458,7 @@ pub async fn run_review_check(
                 oc,
                 oc.directory_or(&work_dir),
                 &title,
-                state.agent().as_str(),
+                &system_prompt,
                 &filled_prompt,
                 deps.config.concurrency,
             )
@@ -556,12 +586,26 @@ pub async fn run_failed_review_check(
                 issue_number
             );
 
+            let system_prompt = load_agent_template("developer")?;
+            let template = load_prompt_template("developer")?;
+            let branch_name = format!("issue-{}", issue_number);
+            let values = HashMap::from([
+                ("ISSUE_TITLE".to_string(), title.clone()),
+                ("ISSUE_NUMBER".to_string(), issue_number.to_string()),
+                ("ISSUE_BODY".to_string(), message.clone()),
+                ("BRANCH_NAME".to_string(), branch_name),
+                (
+                    "PROJECT_REPOSITORY".to_string(),
+                    format!("{}/{}", ctx.owner, ctx.repo),
+                ),
+            ]);
+            let user_prompt = fill_prompt(&template, &values);
             let new_session_id = start_opencode_session(
                 oc,
                 oc.directory_or(&work_dir),
                 &title,
-                "git-automate-developer",
-                &message,
+                &system_prompt,
+                &user_prompt,
                 deps.config.concurrency,
             )
             .await?;
@@ -1705,7 +1749,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/session/sess123/prompt_async"))
-            .and(body_string_contains("\"agent\":\"git-automate-reviewer\""))
+            .and(body_string_contains("\"system\""))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
             .mount(&oc_mock)
@@ -1759,11 +1803,11 @@ mod tests {
             .mount(&oc_mock)
             .await;
 
-        // Verify prompt_async body: agent is "git-automate-qa" and contains filled
-        // BRANCH_NAME ("issue-7") — proves fill_prompt was called.
+        // Verify prompt_async body: system field present (agent template) and
+        // contains filled BRANCH_NAME ("issue-7") — proves fill_prompt was called.
         Mock::given(method("POST"))
             .and(path("/session/sess123/prompt_async"))
-            .and(body_string_contains("\"agent\":\"git-automate-qa\""))
+            .and(body_string_contains("\"system\""))
             .and(body_string_contains("issue-7"))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
@@ -1824,7 +1868,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/session/sess123/prompt_async"))
-            .and(body_string_contains("\"agent\":\"git-automate-product\""))
+            .and(body_string_contains("\"system\""))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
             .mount(&oc_mock)
@@ -1943,7 +1987,7 @@ mod tests {
             directory: None,
         };
 
-        let result = start_opencode_session(&oc, "/dir", "title", "agent", "message", None).await;
+        let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
         assert!(result.is_err());
         assert!(matches!(result, Err(WorkflowError::Other(_))));
     }
@@ -1989,7 +2033,7 @@ mod tests {
 
         // limit = Some(2), active = 4 → 4 >= 2 → should skip
         let result =
-            start_opencode_session(&oc, "/dir", "title", "agent", "message", Some(2)).await;
+            start_opencode_session(&oc, "/dir", "title", "system", "message", Some(2)).await;
 
         assert!(result.is_err());
         assert!(matches!(result, Err(WorkflowError::Other(_))));
@@ -2042,7 +2086,7 @@ mod tests {
 
         // limit = Some(5), active = 2 → 2 < 5 → should proceed
         let result =
-            start_opencode_session(&oc, "/dir", "title", "agent", "message", Some(5)).await;
+            start_opencode_session(&oc, "/dir", "title", "system", "message", Some(5)).await;
 
         assert_eq!(result.unwrap(), "sess123");
     }
