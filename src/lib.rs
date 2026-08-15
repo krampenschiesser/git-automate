@@ -3,8 +3,6 @@
 
 /// Configuration parsing (YAML + `${env:VAR}` substitution).
 pub mod config;
-/// Shell command execution abstraction.
-pub mod shell;
 
 /// OpenCode HTTP client for agent session management.
 pub mod external_agent;
@@ -16,26 +14,10 @@ pub mod workflow;
 // Not gated by #[cfg(test)] so integration tests (which compile the library
 // as an external crate) can also use SET_CWD_MUTEX to serialize cwd changes.
 pub mod test_utils {
-    use std::sync::Arc;
     use std::sync::LazyLock;
     use tokio::sync::Mutex;
 
-    use crate::shell::{ShellFn, ShellOutput};
-
     pub static SET_CWD_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    /// A shell function that always succeeds with empty output.
-    pub fn mock_shell() -> ShellFn {
-        Arc::new(|_cmd: String| {
-            Box::pin(async move {
-                ShellOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                }
-            })
-        })
-    }
 
     /// Build a `GitHubClient` pointed at a mock server.
     #[cfg(test)]
@@ -62,8 +44,7 @@ pub mod test_utils {
                 opencode: None,
             },
             github,
-            shell: mock_shell(),
-            project_id_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            project_id_cache: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }

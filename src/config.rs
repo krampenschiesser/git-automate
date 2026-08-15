@@ -33,7 +33,8 @@ pub struct GitSection {
         deserialize_with = "deserialize_project_id"
     )]
     pub project_id: Option<String>,
-    pub directory: Option<String>,
+    #[serde(deserialize_with = "deserialize_directory")]
+    pub directory: String,
     #[serde(rename = "issueProvider", default = "default_issue_provider")]
     pub issue_provider: String,
     #[serde(
@@ -133,6 +134,19 @@ where
 {
     let s = String::deserialize(deserializer)?;
     Regex::new(&s).map_err(|e| DeError::custom(format!("invalid title_pattern '{s}': {e}")))?;
+    Ok(s)
+}
+
+/// Rejects an empty/whitespace `directory` (catches an unset `${env:VAR}`
+/// which substitutes to `""`).
+fn deserialize_directory<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.trim().is_empty() {
+        return Err(DeError::custom("git.directory must be a non-empty path"));
+    }
     Ok(s)
 }
 
@@ -303,7 +317,29 @@ git:
         let config = parse_config(tmp.path()).unwrap();
         assert_eq!(config.git.repository, "https://github.com/user/repo");
         assert_eq!(config.git.project_id.as_deref(), Some("42"));
-        assert_eq!(config.git.directory.as_deref(), Some("src"));
+        assert_eq!(config.git.directory, "src");
+    }
+
+    // Test: parse_config without directory → YamlParse (missing field)
+    #[test]
+    fn parse_config_missing_directory_fails() {
+        let yaml = "git:\n  repository: https://github.com/user/repo\n";
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let result = parse_config(tmp.path());
+        assert!(matches!(result, Err(ConfigError::YamlParse { .. })));
+    }
+
+    // Test: parse_config with empty directory → YamlParse (non-empty validation)
+    #[test]
+    fn parse_config_empty_directory_fails() {
+        let yaml = "git:\n  repository: https://github.com/user/repo\n  directory: \"\"\n";
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let result = parse_config(tmp.path());
+        assert!(matches!(result, Err(ConfigError::YamlParse { .. })));
     }
 
     // Test 8: parse_config with missing file → ConfigError::FileNotFound
@@ -321,6 +357,7 @@ opencode:
   pw: secret123
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -338,6 +375,7 @@ git:
         let yaml = r#"
 git:
   repository: 12345
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -354,6 +392,7 @@ git:
 git:
   repository: https://github.com/user/repo
   projectId: 42
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -370,6 +409,7 @@ git:
 git:
   repository: https://github.com/user/repo
   projectId: "P-123"
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -390,6 +430,7 @@ opencode:
   pw: ${env:GA_TEST_PW}
 git:
   repository: https://github.com/cwd/repo
+  directory: /test-dir
 "#;
         let tmp_dir = tempfile::tempdir().unwrap();
         let config_path = tmp_dir.path().join("git-automate.yml");
@@ -421,6 +462,7 @@ git:
 git:
   repository: https://github.com/user/repo
   issueProvider: github
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -436,6 +478,7 @@ git:
         let yaml = r#"
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -452,6 +495,7 @@ git:
 git:
   repository: https://github.com/user/repo
   issueProvider: jira
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -467,7 +511,7 @@ git:
         let gs = GitSection {
             repository: "https://github.com/user/repo".to_string(),
             project_id: None,
-            directory: None,
+            directory: "/test-work".to_string(),
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -495,6 +539,7 @@ git:
   trelloApiKey: ${{env:{}}}
   trelloToken: ${{env:{}}}
   trelloBoardId: BRD-123
+  directory: /test-dir
 ",
             ENV_TRELLO_KEY, ENV_TRELLO_TOKEN
         );
@@ -518,6 +563,7 @@ git:
 concurrency: 4
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -533,6 +579,7 @@ git:
         let yaml = r#"
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -549,6 +596,7 @@ git:
 concurrency: 0
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -565,7 +613,7 @@ git:
             git: GitSection {
                 repository: String::new(),
                 project_id: None,
-                directory: None,
+                directory: "/test-work".to_string(),
                 issue_provider: "github".to_string(),
                 title_pattern: "@ai.*".to_string(),
                 trello_api_key: None,
@@ -597,6 +645,7 @@ git:
             "
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 githubToken: ${{env:{}}}
 ",
             ENV_GH_TOKEN
@@ -618,6 +667,7 @@ githubToken: ${{env:{}}}
         let yaml = r#"
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 "#;
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -637,6 +687,7 @@ git:
             "
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 githubToken: ${{env:{}}}
 ",
             ENV_GH_TOKEN_UNSET
@@ -667,6 +718,7 @@ opencode:
   pw: ${{env:{}}}
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 ",
             ENV_GH_TOKEN_ALL, ENV_OPENCODE_URL_ALL, ENV_PW_ALL
         );
@@ -698,6 +750,7 @@ opencode:
   pw: ${{env:{}}}
 git:
   repository: https://github.com/user/repo
+  directory: /test-dir
 ",
             ENV_PW_PER_PROJECT
         );

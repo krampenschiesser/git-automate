@@ -23,7 +23,7 @@ tests/
 | Debug test flakiness | `src/lib.rs` `SET_CWD_MUTEX` | 14 usage locations across codebase |
 
 ## CONVENTIONS
-- **`SET_CWD_MUTEX`**: Any test calling `write_project_id`, `clone_repo_if_needed`, or `load_config` mutates `cwd` — MUST acquire `SET_CWD_MUTEX.lock().await` and restore original directory afterward. This is the #1 cause of flakiness
+- **`SET_CWD_MUTEX`**: Any test calling `write_project_id` or `load_config` mutates `cwd` — MUST acquire `SET_CWD_MUTEX.lock().await` and restore original directory afterward. This is the #1 cause of flakiness
 - **Mock disambiguation**: GitHub mocks use `body_string_contains` on unique GraphQL substrings — follow this pattern for new mocks:
   - `user(login:` — owner lookup
   - `createProjectV2(input` — project creation

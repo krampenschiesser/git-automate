@@ -413,7 +413,7 @@ impl Workflow {
         tracing::info!("OpenCode server at {} is healthy", oc.url);
 
         let agents: Vec<AgentInfo> = client
-            .get_agents(oc.directory.as_deref())
+            .get_agents(Some(oc.directory.as_str()))
             .await
             .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
 
@@ -441,7 +441,7 @@ impl Workflow {
 mod tests {
     use super::*;
     use crate::config::{GitAutomateConfig, GitSection};
-    use crate::test_utils::{gh_client, make_deps, mock_shell};
+    use crate::test_utils::{gh_client, make_deps};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -454,7 +454,7 @@ mod tests {
         GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: Some("PID-123".to_string()),
-            directory: None,
+            directory: "/test-work".to_string(),
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -536,7 +536,7 @@ mod tests {
                 git: GitSection {
                     repository: "https://github.com/owner/repo".to_string(),
                     project_id: Some("PID-123".to_string()),
-                    directory: None,
+                    directory: "/test-work".to_string(),
                     issue_provider: "github".to_string(),
                     title_pattern: "@ai.*".to_string(),
                     trello_api_key: None,
@@ -548,7 +548,6 @@ mod tests {
                 opencode: None,
             },
             github: None,
-            shell: mock_shell(),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -642,7 +641,7 @@ mod tests {
                 git: GitSection {
                     repository: "https://github.com/owner/repo".to_string(),
                     project_id: None,
-                    directory: None,
+                    directory: "/test-work".to_string(),
                     issue_provider: "github".to_string(),
                     title_pattern: "@ai.*".to_string(),
                     trello_api_key: None,
@@ -654,7 +653,6 @@ mod tests {
                 opencode: None,
             },
             github: Some(client),
-            shell: mock_shell(),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -697,7 +695,7 @@ mod tests {
                 git: GitSection {
                     repository: "https://github.com/owner/repo".to_string(),
                     project_id: Some("PID-1".to_string()),
-                    directory: None,
+                    directory: "/test-work".to_string(),
                     issue_provider: "github".to_string(),
                     title_pattern: "@ai.*".to_string(),
                     trello_api_key: None,
@@ -709,7 +707,6 @@ mod tests {
                 opencode: None,
             },
             github: Some(client),
-            shell: mock_shell(),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -733,7 +730,6 @@ mod tests {
                 opencode: None,
             },
             github: Some(client),
-            shell: mock_shell(),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -826,7 +822,7 @@ mod tests {
         let git = GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: None,
-            directory: None,
+            directory: "/test-work".to_string(),
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -842,7 +838,6 @@ mod tests {
                 opencode: None,
             },
             github: Some(client),
-            shell: mock_shell(),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -923,7 +918,7 @@ mod tests {
         let git = GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: Some("PID-123".to_string()),
-            directory: None,
+            directory: "/test-work".to_string(),
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -939,7 +934,6 @@ mod tests {
                 opencode: None,
             },
             github: Some(client),
-            shell: mock_shell(),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -1017,7 +1011,7 @@ mod tests {
         let git = GitSection {
             repository: "https://github.com/owner/repo".to_string(),
             project_id: Some("1".to_string()),
-            directory: None,
+            directory: "/test-work".to_string(),
             issue_provider: "github".to_string(),
             title_pattern: "@ai.*".to_string(),
             trello_api_key: None,
@@ -1033,7 +1027,6 @@ mod tests {
                 opencode: None,
             },
             github: Some(client),
-            shell: mock_shell(),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -1275,7 +1268,7 @@ mod tests {
         let oc = OpencodeSessionConfig {
             url: mock.uri(),
             pw: "test-pw".to_string(),
-            directory: Some("/tmp/work".to_string()),
+            directory: "/test-work".to_string(),
         };
 
         let deps = make_deps(None);
@@ -1313,7 +1306,7 @@ mod tests {
         let oc = OpencodeSessionConfig {
             url: mock.uri(),
             pw: "test-pw".to_string(),
-            directory: None,
+            directory: "/test-work".to_string(),
         };
 
         let deps = make_deps(None);
@@ -1352,7 +1345,7 @@ mod tests {
         let oc = OpencodeSessionConfig {
             url: mock.uri(),
             pw: "test-pw".to_string(),
-            directory: None,
+            directory: "/test-work".to_string(),
         };
 
         let deps = make_deps(None);
@@ -1394,7 +1387,7 @@ mod tests {
         let oc = OpencodeSessionConfig {
             url: mock.uri(),
             pw: "test-pw".to_string(),
-            directory: None,
+            directory: "/test-work".to_string(),
         };
 
         let deps = make_deps(None);

@@ -18,7 +18,7 @@ use git_automate::external_agent::opencode::OpenCodeClient;
 use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::workflow::helpers::WorkflowContext;
 
-pub use git_automate::test_utils::{SET_CWD_MUTEX, mock_shell};
+pub use git_automate::test_utils::SET_CWD_MUTEX;
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ pub fn project_with_opencode(_url: String) -> GitSection {
     GitSection {
         repository: "https://github.com/owner/repo".to_string(),
         project_id: Some("PID-123".to_string()),
-        directory: None,
+        directory: "/test-work".to_string(),
         issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
@@ -51,7 +51,7 @@ pub fn project_without_opencode() -> GitSection {
     GitSection {
         repository: "https://github.com/owner/repo".to_string(),
         project_id: Some("PID-123".to_string()),
-        directory: None,
+        directory: "/test-work".to_string(),
         issue_provider: "github".to_string(),
         title_pattern: "@ai.*".to_string(),
         trello_api_key: None,
@@ -94,7 +94,6 @@ pub fn make_deps(
             opencode,
         },
         github,
-        shell: mock_shell(),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
     }
 }

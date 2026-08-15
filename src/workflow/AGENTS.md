@@ -18,7 +18,6 @@ src/workflow/
 | Add new status | `mod.rs` `WorkflowStatus` enum + `helpers.rs` `ensure_status_options` | 7 statuses: Triage → Todo → In Dev → Review Tech → Review Prod → QA → Done |
 | Modify check logic | `checks.rs` `run_triage_check` / `run_todo_check` / `run_review_check` | Production code ~300 lines; tests are ~1800 lines |
 | Resolve project/repo | `helpers.rs` `resolve_context` | Hub function: parse repo, resolve ID, ensure fields |
-| Clone repo | `helpers.rs` `clone_repo_if_needed` | Shallow clone to `/tmp/git-automate-work/{owner}-{repo}` |
 | Load prompt/agent templates | `helpers.rs` `load_prompt_template` / `load_agent_template` | `include_str!` — **requires rebuild** |
 | Add GitHub call | `external_issues/github/client.rs` + `types.rs` | 4-step pattern: .graphql → struct → method → test |
 | Start OpenCode session | `checks.rs` `start_opencode_session` | Concurrency gate enforced here |

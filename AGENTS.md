@@ -14,7 +14,6 @@ Single-crate Rust daemon (`edition = "2024"`, req. Rust 1.85+). Polls GitHub for
 │   ├── main.rs          (831)  CLI (serve/health/doctor) + daemon loop
 │   ├── lib.rs           (67)   Module decls + test_utils
 │   ├── config.rs        (740)  YAML config + ${env:VAR} substitution
-│   ├── shell.rs         (167)  sh -c execution wrapper
 │   ├── assets/          (12)   Embedded via include_str!
 │   │   ├── agents/      (6)    *.agent.md (triage/taskmanager/dev/reviewer/product/qa)
 │   │   └── prompts/     (6)    *.md prompt templates
@@ -53,13 +52,12 @@ Single-crate Rust daemon (`edition = "2024"`, req. Rust 1.85+). Polls GitHub for
 | `WorkflowStatus` | enum | `workflow/mod.rs` | 7 statuses: Triage→Todo→In Dev→Review Tech→Review Prod→QA→Done |
 | `AgentName` | enum | `workflow/mod.rs` | 6 agents: triage, taskmanager, developer, reviewer, product, qa |
 | `WorkflowError` | enum | `workflow/helpers.rs` | Error type; per-project errors never propagate |
-| `WorkflowContext` | struct | `workflow/helpers.rs` | Config + GitHub client + shell fn |
+| `WorkflowContext` | struct | `workflow/helpers.rs` | Config + GitHub client |
 | `OpencodeSessionConfig` | struct | `workflow/checks.rs` | Session creation config + concurrency gate |
 | `ExternalAgent` | trait | `external_agent/common/mod.rs` | Provider-agnostic: `create_session`, `get_session`, `list_agents` |
 | `OpenCodeClient` | struct | `external_agent/opencode/client.rs` | Concrete `ExternalAgent` impl via HTTP |
 | `GitHubClient` | struct | `external_issues/github/client.rs` | GraphQL/REST; 17 `include_str!` queries |
 | `GitAutomateConfig` | struct | `config.rs` | Top-level YAML config with `${env:VAR}` |
-| `ShellFn` | type alias | `shell.rs` | `Arc<dyn Fn(String) -> ...>` |
 | `SET_CWD_MUTEX` | static | `lib.rs` | Serializes cwd-mutating tests |
 
 ## COMMANDS
@@ -84,7 +82,7 @@ git-automate doctor --config git-automate.yml   # install missing agents
 
 ## Required environment
 
-- `GITHUB_TOKEN` — **fail-fast in `serve`** (exits if missing/empty); **optional in `doctor`** (warns, skips GitHub checks). Referenced in `git-automate.yml` via `${env:GITHUB_TOKEN}` for authenticated clones.
+- `GITHUB_TOKEN` — **fail-fast in `serve`** (exits if missing/empty); **optional in `doctor`** (warns, skips GitHub checks).
 - `OPENCODE_PW` — OpenCode server password; referenced in config via `${env:OPENCODE_PW}`.
 
 ## CLI
@@ -100,12 +98,12 @@ git-automate doctor --config git-automate.yml      # one-shot setup; copies miss
 - **6 required OpenCode agents** (embedded + copied by `doctor`): `git-automate-triage`, `git-automate-taskmanager`, `git-automate-developer`, `git-automate-reviewer`, `git-automate-product`, `git-automate-qa`.
 - **7 statuses**: `Triage → Todo → In Development → Review Technical → Review Product → QA → Done`.
 - Project setup is idempotent: missing status options and the `sessionId` text field are added as needed; an existing project with all options + field is a no-op.
-- Repos are shallow-cloned to `/tmp/git-automate-work/{owner}-{repo}`; existing clones are skipped.
+- Working directory is configured via `git.directory` (required, existing checkout on the OpenCode server).
 
 ## Test conventions
 
 - **Mocking**: `wiremock` for both GitHub GraphQL (`/graphql`) and OpenCode (`/global/health`, `/agent`, `/session`, …). `tempfile` for on-disk config.
-- **`SET_CWD_MUTEX`** (`lib.rs::test_utils`): any test that calls `write_project_id`, `clone_repo_if_needed`, or `load_config` mutates `cwd` — it **must** acquire this lock and restore the original directory afterward. This is the most common cause of test flakiness.
+- **`SET_CWD_MUTEX`** (`lib.rs::test_utils`): any test that calls `write_project_id` or `load_config` mutates `cwd` — it **must** acquire this lock and restore the original directory afterward. This is the most common cause of test flakiness.
 - **Mock disambiguation**: GitHub mocks use `body_string_contains` on unique substrings (`user(login:`, `createProjectV2(input`, `field(name:`, `fields(first:`, `updateProjectV2Field`, `createProjectV2Field`) — follow the same pattern for new GraphQL tests.
 - **Shared fixtures**: integration tests live in `tests/` with helpers in `tests/common/mod.rs` (`mount_github_graphql_mocks`, `mount_opencode_mocks`, `make_deps`, `gh_client`, …).
 - Tests numbered `T#` in comments (e.g. `T1`, `T7`).
@@ -113,12 +111,12 @@ git-automate doctor --config git-automate.yml      # one-shot setup; copies miss
 ## ANTI-PATTERNS (THIS PROJECT)
 - `run_all()` swallows per-project errors (logs + `"<check> failed for {project}: {e}"`); return value is always `Ok(())` — check logs, not return value
 - Editing `src/assets/prompts/*.md` or `src/assets/agents/*.agent.md` requires a **rebuild** — `include_str!` is compile-time
-- `SET_CWD_MUTEX` must be acquired before any cwd-mutating test (`write_project_id`, `clone_repo_if_needed`, `load_config`); restore original dir afterward
+- `SET_CWD_MUTEX` must be acquired before any cwd-mutating test (`write_project_id`, `load_config`); restore original dir afterward
 - `GITHUB_TOKEN` fail-fast in `serve`; optional in `doctor` (warns, skips GitHub checks)
-- Shell exit code `-1` means both signal-kill and spawn failure (distinguish via non-empty stderr)
 - `${env:VAR}` for unset vars becomes empty string (no error); `.env` loaded via `dotenv()`, env takes precedence
 - `projectId` numeric → resolved to global ID at runtime via `projectV2(number:)`; original value kept in config
 - `deny_unknown_fields` — unknown YAML keys cause parse errors; `titlePattern` validated as regex at deserialize
+- `directory` validated as non-empty string at deserialize (catches unset `${env:VAR}` → empty)
 - Mock disambiguation: GitHub mocks use `body_string_contains` on unique substrings (e.g. `user(login:`, `createProjectV2(input`, `field(name:`)
 - `concurrency` cap skips session creation with a warning (not an error) when limit reached
 - GitHub client `None` → each check logs `warn` and returns `Ok(())` (intentional, e.g. `doctor` mode)
@@ -134,7 +132,7 @@ git-automate doctor --config git-automate.yml      # one-shot setup; copies miss
 ## Notes that are easy to miss
 
 - `serve` logs `Startup runAll failed` / `Polling runAll failed` on each error; clean SIGINT/SIGTERM logs `"Received shutdown signal, exiting"`.
-- Repos are shallow-cloned to `/tmp/git-automate-work/{owner}-{repo}`; existing clones are skipped.
+- Working directory comes from `git.directory` (required) — no cloning occurs.
 - `config.rs` is the foundation — it depends on no other module. All other modules depend on it.
 - No unified top-level error enum; each module defines its own. `main.rs` uses `Box<dyn std::error::Error>` as catch-all.
 

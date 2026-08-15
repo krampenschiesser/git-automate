@@ -7,3 +7,4 @@ git:
   repository: https://github.com/krampenschiesser/git-automate
   projectId: 5
   issueProvider: github
+  directory: /path/to/your/checkout
