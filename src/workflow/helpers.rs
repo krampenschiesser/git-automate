@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use regex::Regex;
 use serde_json::{Value, json};
@@ -96,6 +98,7 @@ impl std::fmt::Debug for ShellDeps {
 pub struct ContextDeps {
     pub github: Option<GitHubClient>,
     pub config: GitAutomateConfig,
+    pub project_id_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Full dependency set for workflow checks and the orchestrator.
@@ -104,6 +107,7 @@ pub struct WorkflowContext {
     pub config: GitAutomateConfig,
     pub github: Option<GitHubClient>,
     pub shell: ShellFn,
+    pub project_id_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for WorkflowContext {
@@ -112,6 +116,7 @@ impl std::fmt::Debug for WorkflowContext {
             .field("config", &self.config)
             .field("github", &self.github)
             .field("shell", &"<shell_fn>")
+            .field("project_id_cache", &"<cache>")
             .finish()
     }
 }
@@ -130,6 +135,7 @@ impl WorkflowContext {
         ContextDeps {
             github: self.github.clone(),
             config: self.config.clone(),
+            project_id_cache: self.project_id_cache.clone(),
         }
     }
 }
@@ -380,6 +386,29 @@ pub async fn resolve_project_id(
     }
 }
 
+/// Like [`resolve_project_id`] but memoizes the result in *cache*, keyed by
+/// `"owner/project_id"`, so repeated calls never hit the network twice.
+pub async fn resolve_project_id_cached(
+    cache: &Mutex<HashMap<String, String>>,
+    github: &GitHubClient,
+    owner: &str,
+    project_id: &str,
+) -> Result<String, WorkflowError> {
+    let key = format!("{}/{}", owner, project_id);
+
+    {
+        let guard = cache.lock().await;
+        if let Some(cached) = guard.get(&key) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let resolved = resolve_project_id(github, owner, project_id).await?.0;
+    let mut guard = cache.lock().await;
+    guard.insert(key, resolved.clone());
+    Ok(resolved)
+}
+
 // ─── Context resolution ───────────────────────────────────────
 
 /// Resolve a project name + config into a fully populated [`ProjectContext`],
@@ -408,7 +437,7 @@ pub async fn resolve_context(
     // The config file is NOT modified — the original numeric ID is preserved
     // so users can keep `projectId: 1` and have it resolved each time.
     let project_id = if let Some(pid) = &git_section.project_id {
-        resolve_project_id(github, &owner, pid).await?.0
+        resolve_project_id_cached(&deps.project_id_cache, github, &owner, pid).await?
     } else {
         tracing::info!("Creating project {} for {}/{}", project_name, owner, repo);
         let pid = github.create_project(&owner, project_name).await?;
@@ -986,6 +1015,80 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn resolve_project_id_cached_hits_network_once() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectV2": { "id": "PVT-global-4" } },
+                    "organization": null
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let first = resolve_project_id_cached(&cache, &client, "owner", "4")
+            .await
+            .unwrap();
+        let second = resolve_project_id_cached(&cache, &client, "owner", "4")
+            .await
+            .unwrap();
+
+        assert_eq!(first, "PVT-global-4");
+        assert_eq!(second, "PVT-global-4");
+        assert_eq!(first, second);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_project_id_cached_different_keys_independent() {
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "user": { "projectV2": { "id": "PVT-A" } },
+                    "organization": null
+                }
+            })))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "organization": { "projectV2": { "id": "PVT-B" } },
+                    "user": null
+                }
+            })))
+            .expect(2)
+            .mount(&server_b)
+            .await;
+
+        let a = resolve_project_id_cached(&cache, &gh_client(&server_a), "owner", "1")
+            .await
+            .unwrap();
+        let b = resolve_project_id_cached(&cache, &gh_client(&server_b), "other", "2")
+            .await
+            .unwrap();
+
+        assert_eq!(a, "PVT-A");
+        assert_eq!(b, "PVT-B");
+        server_a.verify().await;
+        server_b.verify().await;
+    }
+
     fn test_git_section(project_id: Option<&str>) -> GitSection {
         GitSection {
             repository: "https://github.com/owner/repo".to_string(),
@@ -1073,6 +1176,7 @@ mod tests {
         let deps = ContextDeps {
             github: Some(client),
             config: test_config(Some("PID-123")),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(Some("PID-123"));
 
@@ -1146,6 +1250,7 @@ mod tests {
         let deps = ContextDeps {
             github: Some(client),
             config: test_config(Some("1")),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(Some("1"));
 
@@ -1253,6 +1358,7 @@ mod tests {
         let deps = ContextDeps {
             github: Some(client),
             config: test_config(None),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(None);
 
@@ -1293,6 +1399,7 @@ mod tests {
         let deps = ContextDeps {
             github: None,
             config: test_config(Some("PID-123")),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let result =
             resolve_context(&deps, "test-project", &test_git_section(Some("PID-123"))).await;
@@ -1306,6 +1413,7 @@ mod tests {
         let deps = ContextDeps {
             github: Some(client),
             config: test_config(Some("PID-123")),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = GitSection {
             repository: "invalid-no-slash".to_string(),
@@ -1567,6 +1675,7 @@ mod tests {
         let deps = ContextDeps {
             github: Some(client),
             config: test_config(Some("PID-123")),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(Some("PID-123"));
 
@@ -1642,6 +1751,7 @@ mod tests {
         let deps = ContextDeps {
             github: Some(client),
             config: test_config(Some("PID-123")),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(Some("PID-123"));
 
@@ -1932,6 +2042,7 @@ mod tests {
             },
             github: None,
             shell: shell.clone(),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let sd = deps.shell_deps();
         // shell is an Arc<dyn Fn>, just verify it's the same by calling it
@@ -1952,6 +2063,7 @@ mod tests {
             config: config.clone(),
             github: None,
             shell,
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         let cd = deps.context_deps();
         assert!(cd.github.is_none());
