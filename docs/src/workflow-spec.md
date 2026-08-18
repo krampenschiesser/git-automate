@@ -198,3 +198,153 @@ later steps.
 
 Same as Setup: `GITHUB_TOKEN` is required in `serve` mode (fail-fast)
 and optional in `doctor` mode (warns and skips).
+
+## Step 3: Triage
+
+Triage runs at every poll cycle, after Setup (which runs only at startup)
+and the OpenCode Health Check. Its job is to discover new `@ai`-tagged
+issues in the configured GitHub repository and bring them into the
+project board.
+
+### What Triage Does
+
+1. **List repository issues.** The daemon queries the GitHub REST API for
+   all open issues in the configured repository.
+
+2. **Filter by `titlePattern`.** The default pattern is `@ai.*`, meaning
+   issue titles must begin with `@ai` (followed by any characters). The
+   pattern is compiled as a regex at the start of each triage cycle.
+   Issues whose titles do not match the pattern are ignored entirely.
+   This is the `@ai` filter applied at the issue title level.
+
+3. **Add matching issues to the project.** For each issue that matches
+   the pattern, the daemon checks whether the issue already has a
+   corresponding item in the GitHub Project V2 board. If not, it adds
+   the issue to the project via `addIssueToProject`.
+
+4. **Set status to "Triage".** For every matching issue (whether newly
+   added or already present), the daemon sets the item's Status field
+   to "Triage" via `updateProjectItemStatus`. These status transitions
+   are performed by code, not by LLM agents.
+
+5. **Start a triage session if needed.** If the project item does not
+   yet have a `sessionId` value, the daemon starts a triage OpenCode
+   session. This session creation is code-driven: the daemon loads the
+   triage agent template as the system prompt and the triage prompt
+   template as the user message, filling in the following template
+   variables:
+   - `ISSUE_TITLE`
+   - `ISSUE_NUMBER`
+   - `ISSUE_BODY`
+   - `ISSUE_LABELS`
+   - `ISSUE_ASSIGNEE`
+
+   The returned session ID is written back to the project item's
+   `sessionId` field via `updateProjectItemSessionId`. If a `sessionId`
+   already exists, no new session is started.
+
+### What Triage Does Not Do
+
+- Triage does not invoke any LLM agent to decide which issues to
+  process. The `@ai` regex filter and the project addition logic are
+  entirely code-driven.
+- Triage does not perform any status transitions beyond setting the
+  initial "Triage" status. All subsequent status changes are handled
+  by later workflow steps.
+
+## Step 4: Todo
+
+The Todo step runs at every poll cycle. It finds project items that
+have reached "Todo" status but have not yet been assigned a developer
+session, and it starts one.
+
+### What Todo Does
+
+1. **Find Todo items without sessions.** The daemon queries all project
+   items and selects those whose Status is "Todo" and whose `sessionId`
+   field is empty.
+
+2. **Create a branch if needed.** For each selected item, the daemon
+   constructs a branch name in the hardcoded format `issue-{N}`, where
+   `N` is the issue number (e.g. `issue-42`). If the branch does not
+   already exist in the repository, the daemon creates it from the
+   repository's default branch.
+
+3. **Start a developer session.** The daemon starts a developer OpenCode
+   session (code-driven) using the developer agent template as the
+   system prompt and the developer prompt template as the user message.
+   Template variables filled in are:
+   - `ISSUE_TITLE`
+   - `ISSUE_NUMBER`
+   - `ISSUE_BODY`
+   - `BRANCH_NAME`
+   - `PROJECT_REPOSITORY`
+
+   If the issue is not found in the issue map, the title falls back to
+   `"Dev work for issue #{N}"` and the message falls back to
+   `"Issue #{N}"`.
+
+4. **Write the session ID.** The returned session ID is written to the
+   project item's `sessionId` field via `updateProjectItemSessionId`.
+
+### Branch Name Invariant
+
+The branch name format `issue-{N}` is a hardcoded invariant. It is not
+read from configuration and is not influenced by the issue title or any
+other external input. Every developer session for issue `N` uses the
+branch `issue-{N}`.
+
+## Status Flow
+
+The workflow defines seven statuses that an issue item passes through
+in sequence. Status transitions are performed by code, never by LLM
+agents.
+
+### The Seven Statuses
+
+| # | Status | Entered When |
+|---|---|---|
+| 1 | Triage | A new `@ai`-tagged issue is added to the project by the triage step. |
+| 2 | Todo | The triage session completes and the developer session starts. |
+| 3 | In Development | A developer session is running for the item. |
+| 4 | Review Technical | The developer session completes and a reviewer session starts. |
+| 5 | Review Product | The technical review completes and a product review session starts. |
+| 6 | QA | The product review completes and a QA session starts. |
+| 7 | Done | The QA session completes successfully. |
+
+### Normal Flow
+
+```
+Triage → Todo → In Development → Review Technical → Review Product → QA → Done
+```
+
+Each arrow represents a code-driven status transition triggered when the
+corresponding OpenCode session completes and the next step in the
+pipeline detects the completion.
+
+### Exception Paths
+
+**Product review sends back.** If the product reviewer determines that
+changes are needed, the item transitions from "Review Product" back to
+"In Development" (not back to "Todo"). A new developer session is
+started to address the feedback.
+
+**QA sends back.** If the QA agent determines that the work does not
+meet acceptance criteria, the item transitions from "QA" back to
+"In Development". A new developer session is started to address the
+issues found.
+
+**Failed review recovery.** If a review session (technical, product, or
+QA) completes without producing a status transition, the daemon detects
+this condition on the next poll cycle and recovers automatically:
+the item is reset to "Todo", its `sessionId` is cleared, a new
+developer session is started, and the status is advanced to
+"In Development". This prevents items from being stranded in a review
+status with a completed but unrecorded session.
+
+### Key Principle
+
+At no point do LLM agents perform status transitions. All transitions
+are driven by the daemon's code, which observes session completion and
+updates the project board accordingly. The agents produce output and
+feedback; the daemon interprets that output and moves the item forward.
