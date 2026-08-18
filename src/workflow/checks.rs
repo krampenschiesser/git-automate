@@ -115,8 +115,28 @@ async fn start_opencode_session(
         }
     }
 
+    let workspace = client
+        .create_workspace(directory)
+        .await
+        .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
+    let worktree = client
+        .create_worktree(directory, &workspace.id)
+        .await
+        .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
+    tracing::info!(
+        "starting session in worktree {} (workspace {})",
+        worktree.directory,
+        workspace.id
+    );
     client
-        .start_session_with_system(directory, title, system_prompt, "", message)
+        .start_session_with_system(
+            &worktree.directory,
+            title,
+            system_prompt,
+            "",
+            message,
+            Some(&workspace.id),
+        )
         .await
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))
 }
@@ -630,7 +650,7 @@ mod tests {
     use crate::test_utils::{gh_client, make_deps};
     use crate::workflow::helpers::ProjectContext;
     use serde_json::json;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ─── Test helpers ────────────────────────────────────────
@@ -785,6 +805,33 @@ mod tests {
 
     /// Mount OpenCode mocks for session creation + prompt_async.
     async fn mount_opencode_mocks(server: &MockServer) {
+        // Workspace creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .mount(server)
+            .await;
+
+        // Worktree creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-1",
+                "directory": "/wt/dir1"
+            })))
+            .mount(server)
+            .await;
+
         Mock::given(method("POST"))
             .and(path("/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1592,6 +1639,35 @@ mod tests {
         mount_todo_github_mocks(&mock, project_items, issues, field_values).await;
         mount_branch_mocks(&mock, false, "main", "abc123").await;
 
+        // Workspace + worktree creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-42",
+                "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
         // Specific session mock: expects title "Dev work for issue #42"
         Mock::given(method("POST"))
             .and(path("/session"))
@@ -1697,6 +1773,35 @@ mod tests {
         mount_review_github_mocks(&mock, project_items, issues, field_values, status_options).await;
         mount_review_branch_mocks(&mock).await;
 
+        // Workspace + worktree creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-42",
+                "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
         // Specific session mock: expects title "Review Technical: Fix login"
         Mock::given(method("POST"))
             .and(path("/session"))
@@ -1755,6 +1860,35 @@ mod tests {
 
         mount_review_github_mocks(&mock, project_items, issues, field_values, status_options).await;
         mount_review_branch_mocks(&mock).await;
+
+        // Workspace + worktree creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-7",
+                "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
 
         // Session mock for QA state
         Mock::given(method("POST"))
@@ -1815,6 +1949,35 @@ mod tests {
 
         mount_review_github_mocks(&mock, project_items, issues, field_values, status_options).await;
         mount_review_branch_mocks(&mock).await;
+
+        // Workspace + worktree creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-99",
+                "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
 
         // Specific session mock: expects title "Review Product: Update landing page"
         Mock::given(method("POST"))
@@ -1939,6 +2102,33 @@ mod tests {
     #[tokio::test]
     async fn start_opencode_session_maps_open_code_error() {
         let mock = MockServer::start().await;
+
+        // Workspace + worktree succeed; the 500 comes from /session
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-1",
+                "directory": "/wt/dir1"
+            })))
+            .mount(&mock)
+            .await;
+
         Mock::given(method("POST"))
             .and(path("/session"))
             .respond_with(ResponseTemplate::new(500))
@@ -1971,6 +2161,34 @@ mod tests {
                 "sess4": {"status": "idle"},
             })))
             .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Workspace + worktree should NOT be created — limit is 2 and there are 4 active
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-1",
+                "directory": "/wt/dir1"
+            })))
+            .expect(0)
             .mount(&mock)
             .await;
 
@@ -2019,9 +2237,40 @@ mod tests {
             .mount(&mock)
             .await;
 
+        // Workspace + worktree creation succeed
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-1",
+                "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
         // POST /session should be called exactly once and return "sess123"
         Mock::given(method("POST"))
             .and(path("/session"))
+            .and(query_param("workspace", "wrk1"))
+            .and(query_param("directory", "/wt/dir1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "sess123",
                 "projectID": "p1",
@@ -2053,6 +2302,177 @@ mod tests {
             start_opencode_session(&oc, "/dir", "title", "system", "message", Some(5)).await;
 
         assert_eq!(result.unwrap(), "sess123");
+    }
+
+    // T19: start_opencode_session full flow — workspace → worktree → session in worktree dir
+    #[tokio::test]
+    async fn start_opencode_session_full_flow_creates_workspace_and_worktree() {
+        let mock = MockServer::start().await;
+
+        // Workspace creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .and(query_param("directory", "/dir"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Worktree creation — must reference the workspace
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-1",
+                "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // POST /session — created in the worktree directory with the workspace param
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(query_param("workspace", "wrk1"))
+            .and(query_param("directory", "/wt/dir1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/wt/dir1",
+                "title": "t",
+                "version": "1",
+                "time": {"created": 1, "updated": 2}
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "pw".to_string(),
+            directory: "/test-work".to_string(),
+        };
+
+        let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
+        assert_eq!(result.unwrap(), "sess123");
+    }
+
+    // T20: workspace creation fails → no worktree, no session
+    #[tokio::test]
+    async fn start_opencode_session_workspace_failure_stops_flow() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-1",
+                "directory": "/wt/dir1"
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "should-not-happen",
+                "projectID": "p",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": {"created": 1, "updated": 2}
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "pw".to_string(),
+            directory: "/test-work".to_string(),
+        };
+
+        let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
+        assert!(matches!(result, Err(WorkflowError::Other(_))));
+        mock.verify().await;
+    }
+
+    // T21: worktree creation fails → no session
+    #[tokio::test]
+    async fn start_opencode_session_worktree_failure_stops_flow() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "should-not-happen",
+                "projectID": "p",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": {"created": 1, "updated": 2}
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let oc = OpencodeSessionConfig {
+            url: mock.uri(),
+            pw: "pw".to_string(),
+            directory: "/test-work".to_string(),
+        };
+
+        let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
+        assert!(matches!(result, Err(WorkflowError::Other(_))));
+        mock.verify().await;
     }
 
     // Test 18: Review — item with existing session → skips
@@ -2483,6 +2903,33 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/session/sess123/prompt_async"))
             .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+
+        // Workspace creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .mount(server)
+            .await;
+
+        // Worktree creation
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-1",
+                "directory": "/wt/dir1"
+            })))
             .mount(server)
             .await;
     }

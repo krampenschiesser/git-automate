@@ -274,3 +274,37 @@ pub async fn mount_opencode_mocks(server: &MockServer) {
         .mount(server)
         .await;
 }
+
+/// Mount OpenCode experimental workspace + worktree creation mocks.
+///
+/// Call alongside `mount_opencode_mocks` when a test starts sessions (which
+/// now create a workspace and worktree before the session).
+#[allow(dead_code)]
+pub async fn mount_opencode_workspace_worktree_mocks(server: &MockServer) {
+    // Workspace creation
+    Mock::given(method("POST"))
+        .and(path("/experimental/workspace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "wrk1",
+            "type": "git",
+            "name": "w1",
+            "branch": null,
+            "directory": null,
+            "extra": null,
+            "projectID": "p1",
+            "timeUsed": 0
+        })))
+        .mount(server)
+        .await;
+
+    // Worktree creation
+    Mock::given(method("POST"))
+        .and(path("/experimental/worktree"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "wt1",
+            "branch": "issue-1",
+            "directory": "/wt/dir1"
+        })))
+        .mount(server)
+        .await;
+}
