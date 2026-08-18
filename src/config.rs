@@ -2,6 +2,7 @@ use regex::Regex;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
+use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
@@ -23,6 +24,8 @@ pub struct OpencodeConfig {
     pub pw: String,
     pub cwd: String,
     pub project: String,
+    #[serde(default)]
+    pub concurrency: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -67,8 +70,6 @@ fn default_title_pattern() -> String {
 #[serde(deny_unknown_fields)]
 pub struct GitAutomateConfig {
     pub git: GitSection,
-    #[serde(default)]
-    pub concurrency: Option<usize>,
     pub opencode: Option<OpencodeConfig>,
 }
 
@@ -563,11 +564,18 @@ git:
 
     // --- concurrency config tests ---
 
-    // Test: parse_config with concurrency: 4 → config.concurrency == Some(4)
+    // Test: parse_config with opencode.concurrency → hashmap with entries
     #[test]
-    fn parse_config_with_concurrency() {
+    fn parse_config_opencode_concurrency_hashmap() {
         let yaml = r#"
-concurrency: 4
+opencode:
+  url: http://localhost:8081
+  pw: secret
+  cwd: /test-work
+  project: test-project
+  concurrency:
+    myprovider/slow: 2
+    myprovider/fast: 4
 git:
   repository: https://github.com/user/repo
   directory: /test-dir
@@ -577,13 +585,20 @@ git:
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.concurrency, Some(4));
+        let oc = config.opencode.as_ref().unwrap();
+        assert_eq!(oc.concurrency.get("myprovider/slow"), Some(&2));
+        assert_eq!(oc.concurrency.get("myprovider/fast"), Some(&4));
     }
 
-    // Test: parse_config without concurrency → defaults to None
+    // Test: parse_config without opencode.concurrency → empty HashMap
     #[test]
-    fn parse_config_without_concurrency_defaults_to_none() {
+    fn parse_config_opencode_concurrency_defaults_empty() {
         let yaml = r#"
+opencode:
+  url: http://localhost:8081
+  pw: secret
+  cwd: /test-work
+  project: test-project
 git:
   repository: https://github.com/user/repo
   directory: /test-dir
@@ -593,29 +608,15 @@ git:
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.concurrency, None);
+        let oc = config.opencode.as_ref().unwrap();
+        assert!(oc.concurrency.is_empty());
     }
 
-    // Test: parse_config with concurrency: 0 → config.concurrency == Some(0)
-    #[test]
-    fn parse_config_with_concurrency_zero() {
-        let yaml = r#"
-concurrency: 0
-git:
-  repository: https://github.com/user/repo
-  directory: /test-dir
-"#;
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(yaml.as_bytes()).unwrap();
-        tmp.flush().unwrap();
-
-        let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.concurrency, Some(0));
-    }
-
-    // Test: git_automate_config_serde_round_trip_concurrency
+    // Test: git_automate_config_serde_round_trip_with_opencode_concurrency
     #[test]
     fn git_automate_config_serde_round_trip_concurrency() {
+        let mut concurrency = HashMap::new();
+        concurrency.insert("myprovider/fast".to_string(), 4);
         let config = GitAutomateConfig {
             git: GitSection {
                 repository: String::new(),
@@ -628,13 +629,55 @@ git:
                 trello_board_id: None,
                 token: Some("ghp_testtoken123456789".to_string()),
             },
-            concurrency: Some(4),
-            opencode: None,
+            opencode: Some(OpencodeConfig {
+                url: "http://localhost:8081".to_string(),
+                pw: "pw".to_string(),
+                cwd: "/test-work".to_string(),
+                project: "test-project".to_string(),
+                concurrency,
+            }),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: GitAutomateConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed.concurrency, Some(4));
+        assert_eq!(
+            parsed
+                .opencode
+                .as_ref()
+                .unwrap()
+                .concurrency
+                .get("myprovider/fast"),
+            Some(&4)
+        );
         assert_eq!(parsed.git.token.as_deref(), Some("ghp_testtoken123456789"));
+    }
+
+    // Test: parse_config_opencode_concurrency_hashmap
+    #[test]
+    fn parse_config_opencode_concurrency_hashmap_multi_entries() {
+        let yaml = r#"
+opencode:
+  url: http://localhost:8081
+  pw: secret
+  cwd: /test-work
+  project: test-project
+  concurrency:
+    model/a: 1
+    model/b: 2
+    model/c: 3
+git:
+  repository: https://github.com/user/repo
+  directory: /test-dir
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let oc = config.opencode.as_ref().unwrap();
+        assert_eq!(oc.concurrency.len(), 3);
+        assert_eq!(oc.concurrency.get("model/a"), Some(&1));
+        assert_eq!(oc.concurrency.get("model/b"), Some(&2));
+        assert_eq!(oc.concurrency.get("model/c"), Some(&3));
     }
 
     // --- github_token substitution tests ---
@@ -715,7 +758,6 @@ git:
         }
         let yaml = format!(
             "
-concurrency: 2
 opencode:
   url: ${{env:{}}}
   pw: ${{env:{}}}
@@ -733,7 +775,6 @@ git:
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.concurrency, Some(2));
         assert_eq!(config.git.token.as_deref(), Some("ghp_all_vars_work"));
         assert_eq!(
             config.opencode.as_ref().unwrap().url,
