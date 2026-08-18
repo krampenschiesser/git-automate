@@ -39,7 +39,6 @@ pub mod test_utils {
         crate::workflow::helpers::WorkflowContext {
             config: crate::config::GitAutomateConfig {
                 git: crate::config::GitSection::default(),
-                concurrency: None,
                 opencode: None,
             },
             github,
