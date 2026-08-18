@@ -43,6 +43,7 @@ pub fn project_with_opencode(_url: String) -> GitSection {
         trello_api_key: None,
         trello_token: None,
         trello_board_id: None,
+        token: None,
     }
 }
 
@@ -57,6 +58,7 @@ pub fn project_without_opencode() -> GitSection {
         trello_api_key: None,
         trello_token: None,
         trello_board_id: None,
+        token: None,
     }
 }
 
@@ -81,6 +83,8 @@ pub fn make_deps(
         Some(OpencodeConfig {
             url: opencode_url.expect("opencode_url must be set when with_opencode"),
             pw: "pw".to_string(),
+            cwd: "/test-work".to_string(),
+            project: "test-project".to_string(),
         })
     } else {
         None
@@ -90,7 +94,6 @@ pub fn make_deps(
         config: GitAutomateConfig {
             git: project,
             concurrency: None,
-            github_token: None,
             opencode,
         },
         github,

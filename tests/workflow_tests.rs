@@ -139,6 +139,8 @@ async fn test_write_project_id_persists_to_yaml() {
 opencode:
   url: "http://localhost"
   pw: "pw"
+  cwd: "/test-dir"
+  project: "test-project"
 git:
   repository: "https://github.com/owner/repo"
   directory: "/test-dir"
@@ -1025,16 +1027,18 @@ fn failed_review_test_ctx(
         trello_api_key: None,
         trello_token: None,
         trello_board_id: None,
+        token: None,
     };
 
     let deps = WorkflowContext {
         config: GitAutomateConfig {
             git: project_config.clone(),
             concurrency: None,
-            github_token: None,
             opencode: Some(OpencodeConfig {
                 url: "http://localhost:8081".to_string(),
                 pw: "pw".to_string(),
+                cwd: "/test-work".to_string(),
+                project: "test-project".to_string(),
             }),
         },
         github: None,
@@ -1053,6 +1057,7 @@ fn failed_review_test_ctx(
         url: "http://localhost:8081".to_string(),
         pw: "pw".to_string(),
         directory: "/test-work".to_string(),
+        project: Some("test-project".to_string()),
     };
 
     (deps, ctx, oc)

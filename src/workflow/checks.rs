@@ -71,6 +71,7 @@ pub struct OpencodeSessionConfig {
     pub url: String,
     pub pw: String,
     pub directory: String,
+    pub project: Option<String>,
 }
 
 // ─── start_opencode_session ────────────────────────────────────
@@ -648,6 +649,7 @@ mod tests {
                 trello_api_key: None,
                 trello_token: None,
                 trello_board_id: None,
+                token: None,
             },
             owner: "owner".to_string(),
             repo: "repo".to_string(),
@@ -661,6 +663,7 @@ mod tests {
             url,
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
         }
     }
 
@@ -1949,6 +1952,7 @@ mod tests {
             url: mock.uri(),
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
         };
 
         let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
@@ -1993,6 +1997,7 @@ mod tests {
             url: mock.uri(),
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
         };
 
         // limit = Some(2), active = 4 → 4 >= 2 → should skip
@@ -2046,6 +2051,7 @@ mod tests {
             url: mock.uri(),
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
         };
 
         // limit = Some(5), active = 2 → 2 < 5 → should proceed

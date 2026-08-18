@@ -99,7 +99,8 @@ async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error
     // Prefer the config's github_token (substituted from ${env:GITHUB_TOKEN}),
     // falling back to the GITHUB_TOKEN environment variable for backward compatibility.
     let token = config
-        .github_token
+        .git
+        .token
         .as_ref()
         .filter(|t| !t.is_empty())
         .cloned()
@@ -132,7 +133,7 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // falling back to the GITHUB_TOKEN environment variable for backward compatibility.
     let token = config
         .as_ref()
-        .and_then(|c| c.github_token.as_ref())
+        .and_then(|c| c.git.token.as_ref())
         .filter(|t| !t.is_empty())
         .cloned()
         .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()))
@@ -364,7 +365,7 @@ mod tests {
         let config_path = dir.path().join("git-automate.yml");
         std::fs::write(
             &config_path,
-            "git:\n  repository: owner/repo\n  directory: /test-dir\ngithubToken: ${env:GITHUB_TOKEN}\n",
+            "git:\n  repository: owner/repo\n  directory: /test-dir\n  token: ${env:GITHUB_TOKEN}\n",
         )
         .expect("write config");
 

@@ -1,10 +1,12 @@
 concurrency: 4
-githubToken: ${env:GITHUB_TOKEN}
 opencode:
   url: ${env:OPENCODE_URL}
   pw: ${env:OPENCODE_PW}
+  cwd: /path/to/your/checkout
+  project: git-automate
 git:
   repository: https://github.com/krampenschiesser/git-automate
   projectId: 5
   issueProvider: github
   directory: /path/to/your/checkout
+  token: ${env:GITHUB_TOKEN}

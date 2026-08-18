@@ -321,7 +321,7 @@ impl Workflow {
             })
     }
 
-    fn opencode_config(&self, git: &GitSection) -> OpencodeSessionConfig {
+    fn opencode_config(&self, _git: &GitSection) -> OpencodeSessionConfig {
         let opencode = self
             .deps
             .config
@@ -331,7 +331,8 @@ impl Workflow {
         OpencodeSessionConfig {
             url: opencode.url.clone(),
             pw: opencode.pw.clone(),
-            directory: git.directory.clone(),
+            directory: opencode.cwd.clone(),
+            project: Some(opencode.project.clone()),
         }
     }
 
@@ -460,6 +461,7 @@ mod tests {
             trello_api_key: None,
             trello_token: None,
             trello_board_id: None,
+            token: None,
         }
     }
 
@@ -542,9 +544,9 @@ mod tests {
                     trello_api_key: None,
                     trello_token: None,
                     trello_board_id: None,
+                    token: None,
                 },
                 concurrency: None,
-                github_token: None,
                 opencode: None,
             },
             github: None,
@@ -647,9 +649,9 @@ mod tests {
                     trello_api_key: None,
                     trello_token: None,
                     trello_board_id: None,
+                    token: None,
                 },
                 concurrency: None,
-                github_token: None,
                 opencode: None,
             },
             github: Some(client),
@@ -701,9 +703,9 @@ mod tests {
                     trello_api_key: None,
                     trello_token: None,
                     trello_board_id: None,
+                    token: None,
                 },
                 concurrency: None,
-                github_token: None,
                 opencode: None,
             },
             github: Some(client),
@@ -726,7 +728,6 @@ mod tests {
             config: GitAutomateConfig {
                 git: make_project_no_opencode(),
                 concurrency: None,
-                github_token: None,
                 opencode: None,
             },
             github: Some(client),
@@ -828,13 +829,13 @@ mod tests {
             trello_api_key: None,
             trello_token: None,
             trello_board_id: None,
+            token: None,
         };
 
         let deps = WorkflowContext {
             config: GitAutomateConfig {
                 git: git.clone(),
                 concurrency: None,
-                github_token: None,
                 opencode: None,
             },
             github: Some(client),
@@ -924,13 +925,13 @@ mod tests {
             trello_api_key: None,
             trello_token: None,
             trello_board_id: None,
+            token: None,
         };
 
         let deps = WorkflowContext {
             config: GitAutomateConfig {
                 git: git.clone(),
                 concurrency: None,
-                github_token: None,
                 opencode: None,
             },
             github: Some(client),
@@ -1017,13 +1018,13 @@ mod tests {
             trello_api_key: None,
             trello_token: None,
             trello_board_id: None,
+            token: None,
         };
 
         let deps = WorkflowContext {
             config: GitAutomateConfig {
                 git: git.clone(),
                 concurrency: None,
-                github_token: None,
                 opencode: None,
             },
             github: Some(client),
@@ -1269,6 +1270,7 @@ mod tests {
             url: mock.uri(),
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
         };
 
         let deps = make_deps(None);
@@ -1307,6 +1309,7 @@ mod tests {
             url: mock.uri(),
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
         };
 
         let deps = make_deps(None);
@@ -1346,6 +1349,7 @@ mod tests {
             url: mock.uri(),
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
         };
 
         let deps = make_deps(None);
@@ -1388,6 +1392,7 @@ mod tests {
             url: mock.uri(),
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
         };
 
         let deps = make_deps(None);
