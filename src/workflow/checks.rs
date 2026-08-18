@@ -72,6 +72,7 @@ pub struct OpencodeSessionConfig {
     pub pw: String,
     pub directory: String,
     pub project: Option<String>,
+    pub concurrency: HashMap<String, usize>,
 }
 
 // ─── start_opencode_session ────────────────────────────────────
@@ -93,26 +94,30 @@ async fn start_opencode_session(
     title: &str,
     system_prompt: &str,
     message: &str,
-    concurrency: Option<usize>,
+    concurrency: &HashMap<String, usize>,
 ) -> Result<String, WorkflowError> {
     let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
 
-    if let Some(limit) = concurrency {
-        let active = client
-            .count_active_sessions()
+    if !concurrency.is_empty() {
+        let counts = client
+            .get_session_models()
             .await
             .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
-        if active >= limit {
-            tracing::warn!(
-                "OpenCode active sessions ({}) >= concurrency limit ({}), skipping: {}",
-                active,
-                limit,
-                title
-            );
-            return Err(WorkflowError::Other(format!(
-                "concurrency limit ({}) reached — {} active sessions",
-                limit, active
-            )));
+        for (model_key, limit) in concurrency {
+            let active = counts.get(model_key).copied().unwrap_or(0);
+            if active >= *limit {
+                tracing::warn!(
+                    "OpenCode active sessions for model {} ({}) >= concurrency limit ({}), skipping: {}",
+                    model_key,
+                    active,
+                    limit,
+                    title
+                );
+                return Err(WorkflowError::Other(format!(
+                    "concurrency limit ({}) reached for model {} — {} active sessions",
+                    limit, model_key, active
+                )));
+            }
         }
     }
 
@@ -137,6 +142,7 @@ async fn start_opencode_session(
             "",
             message,
             Some(&workspace.id),
+            None,
         )
         .await
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))
@@ -228,7 +234,11 @@ pub async fn run_triage_check(
                 &issue.title,
                 &system_prompt,
                 &user_prompt,
-                deps.config.concurrency,
+                deps.config
+                    .opencode
+                    .as_ref()
+                    .map(|oc| &oc.concurrency)
+                    .unwrap_or(&HashMap::new()),
             )
             .await?;
             github
@@ -342,7 +352,11 @@ pub async fn run_todo_check(
             &title,
             &system_prompt,
             &user_prompt,
-            deps.config.concurrency,
+            deps.config
+                .opencode
+                .as_ref()
+                .map(|oc| &oc.concurrency)
+                .unwrap_or(&HashMap::new()),
         )
         .await?;
 
@@ -468,7 +482,11 @@ pub async fn run_review_check(
                 &title,
                 &system_prompt,
                 &filled_prompt,
-                deps.config.concurrency,
+                deps.config
+                    .opencode
+                    .as_ref()
+                    .map(|oc| &oc.concurrency)
+                    .unwrap_or(&HashMap::new()),
             )
             .await?;
 
@@ -613,7 +631,11 @@ pub async fn run_failed_review_check(
                 &title,
                 &system_prompt,
                 &user_prompt,
-                deps.config.concurrency,
+                deps.config
+                    .opencode
+                    .as_ref()
+                    .map(|oc| &oc.concurrency)
+                    .unwrap_or(&HashMap::new()),
             )
             .await?;
 
@@ -684,6 +706,7 @@ mod tests {
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
+            concurrency: HashMap::new(),
         }
     }
 
@@ -2143,9 +2166,12 @@ mod tests {
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
+            concurrency: HashMap::new(),
         };
 
-        let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
+        let result =
+            start_opencode_session(&oc, "/dir", "title", "system", "message", &HashMap::new())
+                .await;
         assert!(result.is_err());
         assert!(matches!(result, Err(WorkflowError::Other(_))));
     }
@@ -2154,6 +2180,21 @@ mod tests {
     #[tokio::test]
     async fn start_opencode_session_skips_when_at_limit() {
         let mock = MockServer::start().await;
+
+        // GET /api/session returns 4 sessions with myprovider/fast model
+        Mock::given(method("GET"))
+            .and(path("/api/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
+                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
+                    { "id": "sess3", "model": { "id": "fast", "providerID": "myprovider" } },
+                    { "id": "sess4", "model": { "id": "fast", "providerID": "myprovider" } },
+                ],
+                "cursor": null
+            })))
+            .mount(&mock)
+            .await;
 
         // GET /session/status returns 4 active sessions
         Mock::given(method("GET"))
@@ -2216,11 +2257,14 @@ mod tests {
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
+            concurrency: HashMap::new(),
         };
 
-        // limit = Some(2), active = 4 → 4 >= 2 → should skip
+        // limit = 2 for myprovider/fast, active = 4 → 4 >= 2 → should skip
+        let mut concurrency = HashMap::new();
+        concurrency.insert("myprovider/fast".to_string(), 2);
         let result =
-            start_opencode_session(&oc, "/dir", "title", "system", "message", Some(2)).await;
+            start_opencode_session(&oc, "/dir", "title", "system", "message", &concurrency).await;
 
         assert!(result.is_err());
         assert!(matches!(result, Err(WorkflowError::Other(_))));
@@ -2230,6 +2274,19 @@ mod tests {
     #[tokio::test]
     async fn start_opencode_session_proceeds_below_limit() {
         let mock = MockServer::start().await;
+
+        // GET /api/session returns 2 sessions with myprovider/fast model
+        Mock::given(method("GET"))
+            .and(path("/api/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
+                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
+                ],
+                "cursor": null
+            })))
+            .mount(&mock)
+            .await;
 
         // GET /session/status returns 2 active sessions
         Mock::given(method("GET"))
@@ -2301,11 +2358,14 @@ mod tests {
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
+            concurrency: HashMap::new(),
         };
 
-        // limit = Some(5), active = 2 → 2 < 5 → should proceed
+        // limit = 5 for myprovider/fast, active = 2 → 2 < 5 → should proceed
+        let mut concurrency = HashMap::new();
+        concurrency.insert("myprovider/fast".to_string(), 5);
         let result =
-            start_opencode_session(&oc, "/dir", "title", "system", "message", Some(5)).await;
+            start_opencode_session(&oc, "/dir", "title", "system", "message", &concurrency).await;
 
         assert_eq!(result.unwrap(), "sess123");
     }
@@ -2374,9 +2434,13 @@ mod tests {
             url: mock.uri(),
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
+            concurrency: HashMap::new(),
         };
 
-        let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
+        let result =
+            start_opencode_session(&oc, "/dir", "title", "system", "message", &HashMap::new())
+                .await;
         assert_eq!(result.unwrap(), "sess123");
     }
 
@@ -2421,9 +2485,13 @@ mod tests {
             url: mock.uri(),
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
+            concurrency: HashMap::new(),
         };
 
-        let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
+        let result =
+            start_opencode_session(&oc, "/dir", "title", "system", "message", &HashMap::new())
+                .await;
         assert!(matches!(result, Err(WorkflowError::Other(_))));
         mock.verify().await;
     }
@@ -2474,9 +2542,13 @@ mod tests {
             url: mock.uri(),
             pw: "pw".to_string(),
             directory: "/test-work".to_string(),
+            project: None,
+            concurrency: HashMap::new(),
         };
 
-        let result = start_opencode_session(&oc, "/dir", "title", "system", "message", None).await;
+        let result =
+            start_opencode_session(&oc, "/dir", "title", "system", "message", &HashMap::new())
+                .await;
         assert!(matches!(result, Err(WorkflowError::Other(_))));
         mock.verify().await;
     }

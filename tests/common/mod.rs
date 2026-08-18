@@ -85,6 +85,7 @@ pub fn make_deps(
             pw: "pw".to_string(),
             cwd: "/test-work".to_string(),
             project: "test-project".to_string(),
+            concurrency: HashMap::new(),
         })
     } else {
         None
@@ -93,7 +94,6 @@ pub fn make_deps(
     WorkflowContext {
         config: GitAutomateConfig {
             git: project,
-            concurrency: None,
             opencode,
         },
         github,

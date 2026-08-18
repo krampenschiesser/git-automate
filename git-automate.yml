@@ -1,5 +1,7 @@
-concurrency: 4
 opencode:
+  concurrency:
+    myprovider/slow: 2
+    myprovider/fast: 4
   url: ${env:OPENCODE_URL}
   pw: ${env:OPENCODE_PW}
   cwd: /path/to/your/checkout

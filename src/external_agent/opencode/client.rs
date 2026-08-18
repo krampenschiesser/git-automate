@@ -4,7 +4,8 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::external_agent::opencode::types::{
-    Agent, AgentInfo, HealthResponse, Session, SessionMessage, Workspace, Worktree,
+    Agent, AgentInfo, Cursor, HealthResponse, Session, SessionMessage, SessionsResponse, Workspace,
+    Worktree,
 };
 
 const OPENCODE_USERNAME: &str = "opencode";
@@ -138,6 +139,7 @@ impl OpenCodeClient {
         title: &str,
         agent: &str,
         message: &str,
+        model: Option<&str>,
     ) -> Result<String, OpenCodeError> {
         let prompt_body = json!({
             "agent": agent,
@@ -151,6 +153,7 @@ impl OpenCodeClient {
             None,
             title,
             prompt_body,
+            model,
         )
         .await
     }
@@ -162,6 +165,7 @@ impl OpenCodeClient {
     /// the field is omitted, so OpenCode uses its default agent with the
     /// provided `system` instructions — enabling prompt construction from
     /// embedded markdown without pre-installed agents.
+    #[expect(clippy::too_many_arguments)]
     pub async fn start_session_with_system(
         &self,
         directory: &str,
@@ -170,6 +174,7 @@ impl OpenCodeClient {
         agent: &str,
         message: &str,
         workspace: Option<&str>,
+        model: Option<&str>,
     ) -> Result<String, OpenCodeError> {
         let mut prompt_body = json!({
             "parts": [{ "type": "text", "text": message }]
@@ -188,6 +193,7 @@ impl OpenCodeClient {
             workspace,
             title,
             prompt_body,
+            model,
         )
         .await
     }
@@ -216,6 +222,53 @@ impl OpenCodeClient {
         let statuses: std::collections::HashMap<String, serde_json::Value> =
             response.json().await?;
         Ok(statuses)
+    }
+
+    /// GET /api/session + GET /session/status — return per-model active session counts.
+    pub async fn get_session_models(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, OpenCodeError> {
+        // 1. Fetch all sessions via GET /api/session (handle pagination via cursor)
+        let mut all_sessions: Vec<crate::external_agent::opencode::types::SessionV2Info> =
+            Vec::new();
+        let mut cursor: Option<Cursor> = None;
+        loop {
+            let mut request = self
+                .client
+                .get(format!("{}/api/session", self.base_url))
+                .header("Authorization", &self.auth_header);
+            if let Some(ref c) = cursor
+                && let Some(ref next) = c.next
+            {
+                request = request.query(&[("cursor", next)]);
+            }
+            let response = request.send().await?;
+            if !response.status().is_success() {
+                return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
+            }
+            let resp: SessionsResponse = response.json().await?;
+            all_sessions.extend(resp.data);
+            match resp.cursor {
+                Some(c) if c.next.is_some() => cursor = Some(c),
+                _ => break,
+            }
+        }
+
+        // 2. Fetch active statuses
+        let active = self.get_session_statuses().await?;
+
+        // 3. Filter sessions: only those whose id is in active statuses map
+        // 4. For each active session with a model, increment count for model.as_key()
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for session in &all_sessions {
+            if let Some(ref model) = session.model
+                && active.contains_key(&session.id)
+            {
+                *counts.entry(model.as_key()).or_insert(0) += 1;
+            }
+        }
+
+        Ok(counts)
     }
 
     /// `GET /session/{id}/message` — list messages in a session.
@@ -298,6 +351,7 @@ impl OpenCodeClient {
 
 /// Shared two-step HTTP flow used by [`OpenCodeClient::start_session`] and the
 /// `ExternalAgent` trait impl to create a session and deliver a prompt.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn start_session_http(
     client: &Client,
     base_url: &str,
@@ -306,16 +360,21 @@ pub(crate) async fn start_session_http(
     workspace: Option<&str>,
     title: &str,
     prompt_body: serde_json::Value,
+    model: Option<&str>,
 ) -> Result<String, OpenCodeError> {
     let mut query = vec![("directory", directory)];
     if let Some(ws) = workspace {
         query.push(("workspace", ws));
     }
+    let mut create_body = json!({ "title": title });
+    if let Some(m) = model {
+        create_body["model"] = json!(m);
+    }
     let create_response = client
         .post(format!("{}/session", base_url))
         .query(&query)
         .header("Authorization", auth_header)
-        .json(&json!({ "title": title }))
+        .json(&create_body)
         .send()
         .await?;
 
@@ -362,7 +421,9 @@ pub fn encode_basic_auth(username: &str, password: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{
+        body_json, header, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Build a client pointed at a mock server with a known password.
@@ -580,7 +641,13 @@ mod tests {
 
         let client = client(&server);
         let id = client
-            .start_session("/d", "Session Title", "git-automate-triage", "issue body")
+            .start_session(
+                "/d",
+                "Session Title",
+                "git-automate-triage",
+                "issue body",
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(id, "sess123");
@@ -597,7 +664,7 @@ mod tests {
 
         let client = client(&server);
         let result = client
-            .start_session("/d", "t", "git-automate-triage", "m")
+            .start_session("/d", "t", "git-automate-triage", "m", None)
             .await;
         assert!(result.is_err());
     }
@@ -631,7 +698,13 @@ mod tests {
 
         let client = client(&server);
         client
-            .start_session("/d", "Session Title", "git-automate-triage", "issue body")
+            .start_session(
+                "/d",
+                "Session Title",
+                "git-automate-triage",
+                "issue body",
+                None,
+            )
             .await
             .unwrap();
     }
@@ -662,7 +735,13 @@ mod tests {
 
         let client = client(&server);
         client
-            .start_session("/d", "Session Title", "git-automate-triage", "issue body")
+            .start_session(
+                "/d",
+                "Session Title",
+                "git-automate-triage",
+                "issue body",
+                None,
+            )
             .await
             .unwrap();
     }
@@ -720,7 +799,7 @@ mod tests {
         assert!(client.check_health().await);
         client.get_agents(None).await.unwrap();
         client
-            .start_session("/d", "t", "git-automate-triage", "m")
+            .start_session("/d", "t", "git-automate-triage", "m", None)
             .await
             .unwrap();
 
@@ -1064,7 +1143,7 @@ mod tests {
 
         let client = client(&server);
         let id = client
-            .start_session_with_system("/d", "t", "sys", "", "m", Some("wrk1"))
+            .start_session_with_system("/d", "t", "sys", "", "m", Some("wrk1"), None)
             .await
             .unwrap();
         assert_eq!(id, "sess123");
@@ -1110,9 +1189,217 @@ mod tests {
 
         let client = client(&server);
         let id = client
-            .start_session_with_system("/d", "t", "sys", "", "m", None)
+            .start_session_with_system("/d", "t", "sys", "", "m", None, None)
             .await
             .unwrap();
         assert_eq!(id, "sess123");
+    }
+
+    // --- start_session_with_system model (tests 31-32) -----------------
+
+    #[tokio::test]
+    async fn start_session_with_system_includes_model_in_body() {
+        let create = Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(body_json(
+                json!({ "title": "t", "model": "myprovider/fast" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        create.mount(&server).await;
+
+        let prompt = Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1);
+        prompt.mount(&server).await;
+
+        let client = client(&server);
+        let id = client
+            .start_session_with_system("/d", "t", "sys", "", "m", None, Some("myprovider/fast"))
+            .await
+            .unwrap();
+        assert_eq!(id, "sess123");
+    }
+
+    #[tokio::test]
+    async fn start_session_with_system_omits_model_when_none() {
+        let create = Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(body_json(json!({ "title": "t" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        create.mount(&server).await;
+
+        let prompt = Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1);
+        prompt.mount(&server).await;
+
+        let client = client(&server);
+        let id = client
+            .start_session_with_system("/d", "t", "sys", "", "m", None, None)
+            .await
+            .unwrap();
+        assert_eq!(id, "sess123");
+    }
+
+    // --- get_session_models (tests 33-36) --------------------------
+
+    #[tokio::test]
+    async fn get_session_models_happy_path() {
+        let server = MockServer::start().await;
+
+        // GET /api/session returns 3 sessions with 2 models
+        Mock::given(method("GET"))
+            .and(path("/api/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
+                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
+                    { "id": "sess3", "model": { "id": "slow", "providerID": "myprovider" } },
+                ],
+                "cursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        // GET /session/status — sess1 and sess2 are active
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sess1": { "type": "busy" },
+                "sess2": { "type": "idle" },
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let counts = client.get_session_models().await.unwrap();
+        assert_eq!(counts.get("myprovider/fast"), Some(&2));
+        // sess3 is not active, so it should not be in the map
+        assert_eq!(counts.get("myprovider/slow"), None);
+    }
+
+    #[tokio::test]
+    async fn get_session_models_no_active_sessions() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
+                ],
+                "cursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let counts = client.get_session_models().await.unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_session_models_excludes_sessions_without_model() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "id": "sess1" },
+                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
+                ],
+                "cursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sess1": { "type": "busy" },
+                "sess2": { "type": "busy" },
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let counts = client.get_session_models().await.unwrap();
+        // sess1 has no model, so it's excluded
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("myprovider/fast"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn get_session_models_pagination() {
+        let server = MockServer::start().await;
+
+        // First page: no cursor param
+        Mock::given(method("GET"))
+            .and(path("/api/session"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
+                ],
+                "cursor": { "previous": null, "next": "page2" }
+            })))
+            .mount(&server)
+            .await;
+
+        // Second page: cursor=page2
+        Mock::given(method("GET"))
+            .and(path("/api/session"))
+            .and(query_param("cursor", "page2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
+                    { "id": "sess3", "model": { "id": "slow", "providerID": "myprovider" } },
+                ],
+                "cursor": null
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sess1": { "type": "busy" },
+                "sess2": { "type": "busy" },
+                "sess3": { "type": "busy" },
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let counts = client.get_session_models().await.unwrap();
+        assert_eq!(counts.get("myprovider/fast"), Some(&2));
+        assert_eq!(counts.get("myprovider/slow"), Some(&1));
     }
 }

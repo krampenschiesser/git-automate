@@ -1037,12 +1037,12 @@ fn failed_review_test_ctx(
     let deps = WorkflowContext {
         config: GitAutomateConfig {
             git: project_config.clone(),
-            concurrency: None,
             opencode: Some(OpencodeConfig {
                 url: "http://localhost:8081".to_string(),
                 pw: "pw".to_string(),
                 cwd: "/test-work".to_string(),
                 project: "test-project".to_string(),
+                concurrency: HashMap::new(),
             }),
         },
         github: None,
@@ -1062,6 +1062,7 @@ fn failed_review_test_ctx(
         pw: "pw".to_string(),
         directory: "/test-work".to_string(),
         project: Some("test-project".to_string()),
+        concurrency: HashMap::new(),
     };
 
     (deps, ctx, oc)

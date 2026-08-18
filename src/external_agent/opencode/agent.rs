@@ -141,6 +141,7 @@ impl ExternalAgent for OpenCodeClient {
                 None,
                 &title,
                 prompt_body,
+                None,
             )
             .await
             .map_err(|e| ExternalAgentError::StartSession(e.to_string()))

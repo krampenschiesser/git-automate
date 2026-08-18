@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(project.project_id.as_deref(), Some("1"));
     }
 
-    // T-n: write_doctor_config preserves existing config fields (concurrency,
+    // T-n: write_doctor_config preserves existing config fields (
     // issueProvider, opencode sections) when updating projectId.
     #[tokio::test]
     async fn write_doctor_config_preserves_existing_fields() {
@@ -777,7 +777,6 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"
-concurrency: 4
 issueProvider: github
 opencode:
   url: http://localhost:8081
@@ -801,7 +800,6 @@ git:
         let content = std::fs::read_to_string(&config_path).unwrap();
         let data: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
 
-        assert_eq!(data.get("concurrency").and_then(|v| v.as_u64()), Some(4));
         assert_eq!(
             data.get("issueProvider").and_then(|v| v.as_str()),
             Some("github")
