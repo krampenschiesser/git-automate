@@ -99,3 +99,102 @@ Received shutdown signal, exiting
 
 No in-progress workflow steps are forcibly terminated. The daemon waits
 for the current cycle to finish before exiting.
+
+## Step 1: Setup
+
+Setup is the first workflow step. It runs **only at startup**, not on
+every poll cycle. This is a deliberate divergence from the original
+design which executed setup on each iteration; running it once at
+startup is sufficient because the GitHub Project V2 board structure
+does not change during normal operation.
+
+### What Setup Does
+
+1. **Parse the repository URL.** The `git.repository` field (e.g.
+   `https://github.com/owner/repo`) is parsed to extract the owner and
+   repository name. The project name is derived from the repository
+   name.
+
+2. **Create the GitHub Project V2 if absent.** If `projectId` is not
+   present in the configuration, a new project is created on GitHub
+   using the derived project name. The newly created global ID is
+   written back to `git-automate.yml` so that subsequent runs use the
+   persisted ID directly.
+
+3. **Resolve numeric project IDs.** If `projectId` is present and its
+   value is purely numeric (e.g. `projectId: 1`), it is treated as a
+   project *number* (databaseId), not a relay global ID. At runtime the
+   daemon resolves it to the corresponding global node ID via the
+   `projectV2(number:)` GraphQL query. The original numeric value is
+   **preserved** in the config file and is never replaced by the
+   resolved global ID. If `projectId` is already a non-numeric global
+   ID, it is used as-is with no network call.
+
+4. **Ensure status options.** The project's Status field must contain
+   all seven `WorkflowStatus` values as options:
+
+   - Triage
+   - Todo
+   - In Development
+   - Review Technical
+   - Review Product
+   - QA
+   - Done
+
+   Any existing status option whose name does not match one of these
+   seven values is **removed**. This keeps the board clean and prevents
+   stale options from accumulating. Missing options are added as
+   needed.
+
+5. **Ensure the `sessionId` field.** The project must have a `sessionId`
+   TEXT field. If the field does not exist, it is created. This field
+   stores the OpenCode session identifier for each project item.
+
+### Idempotency
+
+Setup is idempotent. An existing project that already has all seven
+status options and the `sessionId` field is a no-op. Missing status
+options are added, extra options are removed, and a missing
+`sessionId` field is created. No errors are raised in these cases.
+
+### GitHub Token Requirements
+
+- **`serve` mode**: `GITHUB_TOKEN` is required. If it is missing or
+  empty, the daemon exits immediately (fail-fast).
+- **`doctor` mode**: `GITHUB_TOKEN` is optional. If missing, a warning
+  is logged and all GitHub-dependent checks (including setup) are
+  skipped.
+
+## Step 2: OpenCode Health Check
+
+The OpenCode Health Check runs at **every poll cycle**, unlike Setup
+which runs only at startup. Its purpose is to verify that the OpenCode
+server is reachable and responsive before the daemon proceeds to the
+triage, todo, and review steps.
+
+### What the Check Does
+
+The `check_opencode` function probes the OpenCode server's
+`/global/health` endpoint. This is the **only** endpoint consulted
+during this step.
+
+- If the server responds with a healthy status, the check logs an
+  informational message and returns `Ok(())`.
+- If the server is unreachable or reports unhealthy, the check logs a
+  warning and returns `Ok(())`. The daemon continues to the next step
+  rather than aborting, because transient OpenCode outages should not
+  halt the entire polling loop.
+
+### Agent Verification (Obsolete)
+
+The current implementation queries the OpenCode `/agent` endpoint and
+checks that all six required agents are installed. **This check is
+obsolete and is not part of the specification.** The spec does not
+require verifying agent installation at this stage. Agent readiness is
+assumed; missing agents will surface as session-creation errors in
+later steps.
+
+### GitHub Token Requirements
+
+Same as Setup: `GITHUB_TOKEN` is required in `serve` mode (fail-fast)
+and optional in `doctor` mode (warns and skips).
