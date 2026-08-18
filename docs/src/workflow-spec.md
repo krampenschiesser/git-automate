@@ -348,3 +348,289 @@ At no point do LLM agents perform status transitions. All transitions
 are driven by the daemon's code, which observes session completion and
 updates the project board accordingly. The agents produce output and
 feedback; the daemon interprets that output and moves the item forward.
+
+## Step 5: Review
+
+Review runs at every poll cycle, after Setup (startup only), the
+OpenCode Health Check, Triage, and Todo. Its job is to start review
+sessions for project items that have reached any of the three review
+statuses and do not yet have an active session.
+
+### Review States
+
+The review step processes three states **in order**:
+
+1. **Review Technical**
+2. **Review Product**
+3. **QA**
+
+For each state, the daemon finds all project items whose Status matches
+that state and whose `sessionId` field is empty. If no items match a
+given state, that state is skipped entirely.
+
+### Agent and Template Mapping
+
+Each review state uses a specific agent and prompt template:
+
+| State | Agent | Prompt Template |
+|---|---|---|
+| Review Technical | Reviewer | `reviewer` |
+| Review Product | Product | `product` |
+| QA | QA | `qa` |
+
+The agent template is loaded as the system prompt and the prompt
+template is filled with variables and used as the user message. Both
+loads are code-driven; no LLM agent decides which template to use.
+
+### Template Variables
+
+Review states share a common set of six template variables:
+
+- `ISSUE_NUMBER` — the GitHub issue number
+- `BRANCH_NAME` — the feature branch (e.g. `issue-42`)
+- `ISSUE_TITLE` — the issue title, or `"Issue #N"` as fallback
+- `ISSUE_BODY` — the issue body text, or empty string as fallback
+- `PR_URL` — the pull request URL (starts empty; populated by the developer agent)
+- `PR_CHANGES` — the PR diff or change description (starts empty)
+
+`PR_URL` and `PR_CHANGES` are initialized to empty strings at the
+start of each review cycle. They are populated by the developer agent
+during the "In Development" phase and become available once the
+technical review begins.
+
+### Session Creation
+
+For each matching item, the daemon creates an OpenCode session
+(code-driven) with the loaded system prompt and filled user prompt.
+The session title is formatted as:
+
+```
+"{status}: {issue_title}"
+```
+
+For example: `"Review Technical: @ai Add dark mode support"`. If the
+issue cannot be found in the issue map, the title falls back to:
+
+```
+"{status}: #{issue_number}"
+```
+
+For example: `"Review Technical: #42"`.
+
+After the session is created, its ID is written to the project item's
+`sessionId` field.
+
+### Failed Review Recovery
+
+After all three review states have been processed, the review step
+calls `run_failed_review_check` to perform recovery. This is an
+**integral part of the review step**, not an optional or separate
+phase.
+
+#### What Failed Review Recovery Detects
+
+The recovery check identifies review sessions that have completed
+(i.e. they no longer appear in OpenCode's active session list) but
+whose project item status has **not** transitioned. This indicates
+that the review agent finished without producing the expected status
+change, leaving the item stranded.
+
+#### Recovery Procedure
+
+For each stuck item found in any of the three review states, the
+recovery check performs the following steps in order:
+
+1. **Reset status to "Todo".** The item's Status field is set back to
+   "Todo" via `updateProjectItemStatus`.
+2. **Clear the `sessionId` field.** The existing session ID is removed
+   via `updateProjectItemSessionId` with a `None` value.
+3. **Start a new developer session.** The daemon loads the developer
+   agent template as the system prompt and the developer prompt
+   template as the user message, filling in the standard developer
+   variables (`ISSUE_TITLE`, `ISSUE_NUMBER`, `ISSUE_BODY`,
+   `BRANCH_NAME`, `PROJECT_REPOSITORY`). This session creation is
+   code-driven.
+4. **Set status to "In Development".** The item's Status field is
+   advanced to "In Development" via `updateProjectItemStatus`.
+
+This recovery mechanism ensures that a review agent failure does not
+permanently block an issue. The item re-enters the development cycle
+with a fresh session, giving the developer agent another opportunity
+to produce a correct implementation.
+
+## Concurrency
+
+The daemon limits the total number of concurrently active OpenCode
+agent sessions through the top-level `concurrency` field in
+`git-automate.yml`.
+
+### Behavior When Set
+
+When `concurrency` is configured, it acts as a **hard cap**. Before
+creating any new OpenCode session, the daemon queries the OpenCode
+server for the current count of active sessions. If the active count
+is greater than or equal to the configured limit, the session
+creation is **skipped silently** — no warning is logged, and the
+workflow step proceeds to the next item.
+
+### Behavior When Unset
+
+When `concurrency` is not set, there is no limit on active sessions.
+The daemon creates sessions freely for every item that reaches a
+stage requiring a new session.
+
+### Divergence from Current Code
+
+The current implementation logs a `warn!` message before skipping
+session creation when the concurrency limit is reached. The spec
+requires silent skipping with no warning. This is the only
+concurrency-related divergence.
+
+## Agent Catalog
+
+The git-automate workflow defines six OpenCode agents. Each agent has
+an embedded definition file that is copied to `~/.opencode/agents/`
+by the `doctor` command.
+
+| Agent | File | Role | Invoked By |
+|---|---|---|---|
+| Triage | `git-automate-triage.agent.md` | Analyze issues, break into sub-tasks, and transition items to "Todo" | Step 3 (Triage) |
+| TaskManager | `git-automate-taskmanager.agent.md` | Board management, status enforcement, and cross-agent coordination | **Never invoked (dead code)** |
+| Developer | `git-automate-developer.agent.md` | Implement code changes for triaged issues | Step 4 (Todo), Failed Review Recovery |
+| Reviewer | `git-automate-reviewer.agent.md` | Technical code review for pull requests | Step 5 (Review Technical) |
+| Product | `git-automate-product.agent.md` | Product and UX review for implemented features | Step 5 (Review Product) |
+| QA | `git-automate-qa.agent.md` | Testing and QA verification before final approval | Step 5 (QA) |
+
+### TaskManager: Dead Code
+
+The TaskManager agent is **currently unused**. Its prompt template
+(`taskmanager.md`) exists in `src/assets/prompts/` and the
+`load_prompt_template("taskmanager")` function is available, but no
+workflow check function references it. The agent definition file is
+still embedded and copied by `doctor` for future use, but it is not
+invoked by any step in the current pipeline.
+
+## Prompt Variable Catalog
+
+Each prompt template expects a specific set of variables. The daemon
+fills these variables at runtime before passing the template to an
+OpenCode session. The table below lists each template by filename and
+its expected variables.
+
+| Template | Variables |
+|---|---|
+| `prompts/triage.md` | `ISSUE_TITLE`, `ISSUE_NUMBER`, `ISSUE_BODY`, `ISSUE_LABELS`, `ISSUE_ASSIGNEE` |
+| `prompts/developer.md` | `ISSUE_TITLE`, `ISSUE_NUMBER`, `ISSUE_BODY`, `BRANCH_NAME`, `PROJECT_REPOSITORY` |
+| `prompts/reviewer.md` | `ISSUE_NUMBER`, `PR_URL`, `BRANCH_NAME`, `ISSUE_TITLE`, `PR_CHANGES` |
+| `prompts/product.md` | `ISSUE_NUMBER`, `PR_URL`, `ISSUE_TITLE`, `ISSUE_BODY`, `PR_CHANGES` |
+| `prompts/qa.md` | `ISSUE_NUMBER`, `PR_URL`, `ISSUE_TITLE`, `BRANCH_NAME` |
+| `prompts/taskmanager.md` | `PROJECT_NAME`, `PROJECT_BOARD_URL`, `ISSUE_LIST` |
+
+Note: The `taskmanager.md` template variables are listed for
+completeness but are never populated at runtime, since the TaskManager
+agent is not invoked.
+
+## Divergences
+
+The following sections document differences between the current
+implementation and this specification. These divergences represent
+intentional spec changes that should be reflected in the codebase.
+
+### 1. Setup Runs Only at Startup
+
+**Current behavior:** `setup_check` is invoked on every poll cycle
+through `run_all()`.
+
+**Spec requirement:** Setup runs **only at startup**, before the
+first 30-second polling interval begins. Subsequent poll cycles
+skip setup entirely. This is sufficient because the GitHub Project
+V2 board structure (status options, `sessionId` field) does not
+change during normal operation after the initial setup.
+
+### 2. Status Option Removal
+
+**Current behavior:** `ensure_status_options` adds any missing
+status options but does not remove options that are not part of the
+seven `WorkflowStatus` values.
+
+**Spec requirement:** In addition to adding missing options, the
+setup step must **remove** any existing status option whose name
+does not match one of the seven defined statuses. This prevents
+stale or duplicate options from accumulating on the project board
+over time.
+
+### 3. OpenCode Check Is Health-Only
+
+**Current behavior:** `check_opencode` queries the OpenCode
+`/agent` endpoint and verifies that all six required agents are
+installed. If any agent is missing, the check reports an error.
+
+**Spec requirement:** The OpenCode health check consults **only**
+the `/global/health` endpoint. The agent presence check is
+obsolete and is removed from the specification. Agent readiness is
+assumed; missing agents will surface as session-creation errors in
+later steps.
+
+### 4. Concurrency Is a Hard Cap (No Warning)
+
+**Current behavior:** When the active session count reaches the
+concurrency limit, the daemon logs a `warn!` message before skipping
+session creation.
+
+**Spec requirement:** When the concurrency limit is reached, the
+session is **skipped silently** with no warning logged. The workflow
+step proceeds to the next item without any output.
+
+## Doctor
+
+The `doctor` command is a one-shot setup wizard. It is invoked with:
+
+```bash
+git-automate doctor --config git-automate.yml
+```
+
+### What Doctor Does
+
+1. **Parses the existing config** (if present) to access the
+   repository URL, project ID, and working directory.
+2. **Resolves or creates the GitHub Project V2**. If no project ID
+   is configured, doctor prompts the user to choose between a user
+   or organization project and creates one if needed.
+3. **Ensures status options and the `sessionId` field** exist on
+   the project board, using the same logic as the setup step.
+4. **Writes the config file** with resolved values. Unlike `serve`,
+   doctor writes the **original** project ID (not the resolved
+   global ID) back to the config, preserving the user's input.
+5. **Copies agent definitions** to `~/.opencode/agents/` so that
+   OpenCode can discover them.
+
+### GitHub Token in Doctor
+
+`GITHUB_TOKEN` is **optional** in doctor mode. If it is missing, a
+warning is logged and all GitHub-dependent operations (project
+creation, status option management) are skipped. The command
+completes successfully as long as the config file can be written.
+
+### Doctor vs. Serve
+
+Doctor runs setup with `persist=false` semantics: it does not write
+resolved project IDs back to the config file (the original numeric
+or user-provided value is preserved). Serve, by contrast, writes
+resolved global IDs back to the config on each startup run.
+
+## Error Isolation
+
+Error isolation is defined in the Daemon Loop section above. The
+`run_all()` function runs all five workflow steps in sequence
+(Setup, OpenCode Health Check, Triage, Todo, Review). Each step
+catches its own errors internally and logs them with the pattern:
+
+```
+"<check> failed for {project}: {e}"
+```
+
+`run_all()` always returns `Ok(())`. No error is ever propagated
+to the caller, ensuring that a single failing project or step never
+prevents the daemon from continuing to process the remaining
+projects. Operators should inspect logs to diagnose issues, not the
+return value of the daemon.
