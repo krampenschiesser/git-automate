@@ -29,7 +29,7 @@ The daemon communicates with two external services:
 - **OpenCode** via HTTP for agent session creation and lifecycle management.
 
 Configuration is provided through a YAML file (default: `git-automate.yml`)
-and supports environment variable interpolation via the `${env:VAR}` syntax.
+and supports environment variable interpolation for secret values.
 The daemon requires a `GITHUB_TOKEN` to operate and uses `OPENCODE_PW` for
 authentication against the OpenCode server.
 
@@ -124,8 +124,8 @@ does not change during normal operation.
 3. **Resolve numeric project IDs.** If `projectId` is present and its
    value is purely numeric (e.g. `projectId: 1`), it is treated as a
    project *number* (databaseId), not a relay global ID. At runtime the
-   daemon resolves it to the corresponding global node ID via the
-   `projectV2(number:)` GraphQL query. The original numeric value is
+    daemon resolves it to the corresponding global node ID via a
+    GitHub API project lookup by number. The original numeric value is
    **preserved** in the config file and is never replaced by the
    resolved global ID. If `projectId` is already a non-numeric global
    ID, it is used as-is with no network call.
@@ -153,7 +153,9 @@ does not change during normal operation.
 ### Idempotency
 
 Setup is idempotent. An existing project that already has all seven
-status options and the `sessionId` field is a no-op. Missing status
+status options and the `sessionId` field performs no mutations —
+queries are still issued to verify the current state, but no create or
+delete operations are executed. Missing status
 options are added, extra options are removed, and a missing
 `sessionId` field is created. No errors are raised in these cases.
 
@@ -161,9 +163,8 @@ options are added, extra options are removed, and a missing
 
 - **`serve` mode**: `GITHUB_TOKEN` is required. If it is missing or
   empty, the daemon exits immediately (fail-fast).
-- **`doctor` mode**: `GITHUB_TOKEN` is optional. If missing, a warning
-  is logged and all GitHub-dependent checks (including setup) are
-  skipped.
+- **`doctor` mode**: `GITHUB_TOKEN` is required. If it is missing or
+  empty, the daemon exits immediately (fail-fast).
 
 ## Step 2: OpenCode Health Check
 
@@ -175,7 +176,7 @@ triage, todo, and review steps.
 ### What the Check Does
 
 The `check_opencode` function probes the OpenCode server's
-`/global/health` endpoint. This is the **only** endpoint consulted
+health endpoint. This is the **only** endpoint consulted
 during this step.
 
 - If the server responds with a healthy status, the check logs an
@@ -185,19 +186,10 @@ during this step.
   rather than aborting, because transient OpenCode outages should not
   halt the entire polling loop.
 
-### Agent Verification (Obsolete)
+  ### GitHub Token Requirements
 
-The current implementation queries the OpenCode `/agent` endpoint and
-checks that all six required agents are installed. **This check is
-obsolete and is not part of the specification.** The spec does not
-require verifying agent installation at this stage. Agent readiness is
-assumed; missing agents will surface as session-creation errors in
-later steps.
-
-### GitHub Token Requirements
-
-Same as Setup: `GITHUB_TOKEN` is required in `serve` mode (fail-fast)
-and optional in `doctor` mode (warns and skips).
+  Same as Setup: `GITHUB_TOKEN` is required in `serve` mode (fail-fast)
+  and required in `doctor` mode (fail-fast).
 
 ## Step 3: Triage
 
@@ -380,9 +372,26 @@ Each review state uses a specific agent and prompt template:
 
 The agent template is loaded as the system prompt and the prompt
 template is filled with variables and used as the user message. Both
-loads are code-driven; no LLM agent decides which template to use.
+  loads are code-driven; no LLM agent decides which template to use.
 
-### Template Variables
+  ### Agent Decision Outcomes
+
+  Each review agent can produce one of three outcomes. The daemon
+  monitors the session and advances the project item's status once the
+  agent completes:
+
+  | State | Agent | Outcome: Approve | Outcome: Request Changes | Outcome: Escalate |
+  |---|---|---|---|---|
+  | Review Technical | Reviewer | Advances to "Review Product" | Stays at "Review Technical" (agent provides feedback) | Advances to "Review Product" |
+  | Review Product | Product | Advances to "QA" | Returns to "In Development" (agent provides feedback) | N/A |
+  | QA | QA | Advances to "Done" | Returns to "In Development" (agent provides findings) | N/A |
+
+  "Request changes" results in the status moving backward (to "In
+  Development" for product/QA reviews, or staying in place for technical
+  reviews), while "approve" advances forward. "Escalate" (technical
+  review only) skips product review and advances directly to "QA".
+
+  ### Template Variables
 
 Review states share a common set of six template variables:
 
@@ -562,11 +571,11 @@ over time.
 ### 3. OpenCode Check Is Health-Only
 
 **Current behavior:** `check_opencode` queries the OpenCode
-`/agent` endpoint and verifies that all six required agents are
+agent listing endpoint and verifies that all six required agents are
 installed. If any agent is missing, the check reports an error.
 
 **Spec requirement:** The OpenCode health check consults **only**
-the `/global/health` endpoint. The agent presence check is
+the health endpoint. The agent presence check is
 obsolete and is removed from the specification. Agent readiness is
 assumed; missing agents will surface as session-creation errors in
 later steps.
@@ -606,17 +615,16 @@ git-automate doctor --config git-automate.yml
 
 ### GitHub Token in Doctor
 
-`GITHUB_TOKEN` is **optional** in doctor mode. If it is missing, a
-warning is logged and all GitHub-dependent operations (project
-creation, status option management) are skipped. The command
-completes successfully as long as the config file can be written.
+`GITHUB_TOKEN` is **required** in doctor mode, same as in
+`serve` mode. If it is missing or empty, the command exits
+immediately with a fail-fast error.
 
 ### Doctor vs. Serve
 
 Doctor runs setup with `persist=false` semantics: it does not write
 resolved project IDs back to the config file (the original numeric
 or user-provided value is preserved). Serve, by contrast, writes
-resolved global IDs back to the config on each startup run.
+resolved global IDs back to the config when creating a new project.
 
 ## Error Isolation
 
