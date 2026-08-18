@@ -28,8 +28,8 @@ src/external_agent/opencode/
 - **Provider-agnostic trait**: `ExternalAgent` defined in `common/mod.rs`; `OpenCodeClient` implements it here. The trait abstracts `create_session`, `get_session`, `list_agents`, `check_health`
 - **Basic auth**: `encode_basic_auth(user, pw)` → `base64` → `Basic <encoded>` header. Uses `base64` crate (not `http` crate)
 - **`agent.rs`** handles agent definitions and prompt mapping (`AgentName` → file/template), separate from HTTP transport in `client.rs`
-- **`types.rs`**: serde structs mirror OpenCode JSON responses (`Agent`, `AgentInfo`, `HealthResponse`, `Session`, `SessionTime`, `Workspace`, `Worktree`)
-- **Re-exports** (`mod.rs`): `pub use client::{OpenCodeClient, OpenCodeError, encode_basic_auth}` and `pub use types::{Agent, AgentInfo, HealthResponse, Session, SessionMessage, SessionMessageInfo, SessionTime, Workspace, Worktree}`
+- **`types.rs`**: serde structs mirror OpenCode JSON responses (`Agent`, `AgentInfo`, `HealthResponse`, `Session`, `SessionTime`, `Workspace`, `Worktree`, `ModelRef`, `SessionV2Info`, `SessionsResponse`, `Cursor`)
+- **Re-exports** (`mod.rs`): `pub use client::{OpenCodeClient, OpenCodeError, encode_basic_auth}` and `pub use types::{Agent, AgentInfo, Cursor, HealthResponse, ModelRef, Session, SessionMessage, SessionMessageInfo, SessionTime, SessionV2Info, SessionsResponse, Workspace, Worktree}`
 - **Workspace param**: `POST /session` accepts an optional `workspace` query param; `start_session_http`/`start_session_with_system` take `workspace: Option<&str>` (None when the caller doesn't need a workspace, e.g. the `ExternalAgent` trait path)
 
 ## ANTI-PATTERNS (THIS DIRECTORY)
