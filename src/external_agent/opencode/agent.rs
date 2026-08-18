@@ -138,6 +138,7 @@ impl ExternalAgent for OpenCodeClient {
                 &base_url,
                 &auth_header,
                 project_key,
+                None,
                 &title,
                 prompt_body,
             )

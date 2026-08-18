@@ -4,7 +4,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::external_agent::opencode::types::{
-    Agent, AgentInfo, HealthResponse, Session, SessionMessage,
+    Agent, AgentInfo, HealthResponse, Session, SessionMessage, Workspace, Worktree,
 };
 
 const OPENCODE_USERNAME: &str = "opencode";
@@ -24,6 +24,10 @@ pub enum OpenCodeError {
     NoSessionData,
     #[error("Failed to fetch session messages: {0}")]
     FetchSessionMessages(String),
+    #[error("Failed to create workspace: {0}")]
+    CreateWorkspace(String),
+    #[error("Failed to create worktree: {0}")]
+    CreateWorktree(String),
 }
 
 impl From<reqwest::Error> for OpenCodeError {
@@ -144,6 +148,7 @@ impl OpenCodeClient {
             &self.base_url,
             &self.auth_header,
             directory,
+            None,
             title,
             prompt_body,
         )
@@ -164,6 +169,7 @@ impl OpenCodeClient {
         system_prompt: &str,
         agent: &str,
         message: &str,
+        workspace: Option<&str>,
     ) -> Result<String, OpenCodeError> {
         let mut prompt_body = json!({
             "parts": [{ "type": "text", "text": message }]
@@ -179,6 +185,7 @@ impl OpenCodeClient {
             &self.base_url,
             &self.auth_header,
             directory,
+            workspace,
             title,
             prompt_body,
         )
@@ -237,6 +244,56 @@ impl OpenCodeClient {
         let messages: Vec<SessionMessage> = response.json().await?;
         Ok(messages)
     }
+
+    /// `POST /experimental/workspace` — create a new workspace.
+    ///
+    /// Sends `{"type": "git"}` as the body with `directory` as a query param.
+    /// Returns the created [`Workspace`] on success.
+    pub async fn create_workspace(&self, directory: &str) -> Result<Workspace, OpenCodeError> {
+        let response = self
+            .client
+            .post(format!("{}/experimental/workspace", self.base_url))
+            .query(&[("directory", directory)])
+            .header("Authorization", &self.auth_header)
+            .json(&json!({ "type": "git" }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(OpenCodeError::CreateWorkspace(format!(
+                "workspace creation HTTP status {}",
+                response.status().as_u16()
+            )));
+        }
+        let workspace: Workspace = response.json().await?;
+        Ok(workspace)
+    }
+
+    /// `POST /experimental/worktree` — create a new git worktree.
+    ///
+    /// Uses `directory` and `workspace_id` as query params with an empty JSON
+    /// body. Returns the created [`Worktree`] on success.
+    pub async fn create_worktree(
+        &self,
+        directory: &str,
+        workspace_id: &str,
+    ) -> Result<Worktree, OpenCodeError> {
+        let response = self
+            .client
+            .post(format!("{}/experimental/worktree", self.base_url))
+            .query(&[("directory", directory), ("workspace", workspace_id)])
+            .header("Authorization", &self.auth_header)
+            .json(&json!({}))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(OpenCodeError::CreateWorktree(format!(
+                "worktree creation HTTP status {}",
+                response.status().as_u16()
+            )));
+        }
+        let worktree: Worktree = response.json().await?;
+        Ok(worktree)
+    }
 }
 
 /// Shared two-step HTTP flow used by [`OpenCodeClient::start_session`] and the
@@ -246,12 +303,17 @@ pub(crate) async fn start_session_http(
     base_url: &str,
     auth_header: &str,
     directory: &str,
+    workspace: Option<&str>,
     title: &str,
     prompt_body: serde_json::Value,
 ) -> Result<String, OpenCodeError> {
+    let mut query = vec![("directory", directory)];
+    if let Some(ws) = workspace {
+        query.push(("workspace", ws));
+    }
     let create_response = client
         .post(format!("{}/session", base_url))
-        .query(&[("directory", directory)])
+        .query(&query)
         .header("Authorization", auth_header)
         .json(&json!({ "title": title }))
         .send()
@@ -881,5 +943,176 @@ mod tests {
         let msg: SessionMessage = serde_json::from_value(body[0].clone()).unwrap();
         assert_eq!(msg.text(), "first\nsecond");
         assert!(msg.is_user());
+    }
+
+    // --- create_workspace (tests 25-26) ---------------------------------
+
+    #[tokio::test]
+    async fn create_workspace_happy_path() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .and(query_param("directory", "/d"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(body_json(json!({ "type": "git" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1",
+                "type": "git",
+                "name": "w1",
+                "branch": null,
+                "directory": null,
+                "extra": null,
+                "projectID": "p1",
+                "timeUsed": 0
+            })))
+            .expect(1)
+            .named("create_workspace");
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let ws = client.create_workspace("/d").await.unwrap();
+        assert_eq!(ws.id, "wrk1");
+        assert_eq!(ws.kind, "git");
+        assert_eq!(ws.name, "w1");
+        assert_eq!(ws.project_id, "p1");
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn create_workspace_500_returns_error() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.create_workspace("/d").await;
+        assert!(matches!(result, Err(OpenCodeError::CreateWorkspace(_))));
+    }
+
+    // --- create_worktree (tests 27-28) ----------------------------------
+
+    #[tokio::test]
+    async fn create_worktree_happy_path() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("directory", "/d"))
+            .and(query_param("workspace", "wrk1"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1",
+                "branch": "issue-1",
+                "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .named("create_worktree");
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let wt = client.create_worktree("/d", "wrk1").await.unwrap();
+        assert_eq!(wt.name, "wt1");
+        assert_eq!(wt.branch.as_deref(), Some("issue-1"));
+        assert_eq!(wt.directory, "/wt/dir1");
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn create_worktree_500_returns_error() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.create_worktree("/d", "wrk1").await;
+        assert!(matches!(result, Err(OpenCodeError::CreateWorktree(_))));
+    }
+
+    // --- start_session_with_system with workspace (tests 29-30) ----------
+
+    #[tokio::test]
+    async fn start_session_with_system_workspace_query_param() {
+        let create = Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(query_param("directory", "/d"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        create.mount(&server).await;
+
+        let prompt = Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1);
+        prompt.mount(&server).await;
+
+        let client = client(&server);
+        let id = client
+            .start_session_with_system("/d", "t", "sys", "", "m", Some("wrk1"))
+            .await
+            .unwrap();
+        assert_eq!(id, "sess123");
+    }
+
+    #[tokio::test]
+    async fn start_session_with_system_none_workspace_omits_param() {
+        // A mock that matches when a `workspace` query param is present must NOT match.
+        let ws_present = Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(query_param("workspace", "x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "should-not-happen",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(0);
+        let server = MockServer::start().await;
+        ws_present.mount(&server).await;
+
+        // Fallback: matches the no-workspace-param request.
+        let ok = Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess123",
+                "projectID": "p1",
+                "directory": "/d",
+                "title": "t",
+                "version": "1",
+                "time": { "created": 1, "updated": 2 }
+            })))
+            .expect(1);
+        ok.mount(&server).await;
+
+        let prompt = Mock::given(method("POST"))
+            .and(path("/session/sess123/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1);
+        prompt.mount(&server).await;
+
+        let client = client(&server);
+        let id = client
+            .start_session_with_system("/d", "t", "sys", "", "m", None)
+            .await
+            .unwrap();
+        assert_eq!(id, "sess123");
     }
 }
