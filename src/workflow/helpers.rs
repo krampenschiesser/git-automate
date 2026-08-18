@@ -787,7 +787,6 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut config = GitAutomateConfig {
             git: GitSection::default(),
-            concurrency: None,
             opencode: None,
         };
 
@@ -1028,7 +1027,6 @@ mod tests {
         let git = test_git_section(project_id);
         GitAutomateConfig {
             git,
-            concurrency: None,
             opencode: None,
         }
     }
@@ -1956,7 +1954,6 @@ mod tests {
     async fn context_deps_returns_github_and_config() {
         let config = GitAutomateConfig {
             git: GitSection::default(),
-            concurrency: None,
             opencode: None,
         };
         let deps = WorkflowContext {

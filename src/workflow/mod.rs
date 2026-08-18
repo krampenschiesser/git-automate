@@ -333,6 +333,7 @@ impl Workflow {
             pw: opencode.pw.clone(),
             directory: opencode.cwd.clone(),
             project: Some(opencode.project.clone()),
+            concurrency: opencode.concurrency.clone(),
         }
     }
 
@@ -546,7 +547,6 @@ mod tests {
                     trello_board_id: None,
                     token: None,
                 },
-                concurrency: None,
                 opencode: None,
             },
             github: None,
@@ -651,7 +651,6 @@ mod tests {
                     trello_board_id: None,
                     token: None,
                 },
-                concurrency: None,
                 opencode: None,
             },
             github: Some(client),
@@ -705,7 +704,6 @@ mod tests {
                     trello_board_id: None,
                     token: None,
                 },
-                concurrency: None,
                 opencode: None,
             },
             github: Some(client),
@@ -727,7 +725,6 @@ mod tests {
         let deps = WorkflowContext {
             config: GitAutomateConfig {
                 git: make_project_no_opencode(),
-                concurrency: None,
                 opencode: None,
             },
             github: Some(client),
@@ -835,7 +832,6 @@ mod tests {
         let deps = WorkflowContext {
             config: GitAutomateConfig {
                 git: git.clone(),
-                concurrency: None,
                 opencode: None,
             },
             github: Some(client),
@@ -931,7 +927,6 @@ mod tests {
         let deps = WorkflowContext {
             config: GitAutomateConfig {
                 git: git.clone(),
-                concurrency: None,
                 opencode: None,
             },
             github: Some(client),
@@ -1024,7 +1019,6 @@ mod tests {
         let deps = WorkflowContext {
             config: GitAutomateConfig {
                 git: git.clone(),
-                concurrency: None,
                 opencode: None,
             },
             github: Some(client),
@@ -1271,6 +1265,7 @@ mod tests {
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
+            concurrency: HashMap::new(),
         };
 
         let deps = make_deps(None);
@@ -1310,6 +1305,7 @@ mod tests {
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
+            concurrency: HashMap::new(),
         };
 
         let deps = make_deps(None);
@@ -1350,6 +1346,7 @@ mod tests {
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
+            concurrency: HashMap::new(),
         };
 
         let deps = make_deps(None);
@@ -1393,6 +1390,7 @@ mod tests {
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
+            concurrency: HashMap::new(),
         };
 
         let deps = make_deps(None);
