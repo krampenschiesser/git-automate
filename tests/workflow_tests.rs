@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use serde_json::json;
 use tempfile::tempdir;
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::*;
@@ -28,14 +28,18 @@ async fn test_full_triage_flow_with_mocks() {
 
     mount_github_graphql_mocks(&gh_mock).await;
     mount_opencode_mocks(&oc_mock).await;
+    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
 
     // Track that the session creation POST was actually called.
+    // Session is created in the worktree directory with the workspace param.
     Mock::given(method("POST"))
         .and(path("/session"))
+        .and(query_param("directory", "/wt/dir1"))
+        .and(query_param("workspace", "wrk1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "sess123",
             "projectID": "p1",
-            "directory": "/d",
+            "directory": "/wt/dir1",
             "title": "t",
             "version": "1",
             "time": {"created": 1, "updated": 2}
@@ -1076,6 +1080,8 @@ async fn test_failed_review_technical_transitions_to_in_dev() {
         .mount(&oc_mock)
         .await;
 
+    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
+
     Mock::given(method("POST"))
         .and(path("/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1123,6 +1129,8 @@ async fn test_failed_review_product_transitions_to_in_dev() {
         .mount(&oc_mock)
         .await;
 
+    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
+
     Mock::given(method("POST"))
         .and(path("/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1169,6 +1177,8 @@ async fn test_failed_review_qa_transitions_to_in_dev() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(&oc_mock)
         .await;
+
+    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
 
     Mock::given(method("POST"))
         .and(path("/session"))
