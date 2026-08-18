@@ -53,7 +53,7 @@ Single-crate Rust daemon (`edition = "2024"`, req. Rust 1.85+). Polls GitHub for
 | `AgentName` | enum | `workflow/mod.rs` | 6 agents: triage, taskmanager, developer, reviewer, product, qa |
 | `WorkflowError` | enum | `workflow/helpers.rs` | Error type; per-project errors never propagate |
 | `WorkflowContext` | struct | `workflow/helpers.rs` | Config + GitHub client |
-| `OpencodeSessionConfig` | struct | `workflow/checks.rs` | Session creation config + concurrency gate |
+| `OpencodeSessionConfig` | struct | `workflow/checks.rs` | Session creation config + per-model concurrency gate via API discovery |
 | `ExternalAgent` | trait | `external_agent/common/mod.rs` | Provider-agnostic: `create_session`, `get_session`, `list_agents` |
 | `OpenCodeClient` | struct | `external_agent/opencode/client.rs` | Concrete `ExternalAgent` impl via HTTP |
 | `GitHubClient` | struct | `external_issues/github/client.rs` | GraphQL/REST; 17 `include_str!` queries |
@@ -78,7 +78,7 @@ git-automate doctor --config git-automate.yml   # install missing agents
 - **`projectId` is optional.** If it is numeric (a project *number*, not a relay ID) it is **resolved to a GitHub global ID at runtime** via `projectV2(number:)` — the original numeric value is **kept** in `git-automate.yml` (not replaced). Non-numeric values are treated as already-valid global IDs (no network call).
 - **`${env:VAR}`** interpolation runs on every string field (recursing into maps/sequences). Unset vars become empty strings.
 - **`.env`** is loaded via `dotenv()` at startup; vars already in the environment take precedence over the file.
-- `concurrency` (top-level) caps active OpenCode sessions — when the limit is reached session creation is skipped with a warning.
+- `opencode.concurrency` (per-model map) caps active OpenCode sessions per model — when the limit for any model is reached, session creation is skipped with a warning. Model info is discovered via the OpenCode API (`GET /api/session` + `GET /session/status`).
 
 ## Required environment
 
@@ -118,7 +118,7 @@ git-automate doctor --config git-automate.yml      # one-shot setup; copies miss
 - `deny_unknown_fields` — unknown YAML keys cause parse errors; `titlePattern` validated as regex at deserialize
 - `directory` validated as non-empty string at deserialize (catches unset `${env:VAR}` → empty)
 - Mock disambiguation: GitHub mocks use `body_string_contains` on unique substrings (e.g. `user(login:`, `createProjectV2(input`, `field(name:`)
-- `concurrency` cap skips session creation with a warning (not an error) when limit reached
+- `concurrency` cap (per-model, in `opencode.concurrency`) skips session creation with a warning (not an error) when limit reached for any model (conservative: blocks all creation if any model is at capacity)
 - GitHub client `None` → each check logs `warn` and returns `Ok(())` (intentional, e.g. `doctor` mode)
 
 ## Subdirectory AGENTS
