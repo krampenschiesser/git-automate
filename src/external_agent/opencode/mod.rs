@@ -12,4 +12,5 @@ pub mod types;
 pub use client::{OpenCodeClient, OpenCodeError, encode_basic_auth};
 pub use types::{
     Agent, AgentInfo, HealthResponse, Session, SessionMessage, SessionMessageInfo, SessionTime,
+    Workspace, Worktree,
 };

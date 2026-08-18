@@ -117,3 +117,31 @@ pub enum SessionMessagePart {
     #[serde(other)]
     Other,
 }
+
+/// A workspace returned by `POST /experimental/workspace`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Workspace {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub directory: Option<String>,
+    #[serde(default)]
+    pub extra: Option<serde_json::Value>,
+    #[serde(rename = "projectID")]
+    pub project_id: String,
+    #[serde(default)]
+    pub time_used: Option<serde_json::Value>,
+}
+
+/// A git worktree returned by `POST /experimental/worktree`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Worktree {
+    pub name: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    pub directory: String,
+}
