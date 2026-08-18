@@ -40,7 +40,6 @@ pub mod test_utils {
             config: crate::config::GitAutomateConfig {
                 git: crate::config::GitSection::default(),
                 concurrency: None,
-                github_token: None,
                 opencode: None,
             },
             github,

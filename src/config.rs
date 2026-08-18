@@ -21,6 +21,8 @@ pub enum ConfigError {
 pub struct OpencodeConfig {
     pub url: String,
     pub pw: String,
+    pub cwd: String,
+    pub project: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -49,6 +51,8 @@ pub struct GitSection {
     pub trello_token: Option<String>,
     #[serde(rename = "trelloBoardId")]
     pub trello_board_id: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 fn default_issue_provider() -> String {
@@ -65,8 +69,6 @@ pub struct GitAutomateConfig {
     pub git: GitSection,
     #[serde(default)]
     pub concurrency: Option<usize>,
-    #[serde(rename = "githubToken", default)]
-    pub github_token: Option<String>,
     pub opencode: Option<OpencodeConfig>,
 }
 
@@ -355,6 +357,8 @@ git:
         let yaml = r#"
 opencode:
   pw: secret123
+  cwd: /test-work
+  project: test-project
 git:
   repository: https://github.com/user/repo
   directory: /test-dir
@@ -428,6 +432,8 @@ git:
 opencode:
   url: http://localhost:8081
   pw: ${env:GA_TEST_PW}
+  cwd: /test-work
+  project: test-project
 git:
   repository: https://github.com/cwd/repo
   directory: /test-dir
@@ -517,6 +523,7 @@ git:
             trello_api_key: None,
             trello_token: None,
             trello_board_id: None,
+            token: None,
         };
         let yaml = serde_yaml::to_string(&gs).unwrap();
         let parsed: GitSection = serde_yaml::from_str(&yaml).unwrap();
@@ -619,23 +626,20 @@ git:
                 trello_api_key: None,
                 trello_token: None,
                 trello_board_id: None,
+                token: Some("ghp_testtoken123456789".to_string()),
             },
             concurrency: Some(4),
-            github_token: Some("ghp_testtoken123456789".to_string()),
             opencode: None,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: GitAutomateConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.concurrency, Some(4));
-        assert_eq!(
-            parsed.github_token.as_deref(),
-            Some("ghp_testtoken123456789")
-        );
+        assert_eq!(parsed.git.token.as_deref(), Some("ghp_testtoken123456789"));
     }
 
     // --- github_token substitution tests ---
 
-    // Test: parse_config with githubToken: ${env:VAR} → github_token is substituted
+    // Test: parse_config with git.token: ${env:VAR} → git.token is substituted
     #[test]
     fn parse_config_substitutes_github_token() {
         unsafe {
@@ -646,7 +650,7 @@ git:
 git:
   repository: https://github.com/user/repo
   directory: /test-dir
-githubToken: ${{env:{}}}
+  token: ${{env:{}}}
 ",
             ENV_GH_TOKEN
         );
@@ -656,12 +660,12 @@ githubToken: ${{env:{}}}
 
         let config = parse_config(tmp.path()).unwrap();
         assert_eq!(
-            config.github_token.as_deref(),
+            config.git.token.as_deref(),
             Some("ghp_from_env_substitution")
         );
     }
 
-    // Test: parse_config without githubToken → github_token is None
+    // Test: parse_config without git.token → git.token is None
     #[test]
     fn parse_config_without_github_token_is_none() {
         let yaml = r#"
@@ -674,10 +678,10 @@ git:
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.github_token, None);
+        assert_eq!(config.git.token, None);
     }
 
-    // Test: parse_config with githubToken: ${env:VAR} where VAR unset → github_token is Some("")
+    // Test: parse_config with git.token: ${env:VAR} where VAR unset → git.token is Some("")
     #[test]
     fn parse_config_github_token_unset_var_becomes_empty_string() {
         unsafe {
@@ -688,7 +692,7 @@ git:
 git:
   repository: https://github.com/user/repo
   directory: /test-dir
-githubToken: ${{env:{}}}
+  token: ${{env:{}}}
 ",
             ENV_GH_TOKEN_UNSET
         );
@@ -697,7 +701,7 @@ githubToken: ${{env:{}}}
         tmp.flush().unwrap();
 
         let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.github_token.as_deref(), Some(""));
+        assert_eq!(config.git.token.as_deref(), Some(""));
     }
 
     // Test: parse_config with ALL env vars substituted simultaneously
@@ -712,15 +716,17 @@ githubToken: ${{env:{}}}
         let yaml = format!(
             "
 concurrency: 2
-githubToken: ${{env:{}}}
 opencode:
   url: ${{env:{}}}
   pw: ${{env:{}}}
+  cwd: /test-work
+  project: test-project
 git:
   repository: https://github.com/user/repo
   directory: /test-dir
+  token: ${{env:{}}}
 ",
-            ENV_GH_TOKEN_ALL, ENV_OPENCODE_URL_ALL, ENV_PW_ALL
+            ENV_OPENCODE_URL_ALL, ENV_PW_ALL, ENV_GH_TOKEN_ALL
         );
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -728,7 +734,7 @@ git:
 
         let config = parse_config(tmp.path()).unwrap();
         assert_eq!(config.concurrency, Some(2));
-        assert_eq!(config.github_token.as_deref(), Some("ghp_all_vars_work"));
+        assert_eq!(config.git.token.as_deref(), Some("ghp_all_vars_work"));
         assert_eq!(
             config.opencode.as_ref().unwrap().url,
             "http://localhost:8081"
@@ -737,7 +743,7 @@ git:
     }
 
     // Test: parse_config with global opencode.pw using ${env:VAR}
-    // alongside top-level githubToken — both substituted independently
+    // alongside git.token — both substituted independently
     #[test]
     fn parse_config_substitutes_global_opencode_pw() {
         unsafe {
@@ -748,6 +754,8 @@ git:
 opencode:
   url: http://localhost:8081
   pw: ${{env:{}}}
+  cwd: /test-work
+  project: test-project
 git:
   repository: https://github.com/user/repo
   directory: /test-dir

@@ -788,7 +788,6 @@ mod tests {
         let mut config = GitAutomateConfig {
             git: GitSection::default(),
             concurrency: None,
-            github_token: None,
             opencode: None,
         };
 
@@ -1021,6 +1020,7 @@ mod tests {
             trello_api_key: None,
             trello_token: None,
             trello_board_id: None,
+            token: None,
         }
     }
 
@@ -1029,7 +1029,6 @@ mod tests {
         GitAutomateConfig {
             git,
             concurrency: None,
-            github_token: None,
             opencode: None,
         }
     }
@@ -1346,6 +1345,7 @@ mod tests {
             trello_api_key: None,
             trello_token: None,
             trello_board_id: None,
+            token: None,
         };
 
         let result = resolve_context(&deps, "test-project", &git_section).await;
@@ -1957,7 +1957,6 @@ mod tests {
         let config = GitAutomateConfig {
             git: GitSection::default(),
             concurrency: None,
-            github_token: None,
             opencode: None,
         };
         let deps = WorkflowContext {
