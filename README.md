@@ -28,14 +28,18 @@ git-automate health --url http://localhost:8081 --pw <password>
 The config file (`git-automate.yml`) defines a git project to monitor:
 
 ```yaml
+concurrency: 4
 opencode:
   url: http://localhost:8081
   pw: ${env:OPENCODE_PW}
+  cwd: /path/to/repo
+  project: my-repo
 git:
   repository: https://github.com/owner/repo
   projectId: 1
   titlePattern: '@ai.*'
   directory: /path/to/repo
+  token: ${env:GITHUB_TOKEN}
 ```
 
 ### Environment Variables
@@ -54,9 +58,12 @@ set in the environment take precedence.
 | `concurrency`    | no       | Limits total active OpenCode agent sessions. When set, skips session creation if active session count >= limit (default: no limit) |
 | `opencode.url`   | yes      | OpenCode server base URL                         |
 | `opencode.pw`    | yes      | OpenCode server password (use `${env:VAR}`)      |
+| `opencode.cwd`   | yes      | Working directory (existing checkout) for OpenCode agent sessions — **required** |
+| `opencode.project` | yes    | OpenCode project name — **required**             |
 | `repository`     | yes      | GitHub repo URL or `owner/repo` shorthand        |
 | `projectId`      | no       | GitHub Project V2 ID (created automatically if absent) |
-| `directory`      | yes      | Working directory (existing checkout) for OpenCode agent sessions — **required** |
+| `directory`      | yes      | Working directory (existing checkout) — **required** |
+| `token`          | no       | GitHub API token (use `${env:GITHUB_TOKEN}`) — falls back to `GITHUB_TOKEN` env var |
 | `titlePattern`   | no       | Regex to match issue titles for triage (default `@ai.*`) |
 
 ## Workflow
