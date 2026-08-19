@@ -48,6 +48,8 @@ pub enum WorkflowError {
     Io(#[from] std::io::Error),
     #[error("GitHub error: {0}")]
     GitHub(#[from] GitHubError),
+    #[error("OpenCode concurrency limit exceeded")]
+    ConcurrencyExceeded,
     #[error("{0}")]
     Other(String),
 }
@@ -186,6 +188,45 @@ pub fn extract_session_id(field_values: &BTreeMap<String, Option<String>>) -> Op
         .get("sessionId")
         .and_then(|v| v.as_deref())
         .map(String::from)
+}
+
+/// Extract thread IDs from the `### Resolve threads` section in session messages.
+///
+/// Looks for a markdown heading `### Resolve threads` followed by a line
+/// containing comma-separated thread IDs (e.g. `TH_123, TH_456`).
+/// Returns the list of non-empty trimmed IDs.
+pub fn parse_resolve_threads(messages: &[String]) -> Vec<String> {
+    let mut in_section = false;
+
+    for line in messages {
+        if line.contains("### Resolve threads") {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if line.starts_with("###") || line.trim().starts_with("```") {
+                break;
+            }
+            return line
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
+// ─── Branch naming ─────────────────────────────────────────────
+
+/// Build a branch name from the config's `branch_name` format template.
+/// Uses `{N}` as the placeholder for the issue/PR number.
+/// When the config field is unset, defaults to `"issue-{N}"`.
+pub fn branch_name_for_issue(issue_number: i64, git: &GitSection) -> String {
+    let template = git.branch_name.as_deref().unwrap_or("issue-{N}");
+    template.replace("{N}", &issue_number.to_string())
 }
 
 // ─── Config helpers ───────────────────────────────────────────
@@ -1020,6 +1061,7 @@ mod tests {
             trello_token: None,
             trello_board_id: None,
             token: None,
+            branch_name: None,
         }
     }
 
@@ -1344,6 +1386,7 @@ mod tests {
             trello_token: None,
             trello_board_id: None,
             token: None,
+            branch_name: None,
         };
 
         let result = resolve_context(&deps, "test-project", &git_section).await;
@@ -1964,5 +2007,82 @@ mod tests {
         let cd = deps.context_deps();
         assert!(cd.github.is_none());
         assert!(cd.config.git.repository.is_empty());
+    }
+
+    // ── parse_resolve_threads tests ─────────────────────────────
+
+    #[test]
+    fn parse_resolve_threads_empty_messages() {
+        let messages: Vec<String> = vec![];
+        let result = parse_resolve_threads(&messages);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_resolve_threads_no_section() {
+        let messages = vec!["Just some text".to_string()];
+        let result = parse_resolve_threads(&messages);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_resolve_threads_single_thread() {
+        let messages = vec!["### Resolve threads".to_string(), "TH_123".to_string()];
+        let result = parse_resolve_threads(&messages);
+        assert_eq!(result, vec!["TH_123"]);
+    }
+
+    #[test]
+    fn parse_resolve_threads_multiple_threads() {
+        let messages = vec![
+            "### Resolve threads".to_string(),
+            "TH_123, TH_456, TH_789".to_string(),
+        ];
+        let result = parse_resolve_threads(&messages);
+        assert_eq!(result, vec!["TH_123", "TH_456", "TH_789"]);
+    }
+
+    #[test]
+    fn parse_resolve_threads_comma_separated_with_spaces() {
+        let messages = vec![
+            "### Resolve threads".to_string(),
+            "  TH_1 , TH_2 ,TH_3  ".to_string(),
+        ];
+        let result = parse_resolve_threads(&messages);
+        assert_eq!(result, vec!["TH_1", "TH_2", "TH_3"]);
+    }
+
+    #[test]
+    fn parse_resolve_threads_stops_at_next_heading() {
+        let messages = vec![
+            "### Resolve threads".to_string(),
+            "TH_123".to_string(),
+            "### Other section".to_string(),
+            "TH_456".to_string(),
+        ];
+        let result = parse_resolve_threads(&messages);
+        assert_eq!(result, vec!["TH_123"]);
+    }
+
+    #[test]
+    fn parse_resolve_threads_stops_at_code_block() {
+        let messages = vec![
+            "### Resolve threads".to_string(),
+            "TH_123".to_string(),
+            "```".to_string(),
+            "TH_456".to_string(),
+        ];
+        let result = parse_resolve_threads(&messages);
+        assert_eq!(result, vec!["TH_123"]);
+    }
+
+    #[test]
+    fn parse_resolve_threads_empty_lines_ignored() {
+        let messages = vec![
+            "### Resolve threads".to_string(),
+            "TH_123, , TH_456".to_string(),
+        ];
+        let result = parse_resolve_threads(&messages);
+        assert_eq!(result, vec!["TH_123", "TH_456"]);
     }
 }

@@ -56,6 +56,8 @@ pub struct GitSection {
     pub trello_board_id: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(rename = "branchName", default)]
+    pub branch_name: Option<String>,
 }
 
 fn default_issue_provider() -> String {
@@ -525,6 +527,7 @@ git:
             trello_token: None,
             trello_board_id: None,
             token: None,
+            branch_name: None,
         };
         let yaml = serde_yaml::to_string(&gs).unwrap();
         let parsed: GitSection = serde_yaml::from_str(&yaml).unwrap();
@@ -628,6 +631,7 @@ git:
                 trello_token: None,
                 trello_board_id: None,
                 token: Some("ghp_testtoken123456789".to_string()),
+                branch_name: None,
             },
             opencode: Some(OpencodeConfig {
                 url: "http://localhost:8081".to_string(),
@@ -809,5 +813,55 @@ git:
 
         let config = parse_config(tmp.path()).unwrap();
         assert_eq!(config.opencode.as_ref().unwrap().pw, "global_level_pw");
+    }
+
+    // Test: parse_config with branchName: "feat/issue-{N}" → branch_name = Some("feat/issue-{N}")
+    #[test]
+    fn parse_config_with_branch_name() {
+        let yaml = r#"
+git:
+  repository: https://github.com/user/repo
+  branchName: "feat/issue-{N}"
+  directory: /test-dir
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(config.git.branch_name, Some("feat/issue-{N}".to_string()));
+    }
+
+    // Test: parse_config without branchName → branch_name is None
+    #[test]
+    fn parse_config_without_branch_name_is_none() {
+        let yaml = r#"
+git:
+  repository: https://github.com/user/repo
+  directory: /test-dir
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        assert_eq!(config.git.branch_name, None);
+    }
+
+    // Test: parse_config with branch-name (hyphen) → rejected by deny_unknown_fields
+    #[test]
+    fn parse_config_rejects_branch_name_hyphen() {
+        let yaml = r#"
+git:
+  repository: https://github.com/user/repo
+  branch-name: "feat/issue-{N}"
+  directory: /test-dir
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let result = parse_config(tmp.path());
+        assert!(matches!(result, Err(ConfigError::YamlParse { .. })));
     }
 }

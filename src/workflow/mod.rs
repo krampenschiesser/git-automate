@@ -171,7 +171,18 @@ impl Workflow {
     /// method always returns `Ok(())`.
     pub async fn run_all(&self) -> Result<(), WorkflowError> {
         for step in WorkflowStep::all() {
-            let _ = step.run(self).await;
+            match step.run(self).await {
+                Ok(()) => {}
+                Err(WorkflowError::ConcurrencyExceeded) => {
+                    tracing::info!(
+                        "Concurrency exceeded — skipping remaining steps for this cycle"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!("Step {:?} failed: {}", step, e);
+                }
+            }
         }
         Ok(())
     }
@@ -463,6 +474,7 @@ mod tests {
             trello_token: None,
             trello_board_id: None,
             token: None,
+            branch_name: None,
         }
     }
 
@@ -546,6 +558,7 @@ mod tests {
                     trello_token: None,
                     trello_board_id: None,
                     token: None,
+                    branch_name: None,
                 },
                 opencode: None,
             },
@@ -650,6 +663,7 @@ mod tests {
                     trello_token: None,
                     trello_board_id: None,
                     token: None,
+                    branch_name: None,
                 },
                 opencode: None,
             },
@@ -703,6 +717,7 @@ mod tests {
                     trello_token: None,
                     trello_board_id: None,
                     token: None,
+                    branch_name: None,
                 },
                 opencode: None,
             },
@@ -827,6 +842,7 @@ mod tests {
             trello_token: None,
             trello_board_id: None,
             token: None,
+            branch_name: None,
         };
 
         let deps = WorkflowContext {
@@ -922,6 +938,7 @@ mod tests {
             trello_token: None,
             trello_board_id: None,
             token: None,
+            branch_name: None,
         };
 
         let deps = WorkflowContext {
@@ -1014,6 +1031,7 @@ mod tests {
             trello_token: None,
             trello_board_id: None,
             token: None,
+            branch_name: None,
         };
 
         let deps = WorkflowContext {

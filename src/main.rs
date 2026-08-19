@@ -242,6 +242,8 @@ async fn serve(config_path: &Path, once: bool) -> Result<(), Box<dyn std::error:
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    let mut sigterm = sigterm.ok();
 
     loop {
         tokio::select! {
@@ -251,6 +253,16 @@ async fn serve(config_path: &Path, once: bool) -> Result<(), Box<dyn std::error:
                 }
             }
             _ = &mut ctrl_c => {
+                tracing::info!("Received shutdown signal, exiting");
+                break;
+            }
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
                 tracing::info!("Received shutdown signal, exiting");
                 break;
             }

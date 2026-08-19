@@ -1032,6 +1032,7 @@ fn failed_review_test_ctx(
         trello_token: None,
         trello_board_id: None,
         token: None,
+        branch_name: None,
     };
 
     let deps = WorkflowContext {
