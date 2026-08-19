@@ -479,9 +479,189 @@ pub async fn run_review_check(
         }
     }
 
+    check_review_outcomes(deps, ctx, oc).await?;
     run_failed_review_check(deps, ctx, oc).await?;
 
     Ok(())
+}
+
+/// Monitor completed review sessions, parse agent outcomes, and transition
+/// project item status accordingly.
+///
+/// Processes items in review states (Review Technical, Review Product, QA)
+/// whose sessions have completed. Outcome keywords in the last assistant
+/// message drive status transitions per the spec table.
+pub async fn check_review_outcomes(
+    deps: &WorkflowContext,
+    ctx: &ProjectContext,
+    oc: &OpencodeSessionConfig,
+) -> Result<(), WorkflowError> {
+    let github = deps
+        .github
+        .as_ref()
+        .ok_or_else(|| WorkflowError::NoGitHub(ctx.name.clone()))?;
+
+    let field_ids = resolve_field_ids(github, &ctx.project_id).await?;
+    let session_field_id = field_ids
+        .session_field_id
+        .ok_or_else(|| WorkflowError::NoSessionField(ctx.project_id.clone()))?;
+
+    let project_items = github.list_project_items(&ctx.project_id).await?;
+    if project_items.is_empty() {
+        tracing::info!("{}: no project items for review outcome check", ctx.name);
+        return Ok(());
+    }
+
+    let status_field = github.get_project_status_field(&ctx.project_id).await?;
+
+    let Some(status_field) = status_field else {
+        tracing::warn!(
+            "{}: no Status field found for review outcome check",
+            ctx.name
+        );
+        return Ok(());
+    };
+
+    let prod_option_id = resolve_option_id(&status_field.options, "Review Product");
+    let qa_option_id = resolve_option_id(&status_field.options, "QA");
+    let in_dev_option_id = resolve_option_id(&status_field.options, "In Development");
+    let done_option_id = resolve_option_id(&status_field.options, "Done");
+
+    let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
+    let active_sessions = oc_client.get_session_statuses().await.unwrap_or_else(|e| {
+        tracing::warn!(
+            "{}: could not fetch OpenCode session statuses for review outcome check: {}",
+            ctx.name,
+            e
+        );
+        std::collections::HashMap::new()
+    });
+
+    let mut item_values = Vec::new();
+    for item in &project_items {
+        item_values.push(github.get_project_item_values(&item.id).await?);
+    }
+
+    for state in &REVIEW_STATES {
+        for (item, values) in project_items.iter().zip(&item_values) {
+            let current_status = values.get("Status").and_then(|v| v.as_deref());
+            if current_status != Some(state.status()) {
+                continue;
+            }
+
+            let session_id = match extract_session_id(values) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            if active_sessions.contains_key(&session_id) {
+                continue;
+            }
+
+            let messages = match oc_client
+                .get_session_messages(&session_id, Some(oc.directory.as_str()))
+                .await
+            {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    tracing::warn!(
+                        "{}: could not fetch messages for session {}: {}",
+                        ctx.name,
+                        session_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let last_assistant = messages.iter().rev().find(|msg| msg.info.role != "user");
+            let Some(last_assistant) = last_assistant else {
+                continue;
+            };
+
+            let text = last_assistant.text();
+            let text_lower = text.to_lowercase();
+
+            let outcome = parse_review_outcome(&text_lower);
+            let Some(outcome) = outcome else {
+                continue;
+            };
+
+            tracing::info!(
+                "{}: review session {} for issue #{} completed with outcome: {:?}",
+                ctx.name,
+                session_id,
+                item.content_number,
+                outcome
+            );
+
+            let new_status = match (state, outcome) {
+                (ReviewState::Technical, ReviewOutcome::Approve) => prod_option_id.clone(),
+                (ReviewState::Technical, ReviewOutcome::RequestChanges) => {
+                    github
+                        .update_project_item_session_id(
+                            &ctx.project_id,
+                            &item.id,
+                            &session_field_id,
+                            None,
+                        )
+                        .await?;
+                    continue;
+                }
+                (ReviewState::Technical, ReviewOutcome::Escalate) => qa_option_id.clone(),
+                (ReviewState::Product, ReviewOutcome::Approve) => qa_option_id.clone(),
+                (ReviewState::Product, ReviewOutcome::RequestChanges) => in_dev_option_id.clone(),
+                (ReviewState::Qa, ReviewOutcome::Approve) => done_option_id.clone(),
+                (ReviewState::Qa, ReviewOutcome::RequestChanges) => in_dev_option_id.clone(),
+                _ => continue,
+            };
+
+            if let Some(ref option_id) = new_status {
+                github
+                    .update_project_item_status(
+                        &ctx.project_id,
+                        &item.id,
+                        &field_ids.status_field_id,
+                        option_id,
+                    )
+                    .await?;
+            }
+
+            github
+                .update_project_item_session_id(&ctx.project_id, &item.id, &session_field_id, None)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a review outcome from the lowercased message text.
+///
+/// Priority: Escalate > Approve > Request Changes.
+/// Returns `None` when no outcome keyword is found.
+fn parse_review_outcome(text: &str) -> Option<ReviewOutcome> {
+    let has_escalate = text.contains("escalate") || text.contains("escalation");
+    let has_approve = text.contains("approve") || text.contains("approved");
+    let has_changes = text.contains("request changes") || text.contains("needs changes");
+
+    if has_escalate {
+        Some(ReviewOutcome::Escalate)
+    } else if has_approve {
+        Some(ReviewOutcome::Approve)
+    } else if has_changes {
+        Some(ReviewOutcome::RequestChanges)
+    } else {
+        None
+    }
+}
+
+/// Outcome of a review session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewOutcome {
+    Approve,
+    RequestChanges,
+    Escalate,
 }
 
 /// Detect review sessions that completed without a status transition and
@@ -3111,5 +3291,542 @@ mod tests {
 
         let result = run_failed_review_check(&deps, &ctx, &oc).await;
         assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    async fn mount_review_outcome_opencode_mocks(
+        server: &MockServer,
+        session_id: &str,
+        message_text: &str,
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/session/{}/message", session_id)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "info": {"id": "m1", "role": "user", "sessionID": session_id},
+                    "parts": [{"type": "text", "text": "Please review this PR"}]
+                },
+                {
+                    "info": {"id": "m2", "role": "assistant", "sessionID": session_id},
+                    "parts": [{"type": "text", "text": message_text}]
+                }
+            ])))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_technical_approve_transitions_to_product() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix login", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Technical", "review-session-1");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(&oc_mock, "review-session-1", "I approve this PR")
+            .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_technical_request_changes_clears_session() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix login", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Technical", "review-session-1");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(
+            &oc_mock,
+            "review-session-1",
+            "Needs changes in auth module",
+        )
+        .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_technical_escalate_transitions_to_qa() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix login", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Technical", "review-session-1");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(
+            &oc_mock,
+            "review-session-1",
+            "This needs escalation to QA",
+        )
+        .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_product_approve_transitions_to_qa() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Update pricing", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Product", "review-session-2");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(
+            &oc_mock,
+            "review-session-2",
+            "Approved from product perspective",
+        )
+        .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_product_request_changes_transitions_to_in_dev() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Update pricing", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Product", "review-session-2");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(
+            &oc_mock,
+            "review-session-2",
+            "Request changes to pricing logic",
+        )
+        .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_qa_approve_transitions_to_done() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Test integration", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("QA", "review-session-3");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(
+            &oc_mock,
+            "review-session-3",
+            "All tests pass, approved",
+        )
+        .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_qa_request_changes_transitions_to_in_dev() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Test integration", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("QA", "review-session-3");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(
+            &oc_mock,
+            "review-session-3",
+            "Needs changes in test coverage",
+        )
+        .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_no_match_skips() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix login", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Technical", "review-session-1");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(
+            &oc_mock,
+            "review-session-1",
+            "The code looks reasonable",
+        )
+        .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_active_session_is_skipped() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix login", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Technical", "review-session-1");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "review-session-1": {"status": "busy"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/review-session-1/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-42" } }
+                }
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_no_github_client_returns_error() {
+        let deps = make_deps(None);
+        let ctx = make_context();
+        let oc = make_oc_config("http://localhost:8081".to_string());
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    #[tokio::test]
+    async fn review_outcome_escalate_priority_over_approve() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix login", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = review_field_values("Review Technical", "review-session-1");
+
+        mount_review_github_mocks(
+            &mock,
+            project_items,
+            issues,
+            field_values,
+            all_status_options(),
+        )
+        .await;
+        mount_review_outcome_opencode_mocks(
+            &oc_mock,
+            "review-session-1",
+            "I approve but escalate to qa",
+        )
+        .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn review_outcome_no_items_early_return() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([]);
+        let empty_items = json!({"nodes": []});
+        let empty_field_values = json!({"nodes": []});
+        let status_options = all_status_options();
+
+        mount_review_github_mocks(
+            &mock,
+            empty_items,
+            issues,
+            empty_field_values,
+            status_options,
+        )
+        .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let result = check_review_outcomes(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_outcome_approve_detected() {
+        assert_eq!(
+            parse_review_outcome("i approve this pull request"),
+            Some(ReviewOutcome::Approve)
+        );
+        assert_eq!(
+            parse_review_outcome("the code is approved"),
+            Some(ReviewOutcome::Approve)
+        );
+    }
+
+    #[test]
+    fn parse_outcome_request_changes_detected() {
+        assert_eq!(
+            parse_review_outcome("request changes in the auth module"),
+            Some(ReviewOutcome::RequestChanges)
+        );
+        assert_eq!(
+            parse_review_outcome("needs changes to the tests"),
+            Some(ReviewOutcome::RequestChanges)
+        );
+    }
+
+    #[test]
+    fn parse_outcome_escalate_detected() {
+        assert_eq!(
+            parse_review_outcome("this needs escalation"),
+            Some(ReviewOutcome::Escalate)
+        );
+        assert_eq!(
+            parse_review_outcome("escalate to qa team"),
+            Some(ReviewOutcome::Escalate)
+        );
+    }
+
+    #[test]
+    fn parse_outcome_no_match_returns_none() {
+        assert!(parse_review_outcome("the code looks reasonable").is_none());
+        assert!(parse_review_outcome("looks good to me").is_none());
+        assert!(parse_review_outcome("").is_none());
+    }
+
+    #[test]
+    fn parse_outcome_escalate_priority() {
+        assert_eq!(
+            parse_review_outcome("approve but escalate to qa"),
+            Some(ReviewOutcome::Escalate)
+        );
+    }
+
+    #[test]
+    fn parse_outcome_approve_priority_over_changes() {
+        assert_eq!(
+            parse_review_outcome("approve with some request changes"),
+            Some(ReviewOutcome::Approve)
+        );
     }
 }
