@@ -1,23 +1,28 @@
 //! Workflow checks.
 //!
-//! Implements three workflow checks that drive the automation loop:
+//! Implements four workflow checks that drive the automation loop:
 //! - `run_triage_check` — finds `@ai`-tagged issues, adds them to the project,
 //!   sets status to "Triage", and starts a triage OpenCode session.
 //! - `run_todo_check` — finds items with "Todo" status, creates branches if
 //!   needed, and starts a developer OpenCode session.
+//! - `run_dev_completion_check` — detects completed developer sessions in
+//!   "In Development" status, resolves review threads from session output,
+//!   and transitions the item to "Review Technical".
 //! - `run_review_check` — finds items in review states ("Review Technical",
 //!   "Review Product", "QA"), fills a prompt template, and starts a review
 //!   OpenCode session.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::types::IssueInfo;
 
 use super::helpers::{
-    ProjectContext, WorkflowContext, WorkflowError, extract_session_id, fill_prompt,
-    get_issue_body_map, issue_body_or_title, load_agent_template, load_prompt_template,
-    resolve_field_ids, resolve_option_id, resolve_status_option_and_session,
+    ProjectContext, WorkflowContext, WorkflowError, branch_name_for_issue, extract_session_id,
+    fill_prompt, get_issue_body_map, issue_body_or_title, load_agent_template,
+    load_prompt_template, parse_resolve_threads, resolve_field_ids, resolve_option_id,
+    resolve_status_option_and_session,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -75,6 +80,12 @@ pub struct OpencodeSessionConfig {
     pub concurrency: HashMap<String, usize>,
 }
 
+// ─── Concurrency dedup state ──────────────────────────────────
+
+/// Tracks whether OpenCode concurrency capacity has been exceeded during the
+/// current daemon cycle. Reset to `false` on daemon restart (static variable).
+static CAPACITY_EXCEEDED: AtomicBool = AtomicBool::new(false);
+
 // ─── start_opencode_session ────────────────────────────────────
 
 /// Start an OpenCode session with the given system prompt and user message.
@@ -106,17 +117,16 @@ async fn start_opencode_session(
         for (model_key, limit) in concurrency {
             let active = counts.get(model_key).copied().unwrap_or(0);
             if active >= *limit {
-                tracing::warn!(
-                    "OpenCode active sessions for model {} ({}) >= concurrency limit ({}), skipping: {}",
-                    model_key,
-                    active,
-                    limit,
-                    title
-                );
-                return Err(WorkflowError::Other(format!(
-                    "concurrency limit ({}) reached for model {} — {} active sessions",
-                    limit, model_key, active
-                )));
+                if !CAPACITY_EXCEEDED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "OpenCode capacity exceeded for model {} ({} >= {}), skipping: {}",
+                        model_key,
+                        active,
+                        limit,
+                        title
+                    );
+                }
+                return Err(WorkflowError::ConcurrencyExceeded);
             }
         }
     }
@@ -134,6 +144,13 @@ async fn start_opencode_session(
         worktree.directory,
         workspace.id
     );
+    if CAPACITY_EXCEEDED.swap(false, Ordering::Relaxed) {
+        tracing::info!(
+            "OpenCode capacity available again, resuming workflow for {}",
+            title
+        );
+    }
+
     client
         .start_session_with_system(
             &worktree.directory,
@@ -304,7 +321,7 @@ pub async fn run_todo_check(
 
     for (item_id, issue_number) in &todo_items {
         let issue = issue_map.get(issue_number);
-        let branch_name = format!("issue-{}", issue_number);
+        let branch_name = branch_name_for_issue(*issue_number, &deps.config.git);
 
         let exists = github
             .branch_exists(&ctx.owner, &ctx.repo, &branch_name)
@@ -334,7 +351,7 @@ pub async fn run_todo_check(
         );
         let system_prompt = load_agent_template("developer")?;
         let template = load_prompt_template("developer")?;
-        let branch_name = format!("issue-{}", issue_number);
+        let branch_name = branch_name_for_issue(*issue_number, &deps.config.git);
         let values = HashMap::from([
             ("ISSUE_TITLE".to_string(), title.clone()),
             ("ISSUE_NUMBER".to_string(), issue_number.to_string()),
@@ -434,7 +451,7 @@ pub async fn run_review_check(
 
             let issue = issue_map.get(&item.content_number);
             let issue_number = item.content_number;
-            let branch_name = format!("issue-{}", issue_number);
+            let branch_name = branch_name_for_issue(issue_number, &deps.config.git);
 
             let filled_prompt = fill_prompt(
                 &template,
@@ -664,6 +681,134 @@ pub async fn run_failed_review_check(
     Ok(())
 }
 
+/// Detect completed developer sessions in "In Development" status, parse
+/// session output for `### Resolve threads`, resolve each thread via the
+/// GitHub API, and transition the item to "Review Technical".
+///
+/// If no `### Resolve threads` section is found, no resolution mutations
+/// fire but the issue still transitions to "Review Technical".
+pub async fn run_dev_completion_check(
+    deps: &WorkflowContext,
+    ctx: &ProjectContext,
+    oc: &OpencodeSessionConfig,
+) -> Result<(), WorkflowError> {
+    let github = deps
+        .github
+        .as_ref()
+        .ok_or_else(|| WorkflowError::NoGitHub(ctx.name.clone()))?;
+
+    let field_ids = resolve_field_ids(github, &ctx.project_id).await?;
+    let session_field_id = field_ids
+        .session_field_id
+        .ok_or_else(|| WorkflowError::NoSessionField(ctx.project_id.clone()))?;
+
+    let project_items = github.list_project_items(&ctx.project_id).await?;
+    if project_items.is_empty() {
+        tracing::info!("{}: no project items for dev completion check", ctx.name);
+        return Ok(());
+    }
+
+    let status_field = github.get_project_status_field(&ctx.project_id).await?;
+
+    let Some(status_field) = status_field else {
+        tracing::warn!(
+            "{}: no Status field found for dev completion check",
+            ctx.name
+        );
+        return Ok(());
+    };
+
+    let _in_dev_option_id = resolve_option_id(&status_field.options, "In Development");
+    let review_tech_option_id = resolve_option_id(&status_field.options, "Review Technical");
+
+    let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
+    let active_sessions = oc_client.get_session_statuses().await.unwrap_or_else(|e| {
+        tracing::warn!(
+            "{}: could not fetch OpenCode session statuses for dev completion check: {}",
+            ctx.name,
+            e
+        );
+        std::collections::HashMap::new()
+    });
+
+    let mut item_values = Vec::new();
+    for item in &project_items {
+        item_values.push(github.get_project_item_values(&item.id).await?);
+    }
+
+    for (item, values) in project_items.iter().zip(&item_values) {
+        let current_status = values.get("Status").and_then(|v| v.as_deref());
+        if current_status != Some("In Development") {
+            continue;
+        }
+
+        let session_id = match extract_session_id(values) {
+            Some(id) => id,
+            None => continue,
+        };
+
+        if active_sessions.contains_key(&session_id) {
+            continue;
+        }
+
+        tracing::info!(
+            "{}: developer session {} for issue #{} has completed, resolving threads",
+            ctx.name,
+            session_id,
+            item.content_number
+        );
+
+        let messages = oc_client
+            .get_session_messages(&session_id, None)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "{}: could not fetch session messages for {}: {}",
+                    ctx.name,
+                    session_id,
+                    e
+                );
+                Vec::new()
+            });
+        let thread_ids =
+            parse_resolve_threads(&messages.iter().map(|m| m.text()).collect::<Vec<_>>());
+
+        for thread_id in &thread_ids {
+            tracing::info!(
+                "{}: resolving review thread {} for issue #{}",
+                ctx.name,
+                thread_id,
+                item.content_number
+            );
+            if let Err(e) = github.resolve_review_thread(thread_id).await {
+                tracing::warn!(
+                    "{}: failed to resolve thread {}: {}",
+                    ctx.name,
+                    thread_id,
+                    e
+                );
+            }
+        }
+
+        github
+            .update_project_item_session_id(&ctx.project_id, &item.id, &session_field_id, None)
+            .await?;
+
+        if let Some(ref option_id) = review_tech_option_id {
+            github
+                .update_project_item_status(
+                    &ctx.project_id,
+                    &item.id,
+                    &field_ids.status_field_id,
+                    option_id,
+                )
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
 // ─── Tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -692,6 +837,7 @@ mod tests {
                 trello_token: None,
                 trello_board_id: None,
                 token: None,
+                branch_name: None,
             },
             owner: "owner".to_string(),
             repo: "repo".to_string(),
@@ -2267,7 +2413,7 @@ mod tests {
             start_opencode_session(&oc, "/dir", "title", "system", "message", &concurrency).await;
 
         assert!(result.is_err());
-        assert!(matches!(result, Err(WorkflowError::Other(_))));
+        assert!(matches!(result, Err(WorkflowError::ConcurrencyExceeded)));
     }
 
     // Test 17b: start_opencode_session proceeds when active sessions < concurrency limit
@@ -3177,5 +3323,290 @@ mod tests {
 
         let result = run_failed_review_check(&deps, &ctx, &oc).await;
         assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    // ── Dev Completion Check Tests ───────────────────────────────
+
+    fn in_dev_field_values(session_id: &str) -> serde_json::Value {
+        json!({
+            "nodes": [
+                single_select_field_value("Status", "In Development"),
+                text_field_value("sessionId", Some(session_id)),
+            ]
+        })
+    }
+
+    async fn mount_dev_completion_github_mocks(
+        server: &MockServer,
+        project_items: serde_json::Value,
+        issues: serde_json::Value,
+        field_values: serde_json::Value,
+    ) {
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": all_status_options()
+                        }
+                    }
+                }
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issues))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("items(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "items": project_items } }
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fieldValues(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "fieldValues": field_values } }
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-id" } }
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    // T19: Completed dev session with thread IDs → resolves threads, transitions to Review Technical
+    #[tokio::test]
+    async fn dev_completion_resolves_threads_and_transitions() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix bug", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = in_dev_field_values("dev-session-1");
+
+        mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/dev-session-1/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "info": {"role": "user", "sessionID": "dev-session-1"},
+                    "parts": [{"type": "text", "text": "Here is my work"}]
+                },
+                {
+                    "info": {"role": "assistant", "sessionID": "dev-session-1"},
+                    "parts": [{"type": "text", "text": "### Resolve threads\nTH_123, TH_456"}]
+                }
+            ])))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("resolveReviewThread"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "resolveReviewThread": { "thread": { "id": "TH_123" } } }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = run_dev_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T20: Completed dev session with no Resolve threads section → still transitions to Review Technical
+    #[tokio::test]
+    async fn dev_completion_no_threads_section_still_transitions() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix bug", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = in_dev_field_values("dev-session-2");
+
+        mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/dev-session-2/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "info": {"role": "assistant", "sessionID": "dev-session-2"},
+                    "parts": [{"type": "text", "text": "Done with the fix"}]
+                }
+            ])))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("resolveReviewThread"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "resolveReviewThread": { "thread": { "id": "x" } } }
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let result = run_dev_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T21: Active dev session → no action taken
+    #[tokio::test]
+    async fn dev_completion_active_session_ignored() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = in_dev_field_values("dev-session-1");
+
+        mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "dev-session-1": {"type": "busy"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/dev-session-1/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_dev_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T22: No GitHub client → returns NoGitHub error
+    #[tokio::test]
+    async fn dev_completion_no_github_client_returns_error() {
+        let deps = make_deps(None);
+        let ctx = make_context();
+        let oc = make_oc_config("http://localhost:8081".to_string());
+
+        let result = run_dev_completion_check(&deps, &ctx, &oc).await;
+        assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    // T23: Item not in In Development status → skipped
+    #[tokio::test]
+    async fn dev_completion_skips_non_in_dev_items() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = json!({
+            "nodes": [
+                single_select_field_value("Status", "Todo"),
+                text_field_value("sessionId", Some("dev-session-1")),
+            ]
+        });
+
+        mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_dev_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
     }
 }

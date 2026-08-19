@@ -44,6 +44,7 @@ pub fn project_with_opencode(_url: String) -> GitSection {
         trello_token: None,
         trello_board_id: None,
         token: None,
+        branch_name: None,
     }
 }
 
@@ -59,6 +60,7 @@ pub fn project_without_opencode() -> GitSection {
         trello_token: None,
         trello_board_id: None,
         token: None,
+        branch_name: None,
     }
 }
 
