@@ -1578,7 +1578,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("parentIssue"))
+            .and(body_string_contains("parent {"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {
                     "repository": {
@@ -1590,7 +1590,7 @@ mod tests {
                                     "title": "Parent issue",
                                     "body": "parent body",
                                     "state": "open",
-                                    "parentIssue": null
+                                    "parent": null
                                 },
                                 {
                                     "id": "i2",
@@ -1598,7 +1598,7 @@ mod tests {
                                     "title": "Sub-issue 1",
                                     "body": null,
                                     "state": "open",
-                                    "parentIssue": { "number": 1 }
+                                    "parent": { "number": 1 }
                                 },
                                 {
                                     "id": "i3",
@@ -1606,7 +1606,7 @@ mod tests {
                                     "title": "Sub-issue 2",
                                     "body": "child body",
                                     "state": "closed",
-                                    "parentIssue": { "number": 1 }
+                                    "parent": { "number": 1 }
                                 }
                             ]
                         }
@@ -1641,7 +1641,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("parentIssue"))
+            .and(body_string_contains("parent {"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {
                     "repository": {
@@ -1653,7 +1653,7 @@ mod tests {
                                     "title": "Issue 1",
                                     "body": "body",
                                     "state": "open",
-                                    "parentIssue": null
+                                    "parent": null
                                 }
                             ]
                         }
@@ -1680,7 +1680,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .and(body_string_contains("parentIssue"))
+            .and(body_string_contains("parent {"))
             .respond_with(ResponseTemplate::new(500).set_body_json(json!({
                 "message": "Internal Server Error"
             })))
