@@ -413,7 +413,7 @@ pub struct IssueWithParentNode {
     pub title: String,
     pub body: Option<String>,
     pub state: String,
-    #[serde(rename = "parentIssue")]
+    #[serde(rename = "parent")]
     pub parent_issue: Option<IssueParentRef>,
 }
 

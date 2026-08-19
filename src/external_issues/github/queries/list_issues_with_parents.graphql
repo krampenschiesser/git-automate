@@ -1,13 +1,13 @@
 query ListIssuesWithParents($owner: String!, $repo: String!) {
     repository(owner: $owner, name: $repo) {
-        issues(first: 100) {
+        issues(first: 100,states: [OPEN]) {
             nodes {
                 id
                 number
                 title
                 body
                 state
-                parentIssue {
+                parent {
                     number
                 }
             }
