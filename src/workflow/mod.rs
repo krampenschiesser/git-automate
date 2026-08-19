@@ -9,7 +9,6 @@ pub mod checks;
 pub mod helpers;
 
 use crate::config::GitSection;
-use crate::external_agent::opencode::AgentInfo;
 use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::ParsedRepo;
@@ -67,16 +66,6 @@ impl AgentName {
         }
     }
 }
-
-/// The six required OpenCode agents that must be installed.
-pub const REQUIRED_AGENTS: [AgentName; 6] = [
-    AgentName::Triage,
-    AgentName::TaskManager,
-    AgentName::Developer,
-    AgentName::Reviewer,
-    AgentName::Product,
-    AgentName::QA,
-];
 
 /// The seven workflow status options.
 #[derive(Debug, Clone, Copy)]
@@ -420,7 +409,7 @@ impl Workflow {
         helpers::ensure_session_id_field(github, project_id).await
     }
 
-    /// Check OpenCode server health and verify all required agents exist.
+    /// Check OpenCode server health.
     async fn check_opencode(&self, oc: &OpencodeSessionConfig) -> Result<(), WorkflowError> {
         let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
 
@@ -430,26 +419,6 @@ impl Workflow {
         }
 
         tracing::info!("OpenCode server at {} is healthy", oc.url);
-
-        let agents: Vec<AgentInfo> = client
-            .get_agents(Some(oc.directory.as_str()))
-            .await
-            .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
-
-        let agent_names: std::collections::HashSet<&str> =
-            agents.iter().map(|a| a.name.as_str()).collect();
-
-        let missing: Vec<&str> = REQUIRED_AGENTS
-            .iter()
-            .map(|a| a.as_str())
-            .filter(|a| !agent_names.contains(a))
-            .collect();
-
-        if !missing.is_empty() {
-            tracing::warn!("Missing required agents: {}", missing.join(", "));
-        } else {
-            tracing::info!("All required agents present");
-        }
         Ok(())
     }
 }
@@ -486,14 +455,13 @@ mod tests {
     // ── Constants tests ───────────────────────────────────────
 
     #[test]
-    fn required_agents_matches_ts() {
-        assert_eq!(REQUIRED_AGENTS.len(), 6);
-        assert_eq!(REQUIRED_AGENTS[0].as_str(), "git-automate-triage");
-        assert_eq!(REQUIRED_AGENTS[1].as_str(), "git-automate-taskmanager");
-        assert_eq!(REQUIRED_AGENTS[2].as_str(), "git-automate-developer");
-        assert_eq!(REQUIRED_AGENTS[3].as_str(), "git-automate-reviewer");
-        assert_eq!(REQUIRED_AGENTS[4].as_str(), "git-automate-product");
-        assert_eq!(REQUIRED_AGENTS[5].as_str(), "git-automate-qa");
+    fn agent_name_as_str_all_variants() {
+        assert_eq!(AgentName::Triage.as_str(), "git-automate-triage");
+        assert_eq!(AgentName::TaskManager.as_str(), "git-automate-taskmanager");
+        assert_eq!(AgentName::Developer.as_str(), "git-automate-developer");
+        assert_eq!(AgentName::Reviewer.as_str(), "git-automate-reviewer");
+        assert_eq!(AgentName::Product.as_str(), "git-automate-product");
+        assert_eq!(AgentName::QA.as_str(), "git-automate-qa");
     }
 
     #[test]
@@ -517,29 +485,26 @@ mod tests {
     #[test]
     fn agent_file_name_all_variants() {
         assert_eq!(
-            REQUIRED_AGENTS[0].as_file_name(),
+            AgentName::Triage.as_file_name(),
             "git-automate-triage.agent.md"
         );
         assert_eq!(
-            REQUIRED_AGENTS[1].as_file_name(),
+            AgentName::TaskManager.as_file_name(),
             "git-automate-taskmanager.agent.md"
         );
         assert_eq!(
-            REQUIRED_AGENTS[2].as_file_name(),
+            AgentName::Developer.as_file_name(),
             "git-automate-developer.agent.md"
         );
         assert_eq!(
-            REQUIRED_AGENTS[3].as_file_name(),
+            AgentName::Reviewer.as_file_name(),
             "git-automate-reviewer.agent.md"
         );
         assert_eq!(
-            REQUIRED_AGENTS[4].as_file_name(),
+            AgentName::Product.as_file_name(),
             "git-automate-product.agent.md"
         );
-        assert_eq!(
-            REQUIRED_AGENTS[5].as_file_name(),
-            "git-automate-qa.agent.md"
-        );
+        assert_eq!(AgentName::QA.as_file_name(), "git-automate-qa.agent.md");
     }
 
     // ── run_all ordering (test 1) ─────────────────────────────
@@ -1386,19 +1351,15 @@ mod tests {
                 "healthy": true,
                 "version": "1.0.0"
             })))
+            .expect(1)
             .mount(&mock)
             .await;
 
+        // Agent endpoint must NOT be called
         Mock::given(method("GET"))
             .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","mode":"subagent","native":true},
-                {"name":"git-automate-taskmanager","mode":"subagent","native":true},
-                {"name":"git-automate-developer","mode":"subagent","native":true},
-                {"name":"git-automate-reviewer","mode":"subagent","native":true},
-                {"name":"git-automate-product","mode":"subagent","native":true},
-                {"name":"git-automate-qa","mode":"subagent","native":true},
-            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(0)
             .mount(&mock)
             .await;
 
