@@ -1124,6 +1124,171 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ── ensure_status_options removes non-standard options (test 10a) ─
+
+    #[tokio::test]
+    async fn ensure_status_options_removes_non_standard() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock);
+
+        // 9 options: 7 standard + 2 extra
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                                {"id":"o8","name":"Blocked"},{"id":"o9","name":"Deferred"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // addProjectStatusOptions → expect 1 call with exactly 7 options
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2Field"))
+            .and(body_string_contains("Blocked"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": "should not receive Blocked"
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2Field"))
+            .and(body_string_contains("Deferred"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": "should not receive Deferred"
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        // Catch-all for the actual mutation call
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "x" } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let deps = make_deps(Some(client));
+        let workflow = Workflow::new(deps);
+        let result = workflow.ensure_status_options("PID-123").await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
+    // ── ensure_status_options removes and adds (test 10b) ────
+
+    #[tokio::test]
+    async fn ensure_status_options_removes_and_adds() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock);
+
+        // 8 options: 6 standard + 2 extra + 1 missing standard (Todo absent)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                                {"id":"o8","name":"Stale"},{"id":"o9","name":"Blocked"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "x" } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let deps = make_deps(Some(client));
+        let workflow = Workflow::new(deps);
+        let result = workflow.ensure_status_options("PID-123").await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
+    // ── ensure_status_options all present no mutation (test 10c) ─
+
+    #[tokio::test]
+    async fn ensure_status_options_all_present_no_mutation() {
+        let mock = MockServer::start().await;
+        let client = gh_client(&mock);
+
+        // Exactly 7 standard options
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // addProjectStatusOptions should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "x" } } }
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let deps = make_deps(Some(client));
+        let workflow = Workflow::new(deps);
+        let result = workflow.ensure_status_options("PID-123").await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
     // ── ensure_session_id_field when exists (test 11) ────────
 
     #[tokio::test]
@@ -1210,139 +1375,10 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── check_opencode when healthy (test 13) ────────────────
+    // ── check_opencode healthy calls only /global/health ──────
 
     #[tokio::test]
-    async fn check_opencode_healthy_checks_agents() {
-        let mock = MockServer::start().await;
-
-        // Mock health endpoint
-        Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": true,
-                "version": "1.0.0"
-            })))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        // Mock agent list → all 6 required agents
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-taskmanager","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-developer","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-reviewer","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-product","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-qa","description":"t","mode":"subagent","native":true},
-            ])))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        let oc = OpencodeSessionConfig {
-            url: mock.uri(),
-            pw: "test-pw".to_string(),
-            directory: "/test-work".to_string(),
-            project: None,
-            concurrency: HashMap::new(),
-        };
-
-        let deps = make_deps(None);
-        let workflow = Workflow::new(deps);
-        let result = workflow.check_opencode(&oc).await;
-
-        assert!(result.is_ok());
-        mock.verify().await;
-    }
-
-    // ── check_opencode when not healthy (test 14) ────────────
-
-    #[tokio::test]
-    async fn check_opencode_unhealthy_returns_early() {
-        let mock = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": false,
-                "version": "1.0.0"
-            })))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        // Agent endpoint should NOT be called
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .expect(0)
-            .mount(&mock)
-            .await;
-
-        let oc = OpencodeSessionConfig {
-            url: mock.uri(),
-            pw: "test-pw".to_string(),
-            directory: "/test-work".to_string(),
-            project: None,
-            concurrency: HashMap::new(),
-        };
-
-        let deps = make_deps(None);
-        let workflow = Workflow::new(deps);
-        let result = workflow.check_opencode(&oc).await;
-
-        assert!(result.is_ok());
-        mock.verify().await;
-    }
-
-    // ── check_opencode with missing agents (test 15) ─────────
-
-    #[tokio::test]
-    async fn check_opencode_missing_agents_warns() {
-        let mock = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": true,
-                "version": "1.0.0"
-            })))
-            .mount(&mock)
-            .await;
-
-        // Only 2 agents (missing 4)
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-developer","description":"t","mode":"subagent","native":true},
-            ])))
-            .mount(&mock)
-            .await;
-
-        let oc = OpencodeSessionConfig {
-            url: mock.uri(),
-            pw: "test-pw".to_string(),
-            directory: "/test-work".to_string(),
-            project: None,
-            concurrency: HashMap::new(),
-        };
-
-        let deps = make_deps(None);
-
-        let workflow = Workflow::new(deps);
-        let result = workflow.check_opencode(&oc).await;
-
-        assert!(result.is_ok());
-    }
-
-    // ── check_opencode with all agents present (test 16) ─────
-
-    #[tokio::test]
-    async fn check_opencode_all_agents_succeeds() {
+    async fn check_opencode_healthy_calls_only_health_endpoint() {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))

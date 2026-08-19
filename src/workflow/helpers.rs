@@ -388,28 +388,36 @@ pub async fn ensure_status_options(
         .await?
         .ok_or_else(|| WorkflowError::NoStatusField(project_id.to_string()))?;
 
-    let existing: HashSet<&str> = status_field
+    let standard_names: HashSet<&str> = WorkflowStatus::all().iter().map(|s| s.as_str()).collect();
+
+    let kept: Vec<&StatusOption> = status_field
         .options
         .iter()
-        .map(|o| o.name.as_str())
+        .filter(|o| standard_names.contains(o.name.as_str()))
         .collect();
 
-    let all_options: Vec<Value> = status_field
-        .options
+    let kept_names: HashSet<&str> = kept.iter().map(|o| o.name.as_str()).collect();
+    let missing: Vec<Value> = WorkflowStatus::all()
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|name| !kept_names.contains(*name))
+        .map(|name| json!({ "name": name, "color": "GRAY", "description": "" }))
+        .collect();
+
+    let missing_count = missing.len();
+    let all_options: Vec<Value> = kept
         .iter()
         .map(|o| json!({ "id": o.id, "name": o.name, "color": "GRAY", "description": "" }))
-        .chain(
-            WorkflowStatus::all()
-                .iter()
-                .map(|s| s.as_str())
-                .filter(|opt| !existing.contains(opt))
-                .map(|name| json!({ "name": name, "color": "GRAY", "description": "" })),
-        )
+        .chain(missing)
         .collect();
 
-    let missing_count = all_options.len() - status_field.options.len();
-    if missing_count > 0 {
-        tracing::info!("Adding {} status options", missing_count);
+    if all_options.len() != status_field.options.len() {
+        tracing::info!(
+            "Updating {} status options (removed {}, added {})",
+            all_options.len(),
+            status_field.options.len() - kept.len(),
+            missing_count,
+        );
         github
             .add_project_status_options(&status_field.id, &all_options)
             .await?;
