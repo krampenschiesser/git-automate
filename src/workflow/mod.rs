@@ -333,7 +333,7 @@ impl Workflow {
             pw: opencode.pw.clone(),
             directory: opencode.cwd.clone(),
             project: Some(opencode.project.clone()),
-            concurrency: opencode.concurrency.clone(),
+            concurrency: opencode.concurrency,
         }
     }
 
@@ -1390,15 +1390,15 @@ mod tests {
             pw: "test-pw".to_string(),
             directory: "/test-work".to_string(),
             project: None,
-            concurrency: HashMap::new(),
+            concurrency: None,
         };
 
         let deps = make_deps(None);
-
         let workflow = Workflow::new(deps);
         let result = workflow.check_opencode(&oc).await;
 
         assert!(result.is_ok());
+        mock.verify().await;
     }
 
     // ── run_all with no projects returns Ok ───────────────────

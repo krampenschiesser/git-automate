@@ -2,7 +2,6 @@ use regex::Regex;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
@@ -25,7 +24,7 @@ pub struct OpencodeConfig {
     pub cwd: String,
     pub project: String,
     #[serde(default)]
-    pub concurrency: HashMap<String, usize>,
+    pub concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -564,18 +563,16 @@ git:
 
     // --- concurrency config tests ---
 
-    // Test: parse_config with opencode.concurrency → hashmap with entries
+    // Test: parse_config with opencode.concurrency → Some(limit)
     #[test]
-    fn parse_config_opencode_concurrency_hashmap() {
+    fn parse_config_opencode_concurrency_some() {
         let yaml = r#"
 opencode:
   url: http://localhost:8081
   pw: secret
   cwd: /test-work
   project: test-project
-  concurrency:
-    myprovider/slow: 2
-    myprovider/fast: 4
+  concurrency: 5
 git:
   repository: https://github.com/user/repo
   directory: /test-dir
@@ -586,13 +583,12 @@ git:
 
         let config = parse_config(tmp.path()).unwrap();
         let oc = config.opencode.as_ref().unwrap();
-        assert_eq!(oc.concurrency.get("myprovider/slow"), Some(&2));
-        assert_eq!(oc.concurrency.get("myprovider/fast"), Some(&4));
+        assert_eq!(oc.concurrency, Some(5));
     }
 
-    // Test: parse_config without opencode.concurrency → empty HashMap
+    // Test: parse_config without opencode.concurrency → None
     #[test]
-    fn parse_config_opencode_concurrency_defaults_empty() {
+    fn parse_config_opencode_concurrency_defaults_none() {
         let yaml = r#"
 opencode:
   url: http://localhost:8081
@@ -609,14 +605,12 @@ git:
 
         let config = parse_config(tmp.path()).unwrap();
         let oc = config.opencode.as_ref().unwrap();
-        assert!(oc.concurrency.is_empty());
+        assert_eq!(oc.concurrency, None);
     }
 
     // Test: git_automate_config_serde_round_trip_with_opencode_concurrency
     #[test]
     fn git_automate_config_serde_round_trip_concurrency() {
-        let mut concurrency = HashMap::new();
-        concurrency.insert("myprovider/fast".to_string(), 4);
         let config = GitAutomateConfig {
             git: GitSection {
                 repository: String::new(),
@@ -634,50 +628,13 @@ git:
                 pw: "pw".to_string(),
                 cwd: "/test-work".to_string(),
                 project: "test-project".to_string(),
-                concurrency,
+                concurrency: Some(4),
             }),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: GitAutomateConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(
-            parsed
-                .opencode
-                .as_ref()
-                .unwrap()
-                .concurrency
-                .get("myprovider/fast"),
-            Some(&4)
-        );
+        assert_eq!(parsed.opencode.as_ref().unwrap().concurrency, Some(4));
         assert_eq!(parsed.git.token.as_deref(), Some("ghp_testtoken123456789"));
-    }
-
-    // Test: parse_config_opencode_concurrency_hashmap
-    #[test]
-    fn parse_config_opencode_concurrency_hashmap_multi_entries() {
-        let yaml = r#"
-opencode:
-  url: http://localhost:8081
-  pw: secret
-  cwd: /test-work
-  project: test-project
-  concurrency:
-    model/a: 1
-    model/b: 2
-    model/c: 3
-git:
-  repository: https://github.com/user/repo
-  directory: /test-dir
-"#;
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(yaml.as_bytes()).unwrap();
-        tmp.flush().unwrap();
-
-        let config = parse_config(tmp.path()).unwrap();
-        let oc = config.opencode.as_ref().unwrap();
-        assert_eq!(oc.concurrency.len(), 3);
-        assert_eq!(oc.concurrency.get("model/a"), Some(&1));
-        assert_eq!(oc.concurrency.get("model/b"), Some(&2));
-        assert_eq!(oc.concurrency.get("model/c"), Some(&3));
     }
 
     // --- github_token substitution tests ---
