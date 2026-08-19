@@ -176,6 +176,23 @@ impl Workflow {
         Ok(())
     }
 
+    /// Run polling checks: opencode → triage → todo → review (skips setup).
+    ///
+    /// Setup runs only once at startup via [`Workflow::run_all`]; subsequent
+    /// poll cycles call this method instead.
+    ///
+    /// Each sub-check catches and logs its own errors internally, so this
+    /// method always returns `Ok(())`.
+    pub async fn run_all_poll(&self) -> Result<(), WorkflowError> {
+        for step in WorkflowStep::all()
+            .into_iter()
+            .skip_while(|s| matches!(s, WorkflowStep::Setup))
+        {
+            let _ = step.run(self).await;
+        }
+        Ok(())
+    }
+
     /// For each project: parse the repo URL, create the GitHub project if
     /// missing, ensure status options, and ensure the sessionId field.
     pub async fn run_setup_check(&self) -> Result<(), WorkflowError> {

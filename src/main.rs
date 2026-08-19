@@ -7,7 +7,7 @@
 //!   - `GITHUB_TOKEN` unset/empty → **exit** (fail fast).
 //!   - Logging goes through `tracing` with a default `FmtSubscriber`.
 //!   - Startup `run_all()` → catch + log `"Startup runAll failed: {e}"`.
-//!   - Polling `run_all()` → catch + log `"Polling runAll failed: {e}"`.
+//!   - Polling `run_all_poll()` → catch + log `"Polling runAll failed: {e}"`.
 //!   - SIGINT/SIGTERM → `"Received shutdown signal, exiting"`, break.
 
 use std::collections::HashMap;
@@ -243,16 +243,45 @@ async fn serve(config_path: &Path, once: bool) -> Result<(), Box<dyn std::error:
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                if let Err(e) = workflow.run_all().await {
-                    tracing::error!("Polling runAll failed: {}", e);
+    #[cfg(unix)]
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    tokio::pin!(terminate);
+
+    #[cfg(unix)]
+    {
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = workflow.run_all_poll().await {
+                        tracing::error!("Polling runAll failed: {}", e);
+                    }
+                }
+                _ = &mut ctrl_c => {
+                    tracing::info!("Received shutdown signal, exiting");
+                    break;
+                }
+                _ = terminate.recv() => {
+                    tracing::info!("Received shutdown signal, exiting");
+                    break;
                 }
             }
-            _ = &mut ctrl_c => {
-                tracing::info!("Received shutdown signal, exiting");
-                break;
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = workflow.run_all_poll().await {
+                        tracing::error!("Polling runAll failed: {}", e);
+                    }
+                }
+                _ = &mut ctrl_c => {
+                    tracing::info!("Received shutdown signal, exiting");
+                    break;
+                }
             }
         }
     }
