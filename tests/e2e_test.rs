@@ -187,6 +187,7 @@ async fn e2e_triage_flow_creates_session() {
         config: config.clone(),
         github: Some(github.clone()),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let workflow = Workflow::new(deps);
@@ -394,6 +395,7 @@ async fn e2e_full_workflow_state_flow() {
         config: config.clone(),
         github: Some(github.clone()),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);
 
@@ -725,6 +727,7 @@ async fn e2e_failed_review_recovery_flow() {
         config: config.clone(),
         github: Some(github.clone()),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);
 

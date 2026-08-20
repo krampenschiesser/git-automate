@@ -112,6 +112,7 @@ async fn setup(config_path: &Path) -> Result<Workflow, Box<dyn std::error::Error
         config,
         github: Some(github),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
     let workflow = Workflow::new(deps);
 

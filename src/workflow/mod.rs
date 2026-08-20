@@ -16,7 +16,8 @@ use crate::external_issues::github::types::ParsedRepo;
 
 use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
 use self::helpers::{
-    WorkflowContext, WorkflowError, resolve_context, resolve_project_id_cached, write_project_id,
+    LogLevel, WorkflowContext, WorkflowError, log_deduped, resolve_context,
+    resolve_project_id_cached, write_project_id,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -145,6 +146,16 @@ impl WorkflowStep {
         ]
     }
 
+    pub fn name(&self) -> &'static str {
+        match self {
+            WorkflowStep::Setup => "setup",
+            WorkflowStep::OpencodeCheck => "opencode",
+            WorkflowStep::Triage => "triage",
+            WorkflowStep::Todo => "todo",
+            WorkflowStep::Review => "review",
+        }
+    }
+
     /// Run this step against the given workflow.
     pub async fn run(&self, workflow: &Workflow) -> Result<(), WorkflowError> {
         match self {
@@ -174,13 +185,24 @@ impl Workflow {
             match step.run(self).await {
                 Ok(()) => {}
                 Err(WorkflowError::ConcurrencyExceeded) => {
-                    tracing::info!(
+                    log_deduped(
+                        &self.deps.log_dedup,
+                        "all",
+                        LogLevel::Info,
                         "Concurrency exceeded — skipping remaining steps for this cycle"
-                    );
+                            .to_string(),
+                    )
+                    .await;
                     break;
                 }
                 Err(e) => {
-                    tracing::error!("Step {:?} failed: {}", step, e);
+                    log_deduped(
+                        &self.deps.log_dedup,
+                        step.name(),
+                        LogLevel::Error,
+                        format!("Step {:?} failed: {}", step, e),
+                    )
+                    .await;
                 }
             }
         }
@@ -197,14 +219,26 @@ impl Workflow {
     /// the config file when `persist` is `false` (used by `doctor`).
     async fn run_setup_check_impl(&self, persist: bool) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
-            tracing::warn!("GitHub client not available — skipping setup check");
+            log_deduped(
+                &self.deps.log_dedup,
+                "setup",
+                LogLevel::Warn,
+                "GitHub client not available — skipping setup check".to_string(),
+            )
+            .await;
             return Ok(());
         };
 
         let git = &self.deps.config.git;
         let project_name = Self::derive_project_name(git);
         if let Err(e) = self.setup_project(&project_name, git, persist).await {
-            tracing::error!("Setup check failed for {}: {}", project_name, e);
+            log_deduped(
+                &self.deps.log_dedup,
+                "setup",
+                LogLevel::Error,
+                format!("Setup check failed for {}: {}", project_name, e),
+            )
+            .await;
         }
         Ok(())
     }
@@ -219,7 +253,13 @@ impl Workflow {
         let project_name = Self::derive_project_name(git);
         let oc = self.opencode_config(git);
         if let Err(e) = self.check_opencode(&oc).await {
-            tracing::error!("OpenCode check failed for {}: {}", project_name, e);
+            log_deduped(
+                &self.deps.log_dedup,
+                "opencode",
+                LogLevel::Error,
+                format!("OpenCode check failed for {}: {}", project_name, e),
+            )
+            .await;
         }
         Ok(())
     }
@@ -228,7 +268,13 @@ impl Workflow {
     /// the triage check (`@ai` issues → project item → triage session).
     pub async fn run_triage_check(&self) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
-            tracing::warn!("GitHub client not available — skipping triage check");
+            log_deduped(
+                &self.deps.log_dedup,
+                "triage",
+                LogLevel::Warn,
+                "GitHub client not available — skipping triage check".to_string(),
+            )
+            .await;
             return Ok(());
         };
 
@@ -245,7 +291,13 @@ impl Workflow {
         }
         .await;
         if let Err(e) = result {
-            tracing::error!("Triage check failed for {}: {}", project_name, e);
+            log_deduped(
+                &self.deps.log_dedup,
+                "triage",
+                LogLevel::Error,
+                format!("Triage check failed for {}: {}", project_name, e),
+            )
+            .await;
         }
         Ok(())
     }
@@ -254,7 +306,13 @@ impl Workflow {
     /// the todo check (Todo items → developer session).
     pub async fn run_todo_check(&self) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
-            tracing::warn!("GitHub client not available — skipping todo check");
+            log_deduped(
+                &self.deps.log_dedup,
+                "todo",
+                LogLevel::Warn,
+                "GitHub client not available — skipping todo check".to_string(),
+            )
+            .await;
             return Ok(());
         };
 
@@ -271,7 +329,13 @@ impl Workflow {
         }
         .await;
         if let Err(e) = result {
-            tracing::error!("Todo check failed for {}: {}", project_name, e);
+            log_deduped(
+                &self.deps.log_dedup,
+                "todo",
+                LogLevel::Error,
+                format!("Todo check failed for {}: {}", project_name, e),
+            )
+            .await;
         }
         Ok(())
     }
@@ -280,7 +344,13 @@ impl Workflow {
     /// the review check (Review Technical / Review Product / QA → session).
     pub async fn run_review_check(&self) -> Result<(), WorkflowError> {
         let Some(_github) = self.deps.github.as_ref() else {
-            tracing::warn!("GitHub client not available — skipping review check");
+            log_deduped(
+                &self.deps.log_dedup,
+                "review",
+                LogLevel::Warn,
+                "GitHub client not available — skipping review check".to_string(),
+            )
+            .await;
             return Ok(());
         };
 
@@ -297,7 +367,13 @@ impl Workflow {
         }
         .await;
         if let Err(e) = result {
-            tracing::error!("Review check failed for {}: {}", project_name, e);
+            log_deduped(
+                &self.deps.log_dedup,
+                "review",
+                LogLevel::Error,
+                format!("Review check failed for {}: {}", project_name, e),
+            )
+            .await;
         }
         Ok(())
     }
@@ -313,7 +389,13 @@ impl Workflow {
         let project_name = Self::derive_project_name(git);
         let oc = self.opencode_config(git);
         if let Err(e) = self.check_opencode(&oc).await {
-            tracing::error!("Doctor check failed for {}: {}", project_name, e);
+            log_deduped(
+                &self.deps.log_dedup,
+                "doctor",
+                LogLevel::Error,
+                format!("Doctor check failed for {}: {}", project_name, e),
+            )
+            .await;
         }
         Ok(())
     }
@@ -378,7 +460,13 @@ impl Workflow {
         let project_id = if let Some(pid) = &git.project_id {
             resolve_project_id_cached(&self.deps.project_id_cache, github, &owner, pid).await?
         } else {
-            tracing::info!("Creating project {} for {}/{}", name, owner, repo);
+            log_deduped(
+                &self.deps.log_dedup,
+                "setup",
+                LogLevel::Info,
+                format!("Creating project {} for {}/{}", name, owner, repo),
+            )
+            .await;
             let pid = github.create_project(&owner, name).await?;
             if persist {
                 let mut config_clone = self.deps.config.clone();
@@ -419,11 +507,23 @@ impl Workflow {
         let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
 
         if !client.check_health().await {
-            tracing::warn!("OpenCode server at {} is not healthy", oc.url);
+            log_deduped(
+                &self.deps.log_dedup,
+                "opencode",
+                LogLevel::Warn,
+                format!("OpenCode server at {} is not healthy", oc.url),
+            )
+            .await;
             return Ok(());
         }
 
-        tracing::info!("OpenCode server at {} is healthy", oc.url);
+        log_deduped(
+            &self.deps.log_dedup,
+            "opencode",
+            LogLevel::Info,
+            format!("OpenCode server at {} is healthy", oc.url),
+        )
+        .await;
 
         let agents: Vec<AgentInfo> = client
             .get_agents(Some(oc.directory.as_str()))
@@ -440,9 +540,21 @@ impl Workflow {
             .collect();
 
         if !missing.is_empty() {
-            tracing::warn!("Missing required agents: {}", missing.join(", "));
+            log_deduped(
+                &self.deps.log_dedup,
+                "opencode",
+                LogLevel::Warn,
+                format!("Missing required agents: {}", missing.join(", ")),
+            )
+            .await;
         } else {
-            tracing::info!("All required agents present");
+            log_deduped(
+                &self.deps.log_dedup,
+                "opencode",
+                LogLevel::Info,
+                "All required agents present".to_string(),
+            )
+            .await;
         }
         Ok(())
     }
@@ -564,6 +676,7 @@ mod tests {
             },
             github: None,
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let workflow = Workflow::new(deps);
@@ -669,6 +782,7 @@ mod tests {
             },
             github: Some(client),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -723,6 +837,7 @@ mod tests {
             },
             github: Some(client),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let workflow = Workflow::new(deps);
@@ -744,6 +859,7 @@ mod tests {
             },
             github: Some(client),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let workflow = Workflow::new(deps);
@@ -852,6 +968,7 @@ mod tests {
             },
             github: Some(client),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -948,6 +1065,7 @@ mod tests {
             },
             github: Some(client),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let workflow = Workflow::new(deps);
@@ -1041,6 +1159,7 @@ mod tests {
             },
             github: Some(client),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let tmp = tempfile::tempdir().unwrap();

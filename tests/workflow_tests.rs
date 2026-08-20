@@ -311,6 +311,7 @@ git:
         config,
         github: Some(client),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
@@ -468,6 +469,7 @@ git:
         config,
         github: Some(client),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let workflow = Workflow::new(deps);
@@ -589,6 +591,7 @@ git:
         config,
         github: Some(client),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let workflow = Workflow::new(deps);
@@ -745,6 +748,7 @@ git:
         config,
         github: Some(client),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
@@ -913,6 +917,7 @@ git:
         config,
         github: Some(client),
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // write_project_id writes to git-automate.yml in cwd, so chdir to temp dir.
@@ -1048,6 +1053,7 @@ fn failed_review_test_ctx(
         },
         github: None,
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let ctx = ProjectContext {

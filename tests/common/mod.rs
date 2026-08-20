@@ -100,6 +100,7 @@ pub fn make_deps(
         },
         github,
         project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 

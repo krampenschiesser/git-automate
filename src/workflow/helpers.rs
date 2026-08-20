@@ -73,12 +73,40 @@ pub struct FieldIds {
     pub session_field_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// Skip logging when *msg* matches the last message stored for *step*.
+pub async fn log_deduped(
+    log_dedup: &Arc<Mutex<HashMap<String, String>>>,
+    step: &str,
+    level: LogLevel,
+    msg: String,
+) {
+    let mut guard = log_dedup.lock().await;
+    if guard.get(step).map(|s| s.as_str()) == Some(msg.as_str()) {
+        return;
+    }
+    guard.insert(step.to_string(), msg.clone());
+    drop(guard);
+    match level {
+        LogLevel::Info => tracing::info!("{}", msg),
+        LogLevel::Warn => tracing::warn!("{}", msg),
+        LogLevel::Error => tracing::error!("{}", msg),
+    }
+}
+
 /// Dependencies for context resolution (`resolve_context`).
 #[derive(Debug, Clone)]
 pub struct ContextDeps {
     pub github: Option<GitHubClient>,
     pub config: GitAutomateConfig,
     pub project_id_cache: Arc<Mutex<HashMap<String, String>>>,
+    pub log_dedup: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Full dependency set for workflow checks and the orchestrator.
@@ -87,6 +115,7 @@ pub struct WorkflowContext {
     pub config: GitAutomateConfig,
     pub github: Option<GitHubClient>,
     pub project_id_cache: Arc<Mutex<HashMap<String, String>>>,
+    pub log_dedup: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for WorkflowContext {
@@ -95,17 +124,18 @@ impl std::fmt::Debug for WorkflowContext {
             .field("config", &self.config)
             .field("github", &self.github)
             .field("project_id_cache", &"<cache>")
+            .field("log_dedup", &"<log_dedup>")
             .finish()
     }
 }
 
 impl WorkflowContext {
-    /// Convenience: extract the context-resolution dependencies.
     pub fn context_deps(&self) -> ContextDeps {
         ContextDeps {
             github: self.github.clone(),
             config: self.config.clone(),
             project_id_cache: self.project_id_cache.clone(),
+            log_dedup: self.log_dedup.clone(),
         }
     }
 }
@@ -1138,6 +1168,7 @@ mod tests {
             github: Some(client),
             config: test_config(Some("PID-123")),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(Some("PID-123"));
 
@@ -1212,6 +1243,7 @@ mod tests {
             github: Some(client),
             config: test_config(Some("1")),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(Some("1"));
 
@@ -1320,6 +1352,7 @@ mod tests {
             github: Some(client),
             config: test_config(None),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(None);
 
@@ -1361,6 +1394,7 @@ mod tests {
             github: None,
             config: test_config(Some("PID-123")),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
         let result =
             resolve_context(&deps, "test-project", &test_git_section(Some("PID-123"))).await;
@@ -1375,6 +1409,7 @@ mod tests {
             github: Some(client),
             config: test_config(Some("PID-123")),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = GitSection {
             repository: "invalid-no-slash".to_string(),
@@ -1639,6 +1674,7 @@ mod tests {
             github: Some(client),
             config: test_config(Some("PID-123")),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(Some("PID-123"));
 
@@ -1715,6 +1751,7 @@ mod tests {
             github: Some(client),
             config: test_config(Some("PID-123")),
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
         let git_section = test_git_section(Some("PID-123"));
 
@@ -2003,6 +2040,7 @@ mod tests {
             config: config.clone(),
             github: None,
             project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
         };
         let cd = deps.context_deps();
         assert!(cd.github.is_none());

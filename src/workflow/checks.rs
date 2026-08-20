@@ -19,9 +19,9 @@ use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::types::IssueInfo;
 
 use super::helpers::{
-    ProjectContext, WorkflowContext, WorkflowError, branch_name_for_issue, extract_session_id,
-    fill_prompt, get_issue_body_map, issue_body_or_title, load_agent_template,
-    load_prompt_template, parse_resolve_threads, resolve_field_ids, resolve_option_id,
+    LogLevel, ProjectContext, WorkflowContext, WorkflowError, branch_name_for_issue,
+    extract_session_id, fill_prompt, get_issue_body_map, issue_body_or_title, load_agent_template,
+    load_prompt_template, log_deduped, parse_resolve_threads, resolve_field_ids, resolve_option_id,
     resolve_status_option_and_session,
 };
 
@@ -99,6 +99,7 @@ static CAPACITY_EXCEEDED: AtomicBool = AtomicBool::new(false);
 /// an `WorkflowError::Other` is returned.
 ///
 /// Maps [`crate::external_agent::opencode::OpenCodeError`] to `WorkflowError::Other`.
+#[allow(clippy::too_many_arguments)]
 async fn start_opencode_session(
     oc: &OpencodeSessionConfig,
     directory: &str,
@@ -106,6 +107,8 @@ async fn start_opencode_session(
     system_prompt: &str,
     message: &str,
     concurrency: &HashMap<String, usize>,
+    log_dedup: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    step: &str,
 ) -> Result<String, WorkflowError> {
     let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
 
@@ -118,13 +121,16 @@ async fn start_opencode_session(
             let active = counts.get(model_key).copied().unwrap_or(0);
             if active >= *limit {
                 if !CAPACITY_EXCEEDED.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        "OpenCode capacity exceeded for model {} ({} >= {}), skipping: {}",
-                        model_key,
-                        active,
-                        limit,
-                        title
-                    );
+                    log_deduped(
+                        log_dedup,
+                        "all",
+                        LogLevel::Warn,
+                        format!(
+                            "OpenCode capacity exceeded for model {} ({} >= {}), skipping: {}",
+                            model_key, active, limit, title
+                        ),
+                    )
+                    .await;
                 }
                 return Err(WorkflowError::ConcurrencyExceeded);
             }
@@ -139,16 +145,27 @@ async fn start_opencode_session(
         .create_worktree(directory, &workspace.id)
         .await
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
-    tracing::info!(
-        "starting session in worktree {} (workspace {})",
-        worktree.directory,
-        workspace.id
-    );
+    log_deduped(
+        log_dedup,
+        step,
+        LogLevel::Info,
+        format!(
+            "starting session in worktree {} (workspace {})",
+            worktree.directory, workspace.id
+        ),
+    )
+    .await;
     if CAPACITY_EXCEEDED.swap(false, Ordering::Relaxed) {
-        tracing::info!(
-            "OpenCode capacity available again, resuming workflow for {}",
-            title
-        );
+        log_deduped(
+            log_dedup,
+            "all",
+            LogLevel::Info,
+            format!(
+                "OpenCode capacity available again, resuming workflow for {}",
+                title
+            ),
+        )
+        .await;
     }
 
     client
@@ -195,7 +212,13 @@ pub async fn run_triage_check(
         .collect();
 
     if ai_issues.is_empty() {
-        tracing::info!("{}: no @ai issues found", ctx.name);
+        log_deduped(
+            &deps.log_dedup,
+            "triage",
+            LogLevel::Info,
+            format!("{}: no @ai issues found", ctx.name),
+        )
+        .await;
         return Ok(());
     }
 
@@ -209,7 +232,13 @@ pub async fn run_triage_check(
         let item_id = if let Some(id) = existing_items.get(&issue.number) {
             id.clone()
         } else {
-            tracing::info!("{}: adding issue #{} to project", ctx.name, issue.number);
+            log_deduped(
+                &deps.log_dedup,
+                "triage",
+                LogLevel::Info,
+                format!("{}: adding issue #{} to project", ctx.name, issue.number),
+            )
+            .await;
             github
                 .add_issue_to_project(&issue.id, &ctx.project_id)
                 .await?
@@ -227,11 +256,16 @@ pub async fn run_triage_check(
         let item_values = github.get_project_item_values(&item_id).await?;
         let session_text = extract_session_id(&item_values);
         if session_text.is_none() {
-            tracing::info!(
-                "{}: starting triage session for #{}",
-                ctx.name,
-                issue.number
-            );
+            log_deduped(
+                &deps.log_dedup,
+                "triage",
+                LogLevel::Info,
+                format!(
+                    "{}: starting triage session for #{}",
+                    ctx.name, issue.number
+                ),
+            )
+            .await;
             let system_prompt = load_agent_template("triage")?;
             let template = load_prompt_template("triage")?;
             let values = HashMap::from([
@@ -256,6 +290,8 @@ pub async fn run_triage_check(
                     .as_ref()
                     .map(|oc| &oc.concurrency)
                     .unwrap_or(&HashMap::new()),
+                &deps.log_dedup,
+                "triage",
             )
             .await?;
             github
@@ -308,7 +344,13 @@ pub async fn run_todo_check(
     }
 
     if todo_items.is_empty() {
-        tracing::info!("{}: no Todo items without sessions found", ctx.name);
+        log_deduped(
+            &deps.log_dedup,
+            "todo",
+            LogLevel::Info,
+            format!("{}: no Todo items without sessions found", ctx.name),
+        )
+        .await;
         return Ok(());
     }
 
@@ -327,7 +369,13 @@ pub async fn run_todo_check(
             .branch_exists(&ctx.owner, &ctx.repo, &branch_name)
             .await?;
         if !exists {
-            tracing::info!("{}: creating branch {}", ctx.name, branch_name);
+            log_deduped(
+                &deps.log_dedup,
+                "todo",
+                LogLevel::Info,
+                format!("{}: creating branch {}", ctx.name, branch_name),
+            )
+            .await;
             github
                 .create_branch_ref(&ctx.owner, &ctx.repo, &branch_name, &commit_sha)
                 .await?;
@@ -344,11 +392,16 @@ pub async fn run_todo_check(
             format!("Issue #{}", issue_number)
         };
 
-        tracing::info!(
-            "{}: starting developer session for #{}",
-            ctx.name,
-            issue_number
-        );
+        log_deduped(
+            &deps.log_dedup,
+            "todo",
+            LogLevel::Info,
+            format!(
+                "{}: starting developer session for #{}",
+                ctx.name, issue_number
+            ),
+        )
+        .await;
         let system_prompt = load_agent_template("developer")?;
         let template = load_prompt_template("developer")?;
         let branch_name = branch_name_for_issue(*issue_number, &deps.config.git);
@@ -374,6 +427,8 @@ pub async fn run_todo_check(
                 .as_ref()
                 .map(|oc| &oc.concurrency)
                 .unwrap_or(&HashMap::new()),
+            &deps.log_dedup,
+            "todo",
         )
         .await?;
 
@@ -428,11 +483,17 @@ pub async fn run_review_check(
             .find(|o| o.name == state.status())
             .map(|o| o.id.clone());
         let Some(_state_option_id) = state_option_id else {
-            tracing::warn!(
-                "{}: status option \"{}\" not found",
-                ctx.name,
-                state.status()
-            );
+            log_deduped(
+                &deps.log_dedup,
+                "review",
+                LogLevel::Warn,
+                format!(
+                    "{}: status option \"{}\" not found",
+                    ctx.name,
+                    state.status()
+                ),
+            )
+            .await;
             continue;
         };
 
@@ -486,12 +547,18 @@ pub async fn run_review_check(
                     .unwrap_or(&format!("#{}", issue_number))
             );
 
-            tracing::info!(
-                "{}: starting {} session for #{}",
-                ctx.name,
-                state.agent().as_str(),
-                issue_number
-            );
+            log_deduped(
+                &deps.log_dedup,
+                "review",
+                LogLevel::Info,
+                format!(
+                    "{}: starting {} session for #{}",
+                    ctx.name,
+                    state.agent().as_str(),
+                    issue_number
+                ),
+            )
+            .await;
 
             let session_id = start_opencode_session(
                 oc,
@@ -504,6 +571,8 @@ pub async fn run_review_check(
                     .as_ref()
                     .map(|oc| &oc.concurrency)
                     .unwrap_or(&HashMap::new()),
+                &deps.log_dedup,
+                "review",
             )
             .await?;
 
@@ -542,7 +611,13 @@ pub async fn run_failed_review_check(
 
     let project_items = github.list_project_items(&ctx.project_id).await?;
     if project_items.is_empty() {
-        tracing::info!("{}: no project items for failed review check", ctx.name);
+        log_deduped(
+            &deps.log_dedup,
+            "review",
+            LogLevel::Info,
+            format!("{}: no project items for failed review check", ctx.name),
+        )
+        .await;
         return Ok(());
     }
 
@@ -550,10 +625,16 @@ pub async fn run_failed_review_check(
     let status_field = github.get_project_status_field(&ctx.project_id).await?;
 
     let Some(status_field) = status_field else {
-        tracing::warn!(
-            "{}: no Status field found for failed review check",
-            ctx.name
-        );
+        log_deduped(
+            &deps.log_dedup,
+            "review",
+            LogLevel::Warn,
+            format!(
+                "{}: no Status field found for failed review check",
+                ctx.name
+            ),
+        )
+        .await;
         return Ok(());
     };
 
@@ -561,14 +642,22 @@ pub async fn run_failed_review_check(
     let in_dev_option_id = resolve_option_id(&status_field.options, "In Development");
 
     let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
-    let active_sessions = oc_client.get_session_statuses().await.unwrap_or_else(|e| {
-        tracing::warn!(
-            "{}: could not fetch OpenCode session statuses for failed review check: {}",
-            ctx.name,
-            e
-        );
-        std::collections::HashMap::new()
-    });
+    let active_sessions = match oc_client.get_session_statuses().await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            log_deduped(
+                &deps.log_dedup,
+                "review",
+                LogLevel::Warn,
+                format!(
+                    "{}: could not fetch OpenCode session statuses for failed review check: {}",
+                    ctx.name, e
+                ),
+            )
+            .await;
+            std::collections::HashMap::new()
+        }
+    };
 
     let mut item_values = Vec::new();
     for item in &project_items {
@@ -591,12 +680,16 @@ pub async fn run_failed_review_check(
                 continue;
             }
 
-            tracing::warn!(
-                "{}: review session {} for issue #{} has completed without status transition, recovering",
-                ctx.name,
-                session_id,
-                item.content_number
-            );
+            log_deduped(
+                &deps.log_dedup,
+                "review",
+                LogLevel::Warn,
+                format!(
+                    "{}: review session {} for issue #{} has completed without status transition, recovering",
+                    ctx.name, session_id, item.content_number
+                ),
+            )
+            .await;
 
             if let Some(todo_id) = &todo_option_id {
                 github
@@ -622,11 +715,16 @@ pub async fn run_failed_review_check(
                 .map(issue_body_or_title)
                 .unwrap_or_else(|| format!("Issue #{}", issue_number));
 
-            tracing::info!(
-                "{}: starting developer session for failed review #{}",
-                ctx.name,
-                issue_number
-            );
+            log_deduped(
+                &deps.log_dedup,
+                "review",
+                LogLevel::Info,
+                format!(
+                    "{}: starting developer session for failed review #{}",
+                    ctx.name, issue_number
+                ),
+            )
+            .await;
 
             let system_prompt = load_agent_template("developer")?;
             let template = load_prompt_template("developer")?;
@@ -653,6 +751,8 @@ pub async fn run_failed_review_check(
                     .as_ref()
                     .map(|oc| &oc.concurrency)
                     .unwrap_or(&HashMap::new()),
+                &deps.log_dedup,
+                "review",
             )
             .await?;
 
@@ -704,17 +804,29 @@ pub async fn run_dev_completion_check(
 
     let project_items = github.list_project_items(&ctx.project_id).await?;
     if project_items.is_empty() {
-        tracing::info!("{}: no project items for dev completion check", ctx.name);
+        log_deduped(
+            &deps.log_dedup,
+            "review",
+            LogLevel::Info,
+            format!("{}: no project items for dev completion check", ctx.name),
+        )
+        .await;
         return Ok(());
     }
 
     let status_field = github.get_project_status_field(&ctx.project_id).await?;
 
     let Some(status_field) = status_field else {
-        tracing::warn!(
-            "{}: no Status field found for dev completion check",
-            ctx.name
-        );
+        log_deduped(
+            &deps.log_dedup,
+            "review",
+            LogLevel::Warn,
+            format!(
+                "{}: no Status field found for dev completion check",
+                ctx.name
+            ),
+        )
+        .await;
         return Ok(());
     };
 
@@ -722,14 +834,22 @@ pub async fn run_dev_completion_check(
     let review_tech_option_id = resolve_option_id(&status_field.options, "Review Technical");
 
     let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
-    let active_sessions = oc_client.get_session_statuses().await.unwrap_or_else(|e| {
-        tracing::warn!(
-            "{}: could not fetch OpenCode session statuses for dev completion check: {}",
-            ctx.name,
-            e
-        );
-        std::collections::HashMap::new()
-    });
+    let active_sessions = match oc_client.get_session_statuses().await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            log_deduped(
+                &deps.log_dedup,
+                "review",
+                LogLevel::Warn,
+                format!(
+                    "{}: could not fetch OpenCode session statuses for dev completion check: {}",
+                    ctx.name, e
+                ),
+            )
+            .await;
+            std::collections::HashMap::new()
+        }
+    };
 
     let mut item_values = Vec::new();
     for item in &project_items {
@@ -751,42 +871,58 @@ pub async fn run_dev_completion_check(
             continue;
         }
 
-        tracing::info!(
-            "{}: developer session {} for issue #{} has completed, resolving threads",
-            ctx.name,
-            session_id,
-            item.content_number
-        );
+        log_deduped(
+            &deps.log_dedup,
+            "review",
+            LogLevel::Info,
+            format!(
+                "{}: developer session {} for issue #{} has completed, resolving threads",
+                ctx.name, session_id, item.content_number
+            ),
+        )
+        .await;
 
-        let messages = oc_client
-            .get_session_messages(&session_id, None)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "{}: could not fetch session messages for {}: {}",
-                    ctx.name,
-                    session_id,
-                    e
-                );
+        let messages = match oc_client.get_session_messages(&session_id, None).await {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                log_deduped(
+                    &deps.log_dedup,
+                    "review",
+                    LogLevel::Warn,
+                    format!(
+                        "{}: could not fetch session messages for {}: {}",
+                        ctx.name, session_id, e
+                    ),
+                )
+                .await;
                 Vec::new()
-            });
+            }
+        };
         let thread_ids =
             parse_resolve_threads(&messages.iter().map(|m| m.text()).collect::<Vec<_>>());
 
         for thread_id in &thread_ids {
-            tracing::info!(
-                "{}: resolving review thread {} for issue #{}",
-                ctx.name,
-                thread_id,
-                item.content_number
-            );
+            log_deduped(
+                &deps.log_dedup,
+                "review",
+                LogLevel::Info,
+                format!(
+                    "{}: resolving review thread {} for issue #{}",
+                    ctx.name, thread_id, item.content_number
+                ),
+            )
+            .await;
             if let Err(e) = github.resolve_review_thread(thread_id).await {
-                tracing::warn!(
-                    "{}: failed to resolve thread {}: {}",
-                    ctx.name,
-                    thread_id,
-                    e
-                );
+                log_deduped(
+                    &deps.log_dedup,
+                    "review",
+                    LogLevel::Warn,
+                    format!(
+                        "{}: failed to resolve thread {}: {}",
+                        ctx.name, thread_id, e
+                    ),
+                )
+                .await;
             }
         }
 
@@ -818,6 +954,8 @@ mod tests {
     use crate::test_utils::{gh_client, make_deps};
     use crate::workflow::helpers::ProjectContext;
     use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2315,9 +2453,17 @@ mod tests {
             concurrency: HashMap::new(),
         };
 
-        let result =
-            start_opencode_session(&oc, "/dir", "title", "system", "message", &HashMap::new())
-                .await;
+        let result = start_opencode_session(
+            &oc,
+            "/dir",
+            "title",
+            "system",
+            "message",
+            &HashMap::new(),
+            &Arc::new(Mutex::new(HashMap::new())),
+            "test",
+        )
+        .await;
         assert!(result.is_err());
         assert!(matches!(result, Err(WorkflowError::Other(_))));
     }
@@ -2409,8 +2555,17 @@ mod tests {
         // limit = 2 for myprovider/fast, active = 4 → 4 >= 2 → should skip
         let mut concurrency = HashMap::new();
         concurrency.insert("myprovider/fast".to_string(), 2);
-        let result =
-            start_opencode_session(&oc, "/dir", "title", "system", "message", &concurrency).await;
+        let result = start_opencode_session(
+            &oc,
+            "/dir",
+            "title",
+            "system",
+            "message",
+            &concurrency,
+            &Arc::new(Mutex::new(HashMap::new())),
+            "test",
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(matches!(result, Err(WorkflowError::ConcurrencyExceeded)));
@@ -2510,8 +2665,17 @@ mod tests {
         // limit = 5 for myprovider/fast, active = 2 → 2 < 5 → should proceed
         let mut concurrency = HashMap::new();
         concurrency.insert("myprovider/fast".to_string(), 5);
-        let result =
-            start_opencode_session(&oc, "/dir", "title", "system", "message", &concurrency).await;
+        let result = start_opencode_session(
+            &oc,
+            "/dir",
+            "title",
+            "system",
+            "message",
+            &concurrency,
+            &Arc::new(Mutex::new(HashMap::new())),
+            "test",
+        )
+        .await;
 
         assert_eq!(result.unwrap(), "sess123");
     }
@@ -2584,9 +2748,17 @@ mod tests {
             concurrency: HashMap::new(),
         };
 
-        let result =
-            start_opencode_session(&oc, "/dir", "title", "system", "message", &HashMap::new())
-                .await;
+        let result = start_opencode_session(
+            &oc,
+            "/dir",
+            "title",
+            "system",
+            "message",
+            &HashMap::new(),
+            &Arc::new(Mutex::new(HashMap::new())),
+            "test",
+        )
+        .await;
         assert_eq!(result.unwrap(), "sess123");
     }
 
@@ -2635,9 +2807,17 @@ mod tests {
             concurrency: HashMap::new(),
         };
 
-        let result =
-            start_opencode_session(&oc, "/dir", "title", "system", "message", &HashMap::new())
-                .await;
+        let result = start_opencode_session(
+            &oc,
+            "/dir",
+            "title",
+            "system",
+            "message",
+            &HashMap::new(),
+            &Arc::new(Mutex::new(HashMap::new())),
+            "test",
+        )
+        .await;
         assert!(matches!(result, Err(WorkflowError::Other(_))));
         mock.verify().await;
     }
@@ -2692,9 +2872,17 @@ mod tests {
             concurrency: HashMap::new(),
         };
 
-        let result =
-            start_opencode_session(&oc, "/dir", "title", "system", "message", &HashMap::new())
-                .await;
+        let result = start_opencode_session(
+            &oc,
+            "/dir",
+            "title",
+            "system",
+            "message",
+            &HashMap::new(),
+            &Arc::new(Mutex::new(HashMap::new())),
+            "test",
+        )
+        .await;
         assert!(matches!(result, Err(WorkflowError::Other(_))));
         mock.verify().await;
     }

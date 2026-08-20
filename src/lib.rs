@@ -43,6 +43,7 @@ pub mod test_utils {
             },
             github,
             project_id_cache: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            log_dedup: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
