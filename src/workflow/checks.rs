@@ -13,6 +13,7 @@
 //!   OpenCode session.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::external_agent::opencode::OpenCodeClient;
@@ -274,8 +275,9 @@ pub async fn run_triage_check(
                 ),
             )
             .await;
-            let system_prompt = load_agent_template("triage")?;
-            let template = load_prompt_template("triage")?;
+            let system_prompt =
+                load_agent_template("triage", Some(Path::new(&ctx.config.directory)))?;
+            let template = load_prompt_template("triage", Some(Path::new(&ctx.config.directory)))?;
             let values = HashMap::from([
                 ("ISSUE_TITLE".to_string(), issue.title.clone()),
                 ("ISSUE_NUMBER".to_string(), issue.number.to_string()),
@@ -488,8 +490,9 @@ pub async fn run_todo_check(
             ),
         )
         .await;
-        let system_prompt = load_agent_template("developer")?;
-        let template = load_prompt_template("developer")?;
+        let system_prompt =
+            load_agent_template("developer", Some(Path::new(&ctx.config.directory)))?;
+        let template = load_prompt_template("developer", Some(Path::new(&ctx.config.directory)))?;
         let branch_name = branch_name_for_issue(*issue_number, &deps.config.git, None);
         let values = HashMap::from([
             ("ISSUE_TITLE".to_string(), title.clone()),
@@ -586,8 +589,10 @@ pub async fn run_review_check(
             continue;
         };
 
-        let template = load_prompt_template(state.prompt())?;
-        let system_prompt = load_agent_template(state.prompt())?;
+        let template =
+            load_prompt_template(state.prompt(), Some(Path::new(&ctx.config.directory)))?;
+        let system_prompt =
+            load_agent_template(state.prompt(), Some(Path::new(&ctx.config.directory)))?;
 
         for (item, values) in project_items.iter().zip(&item_values) {
             let current_status = values.get("Status").and_then(|v| v.as_deref());
@@ -858,8 +863,10 @@ pub async fn run_failed_review_check(
             )
             .await;
 
-            let system_prompt = load_agent_template("developer")?;
-            let template = load_prompt_template("developer")?;
+            let system_prompt =
+                load_agent_template("developer", Some(Path::new(&ctx.config.directory)))?;
+            let template =
+                load_prompt_template("developer", Some(Path::new(&ctx.config.directory)))?;
             let branch_name = format!("issue-{}", issue_number);
             let values = HashMap::from([
                 ("ISSUE_TITLE".to_string(), title.clone()),
