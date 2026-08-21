@@ -25,8 +25,8 @@ use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::external_issues::github::repo::parse_repository_url;
 use git_automate::workflow::Workflow;
 use git_automate::workflow::helpers::{
-    WorkflowContext, detect_git_remote, ensure_session_id_field, ensure_status_options,
-    prompt_input, resolve_project_id, write_doctor_config,
+    WorkflowContext, detect_git_remote, ensure_agents_installed, ensure_session_id_field,
+    ensure_status_options, prompt_input, resolve_project_id, write_doctor_config,
 };
 
 // ─── CLI ─────────────────────────────────────────────────────
@@ -130,6 +130,11 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Ensure global agent files are installed.
+    if let Err(e) = ensure_agents_installed() {
+        tracing::warn!("Failed to ensure agent files: {}", e);
+    }
+
     // Prefer the config's github_token (substituted from ${env:GITHUB_TOKEN}),
     // falling back to the GITHUB_TOKEN environment variable for backward compatibility.
     let token = config
@@ -226,6 +231,11 @@ async fn doctor(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn serve(config_path: &Path, once: bool) -> Result<(), Box<dyn std::error::Error>> {
     let workflow = setup(config_path).await?;
+
+    // Ensure global agent files are installed before running the workflow.
+    if let Err(e) = ensure_agents_installed() {
+        tracing::warn!("Failed to ensure agent files: {}", e);
+    }
 
     if once {
         tracing::info!("Running single workflow cycle (--once mode)");
