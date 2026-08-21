@@ -236,11 +236,13 @@ async fn serve(config_path: &Path, once: bool) -> Result<(), Box<dyn std::error:
     }
 
     tracing::info!("Starting git-automate daemon");
-    if let Err(e) = workflow.run_all().await {
-        tracing::error!("Startup runAll failed: {}", e);
+    let _ = workflow.run_all().await;
+    if workflow.error_count() > 0 {
+        tracing::error!("Startup runAll failed");
     }
 
     let mut interval = tokio::time::interval(Duration::from_secs(30));
+    let mut last_error_count = workflow.error_count();
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
@@ -249,8 +251,11 @@ async fn serve(config_path: &Path, once: bool) -> Result<(), Box<dyn std::error:
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = workflow.run_all().await {
-                    tracing::error!("Polling runAll failed: {}", e);
+                let _ = workflow.run_all().await;
+                let current = workflow.error_count();
+                if current > last_error_count {
+                    tracing::error!("Polling runAll failed");
+                    last_error_count = current;
                 }
             }
             _ = &mut ctrl_c => {

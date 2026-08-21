@@ -16,7 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use common::*;
 use git_automate::config::{GitAutomateConfig, GitSection, OpencodeConfig, parse_config};
 use git_automate::workflow::Workflow;
-use git_automate::workflow::checks::{OpencodeSessionConfig, run_review_check};
+use git_automate::workflow::checks::{OpencodeSessionConfig, run_review_check, run_todo_check};
 use git_automate::workflow::helpers::{ProjectContext, WorkflowContext, write_project_id};
 
 // ─── Test 1: Full triage flow with mocks ──────────────────────
@@ -27,6 +27,19 @@ async fn test_full_triage_flow_with_mocks() {
     let oc_mock = MockServer::start().await;
 
     mount_github_graphql_mocks(&gh_mock).await;
+
+    // Mock: createProjectV2Field for waveId (must be before createProjectV2 due to substring match)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "createProjectV2Field": { "projectField": { "id": "wave-field-id" } }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
     mount_opencode_mocks(&oc_mock).await;
     mount_opencode_workspace_worktree_mocks(&oc_mock).await;
 
@@ -256,6 +269,21 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
         .mount(&gh_mock)
         .await;
 
+    // Mock: createProjectV2Field for waveId
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .and(body_string_contains("waveId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "createProjectV2Field": { "projectField": { "id": "wave-field-id" } }
+            }
+        })))
+        .expect(1)
+        .named("add_wave_id_field")
+        .mount(&gh_mock)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("fields(first:"))
@@ -270,14 +298,16 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
                 }
             }
         })))
-        .expect(1)
+        .expect(2)
         .named("get_project_fields")
         .mount(&gh_mock)
         .await;
 
+    // Mock: createProjectV2Field for sessionId
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("createProjectV2Field"))
+        .and(body_string_contains("sessionId"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "createProjectV2Field": { "projectField": { "id": "session-field-id" } }
@@ -399,12 +429,13 @@ async fn test_setup_initialization_idempotent_when_everything_exists() {
                         "nodes": [
                             { "id": "f1", "name": "Status", "dataType": "SINGLE_SELECT" },
                             { "id": "f2", "name": "sessionId", "dataType": "TEXT" },
+                            { "id": "f3", "name": "waveId", "dataType": "NUMBER" },
                         ]
                     }
                 }
             }
         })))
-        .expect(1)
+        .expect(2)
         .named("get_project_fields")
         .mount(&gh_mock)
         .await;
@@ -527,6 +558,21 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
         .mount(&gh_mock)
         .await;
 
+    // Mock: createProjectV2Field for waveId
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .and(body_string_contains("waveId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "createProjectV2Field": { "projectField": { "id": "wave-field-id" } }
+            }
+        })))
+        .expect(1)
+        .named("add_wave_id_field")
+        .mount(&gh_mock)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("fields(first:"))
@@ -541,14 +587,16 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
                 }
             }
         })))
-        .expect(1)
+        .expect(2)
         .named("get_project_fields")
         .mount(&gh_mock)
         .await;
 
+    // Mock: createProjectV2Field for sessionId
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("createProjectV2Field"))
+        .and(body_string_contains("sessionId"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
                 "createProjectV2Field": { "projectField": { "id": "session-field-id" } }
@@ -672,7 +720,7 @@ async fn test_setup_resolves_numeric_project_id_to_global_id() {
         .mount(&gh_mock)
         .await;
 
-    // 4. ensure_session_id_field: project fields include sessionId
+    // 4. ensure_session_id_field + ensure_wave_id_field: project fields include sessionId but not waveId
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("fields(first:"))
@@ -688,15 +736,29 @@ async fn test_setup_resolves_numeric_project_id_to_global_id() {
                 }
             }
         })))
-        .expect(1)
+        .expect(2)
         .named("get_project_fields")
         .mount(&gh_mock)
         .await;
 
-    // 5. createProjectV2Field should NOT be called (sessionId exists)
+    // 5. createProjectV2Field for waveId
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("createProjectV2Field"))
+        .and(body_string_contains("waveId"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+        })))
+        .expect(1)
+        .named("add_wave_id_field")
+        .mount(&gh_mock)
+        .await;
+
+    // 6. createProjectV2Field for sessionId should NOT be called (sessionId exists)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("createProjectV2Field"))
+        .and(body_string_contains("sessionId"))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .named("add_session_id_field_should_not_be_called")
@@ -851,7 +913,7 @@ async fn test_doctor_does_not_persist_resolved_project_id() {
         .mount(&gh_mock)
         .await;
 
-    // 4. ensure_session_id_field: project fields include sessionId
+    // 4. ensure_session_id_field + ensure_wave_id_field: project fields include sessionId and waveId
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("fields(first:"))
@@ -862,17 +924,18 @@ async fn test_doctor_does_not_persist_resolved_project_id() {
                         "nodes": [
                             {"id": "f1", "name": "Status", "dataType": "SINGLE_SELECT"},
                             {"id": "f2", "name": "sessionId", "dataType": "TEXT"},
+                            {"id": "f3", "name": "waveId", "dataType": "NUMBER"},
                         ]
                     }
                 }
             }
         })))
-        .expect(1)
+        .expect(2)
         .named("get_project_fields")
         .mount(&gh_mock)
         .await;
 
-    // 5. createProjectV2Field should NOT be called (sessionId exists)
+    // 5. createProjectV2Field should NOT be called (sessionId + waveId exist)
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains("createProjectV2Field"))
@@ -1252,6 +1315,815 @@ async fn test_active_review_session_not_recovered() {
     let (mut deps, ctx, mut oc) = failed_review_test_ctx("Review Technical", "active-session");
     deps.github = Some(client.clone());
     oc.url = oc_mock.uri();
+    let result = run_review_check(&deps, &ctx, &oc).await;
+    assert!(
+        result.is_ok(),
+        "run_review_check failed: {:?}",
+        result.err()
+    );
+    oc_mock.verify().await;
+}
+
+// ─── PR Context in Todo Check Integration Tests ────────────────
+
+/// Test: Todo check gathers PR context when branch has an associated PR.
+///
+/// Verifies that `run_todo_check` calls `get_pull_request_for_branch`,
+/// `get_pr_diff`, and `list_pr_review_comments` when a PR exists for the
+/// branch, and that the filled prompt contains PR_URL, PR_CHANGES, and
+/// PR_COMMENTS.
+#[tokio::test]
+async fn todo_check_gathers_pr_context_when_pr_exists() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+    let client = gh_client(&gh_mock);
+
+    let project_config = GitSection {
+        repository: "https://github.com/owner/repo".to_string(),
+        project_id: Some("PID-123".to_string()),
+        directory: "/test-work".to_string(),
+        issue_provider: "github".to_string(),
+        title_pattern: "@ai.*".to_string(),
+        trello_api_key: None,
+        trello_token: None,
+        trello_board_id: None,
+        token: None,
+        branch_name: None,
+    };
+    let deps = WorkflowContext {
+        config: GitAutomateConfig {
+            git: project_config.clone(),
+            opencode: Some(OpencodeConfig {
+                url: oc_mock.uri(),
+                pw: "pw".to_string(),
+                cwd: "/test-work".to_string(),
+                project: "test-project".to_string(),
+                concurrency: HashMap::new(),
+            }),
+        },
+        github: Some(client),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let ctx = ProjectContext {
+        name: "test-proj".to_string(),
+        config: project_config,
+        owner: "owner".to_string(),
+        repo: "repo".to_string(),
+        project_id: "PID-123".to_string(),
+    };
+    let oc = OpencodeSessionConfig {
+        url: oc_mock.uri(),
+        pw: "pw".to_string(),
+        directory: "/test-work".to_string(),
+        project: Some("test-project".to_string()),
+        concurrency: HashMap::new(),
+    };
+
+    let issues = json!([
+        {"node_id": "issue-node-42", "number": 42, "title": "Implement feature", "body": "body", "state": "open", "pull_request": null},
+    ]);
+    let project_items = json!({
+        "nodes": [
+            {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+        ]
+    });
+    let field_values = json!({
+        "nodes": [
+            {"__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo", "field": {"__typename": "ProjectV2Field", "name": "Status"}},
+        ]
+    });
+
+    // Fields query (for resolve_field_ids — status + session)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                            {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Status field query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": {
+                        "id": "status-field-id",
+                        "options": [
+                            {"id": "todo-opt-id", "name": "Todo"},
+                            {"id": "dev-opt-id", "name": "In Development"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // REST issues endpoint
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issues))
+        .mount(&gh_mock)
+        .await;
+
+    // Project items query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("items(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "node": { "items": project_items } }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Field values query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fieldValues(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "node": { "fieldValues": field_values } }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Update session id mutation
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateProjectV2ItemFieldValue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-id" } }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Branch does NOT exist → 404
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/branches/issue-42"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"nodes": []})))
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "default_branch": "main"
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/commits/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sha": "abc123"
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/git/refs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .expect(1)
+        .mount(&gh_mock)
+        .await;
+
+    // PR exists for the branch
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .and(query_param("head", "owner:issue-42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 10,
+                "url": "https://github.com/owner/repo/pull/10",
+                "title": "Implement feature"
+            }
+        ])))
+        .mount(&gh_mock)
+        .await;
+
+    // PR diff
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("diff --git a/main.rs b/main.rs\n+println!(\"hello\");\n"),
+        )
+        .mount(&gh_mock)
+        .await;
+
+    // PR review comments (unresolved)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("reviewThreads"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "thread1",
+                                    "path": "src/main.rs",
+                                    "line": 42,
+                                    "originalLine": 38,
+                                    "isResolved": false,
+                                    "diffSide": "RIGHT",
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "id": "comment1",
+                                                "body": "Please fix this",
+                                                "createdAt": "2024-01-01T00:00:00Z",
+                                                "author": {"login": "reviewer"}
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "id": "thread2",
+                                    "path": "src/lib.rs",
+                                    "line": null,
+                                    "originalLine": null,
+                                    "isResolved": true,
+                                    "diffSide": "LEFT",
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "id": "comment2",
+                                                "body": "LGTM",
+                                                "createdAt": "2024-01-02T00:00:00Z",
+                                                "author": null
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // OpenCode mocks
+    Mock::given(method("POST"))
+        .and(path("/experimental/workspace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "wrk1",
+            "type": "git",
+            "name": "w1",
+            "branch": null,
+            "directory": null,
+            "extra": null,
+            "projectID": "p1",
+            "timeUsed": 0
+        })))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/experimental/worktree"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "wt1",
+            "branch": "issue-42",
+            "directory": "/wt/dir1"
+        })))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "sess123",
+            "projectID": "p1",
+            "directory": "/d",
+            "title": "t",
+            "version": "1",
+            "time": {"created": 1, "updated": 2}
+        })))
+        .mount(&oc_mock)
+        .await;
+
+    // Verify prompt_async body contains PR context
+    Mock::given(method("POST"))
+        .and(path("/session/sess123/prompt_async"))
+        .and(body_string_contains(
+            "https://github.com/owner/repo/pull/10",
+        ))
+        .and(body_string_contains("diff --git"))
+        .and(body_string_contains("Please fix this"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&oc_mock)
+        .await;
+
+    let result = run_todo_check(&deps, &ctx, &oc).await;
+    assert!(result.is_ok());
+    oc_mock.verify().await;
+}
+
+/// Test: Todo check handles missing PR gracefully (no PR for branch).
+///
+/// When `get_pull_request_for_branch` returns `None`, the check should
+/// continue normally with empty PR_URL, PR_CHANGES, and PR_COMMENTS.
+#[tokio::test]
+async fn todo_check_no_pr_for_branch_continues_normally() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+    let client = gh_client(&gh_mock);
+
+    let project_config = GitSection {
+        repository: "https://github.com/owner/repo".to_string(),
+        project_id: Some("PID-123".to_string()),
+        directory: "/test-work".to_string(),
+        issue_provider: "github".to_string(),
+        title_pattern: "@ai.*".to_string(),
+        trello_api_key: None,
+        trello_token: None,
+        trello_board_id: None,
+        token: None,
+        branch_name: None,
+    };
+    let deps = WorkflowContext {
+        config: GitAutomateConfig {
+            git: project_config.clone(),
+            opencode: Some(OpencodeConfig {
+                url: oc_mock.uri(),
+                pw: "pw".to_string(),
+                cwd: "/test-work".to_string(),
+                project: "test-project".to_string(),
+                concurrency: HashMap::new(),
+            }),
+        },
+        github: Some(client),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let ctx = ProjectContext {
+        name: "test-proj".to_string(),
+        config: project_config,
+        owner: "owner".to_string(),
+        repo: "repo".to_string(),
+        project_id: "PID-123".to_string(),
+    };
+    let oc = OpencodeSessionConfig {
+        url: oc_mock.uri(),
+        pw: "pw".to_string(),
+        directory: "/test-work".to_string(),
+        project: Some("test-project".to_string()),
+        concurrency: HashMap::new(),
+    };
+
+    let issues = json!([
+        {"node_id": "issue-node-42", "number": 42, "title": "Implement feature", "body": "body", "state": "open", "pull_request": null},
+    ]);
+    let project_items = json!({
+        "nodes": [
+            {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+        ]
+    });
+    let field_values = json!({
+        "nodes": [
+            {"__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Todo", "field": {"__typename": "ProjectV2Field", "name": "Status"}},
+        ]
+    });
+
+    // Fields query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                            {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Status field query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": {
+                        "id": "status-field-id",
+                        "options": [
+                            {"id": "todo-opt-id", "name": "Todo"},
+                            {"id": "dev-opt-id", "name": "In Development"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // REST issues endpoint
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issues))
+        .mount(&gh_mock)
+        .await;
+
+    // Project items query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("items(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "node": { "items": project_items } }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Field values query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fieldValues(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "node": { "fieldValues": field_values } }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Update session id mutation
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateProjectV2ItemFieldValue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-id" } }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Branch does NOT exist → 404
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/branches/issue-42"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"nodes": []})))
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "default_branch": "main"
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/commits/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sha": "abc123"
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/git/refs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .expect(1)
+        .mount(&gh_mock)
+        .await;
+
+    // No PR for the branch
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .and(query_param("head", "owner:issue-42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&gh_mock)
+        .await;
+
+    // OpenCode mocks
+    Mock::given(method("POST"))
+        .and(path("/experimental/workspace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "wrk1",
+            "type": "git",
+            "name": "w1",
+            "branch": null,
+            "directory": null,
+            "extra": null,
+            "projectID": "p1",
+            "timeUsed": 0
+        })))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/experimental/worktree"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "wt1",
+            "branch": "issue-42",
+            "directory": "/wt/dir1"
+        })))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "sess123",
+            "projectID": "p1",
+            "directory": "/d",
+            "title": "t",
+            "version": "1",
+            "time": {"created": 1, "updated": 2}
+        })))
+        .mount(&oc_mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/session/sess123/prompt_async"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&oc_mock)
+        .await;
+
+    let result = run_todo_check(&deps, &ctx, &oc).await;
+    assert!(result.is_ok());
+    oc_mock.verify().await;
+}
+
+/// Test: Review check gathers PR context when branch has an associated PR.
+///
+/// Verifies that `run_review_check` calls `get_pull_request_for_branch`,
+/// `get_pr_diff`, and `list_pr_review_comments` when a PR exists for the
+/// branch, and that the filled prompt contains PR_URL, PR_CHANGES, and
+/// PR_COMMENTS.
+#[tokio::test]
+async fn review_check_gathers_pr_comments() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+    let client = gh_client(&gh_mock);
+
+    let project_config = GitSection {
+        repository: "https://github.com/owner/repo".to_string(),
+        project_id: Some("PID-123".to_string()),
+        directory: "/test-work".to_string(),
+        issue_provider: "github".to_string(),
+        title_pattern: "@ai.*".to_string(),
+        trello_api_key: None,
+        trello_token: None,
+        trello_board_id: None,
+        token: None,
+        branch_name: None,
+    };
+    let deps = WorkflowContext {
+        config: GitAutomateConfig {
+            git: project_config.clone(),
+            opencode: Some(OpencodeConfig {
+                url: oc_mock.uri(),
+                pw: "pw".to_string(),
+                cwd: "/test-work".to_string(),
+                project: "test-project".to_string(),
+                concurrency: HashMap::new(),
+            }),
+        },
+        github: Some(client),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let ctx = ProjectContext {
+        name: "test-proj".to_string(),
+        config: project_config,
+        owner: "owner".to_string(),
+        repo: "repo".to_string(),
+        project_id: "PID-123".to_string(),
+    };
+    let oc = OpencodeSessionConfig {
+        url: oc_mock.uri(),
+        pw: "pw".to_string(),
+        directory: "/test-work".to_string(),
+        project: Some("test-project".to_string()),
+        concurrency: HashMap::new(),
+    };
+
+    let issues = json!([
+        {"node_id": "issue-node-42", "number": 42, "title": "Implement feature", "body": "body", "state": "open", "pull_request": null},
+    ]);
+    let project_items = json!({
+        "nodes": [
+            {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+        ]
+    });
+    let field_values = json!({
+        "nodes": [
+            {"__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "Review Technical", "field": {"__typename": "ProjectV2Field", "name": "Status"}},
+        ]
+    });
+
+    // Fields query (for resolve_field_ids — status + session)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                            {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Status field query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("field(name:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "field": {
+                        "id": "status-field-id",
+                        "options": [
+                            {"id": "review-tech-opt", "name": "Review Technical"},
+                            {"id": "review-prod-opt", "name": "Review Product"},
+                            {"id": "qa-opt", "name": "QA"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // REST issues endpoint
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issues))
+        .mount(&gh_mock)
+        .await;
+
+    // Project items query
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("items(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "node": { "items": project_items } }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Field values query — NO sessionId, so check proceeds to create session
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fieldValues(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "node": { "fieldValues": field_values } }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // Update session id mutation
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateProjectV2ItemFieldValue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-42" } }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // PR exists for the branch
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .and(query_param("head", "owner:issue-42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 10,
+                "url": "https://github.com/owner/repo/pull/10",
+                "title": "Implement feature"
+            }
+        ])))
+        .mount(&gh_mock)
+        .await;
+
+    // PR diff
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("diff --git a/main.rs b/main.rs\n+println!(\"hello\");\n"),
+        )
+        .mount(&gh_mock)
+        .await;
+
+    // PR review comments (unresolved)
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("reviewThreads"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "thread1",
+                                    "path": "src/main.rs",
+                                    "line": 42,
+                                    "originalLine": 38,
+                                    "isResolved": false,
+                                    "diffSide": "RIGHT",
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "id": "comment1",
+                                                "body": "Please fix this",
+                                                "createdAt": "2024-01-01T00:00:00Z",
+                                                "author": {"login": "reviewer"}
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "id": "thread2",
+                                    "path": "src/lib.rs",
+                                    "line": null,
+                                    "originalLine": null,
+                                    "isResolved": true,
+                                    "diffSide": "LEFT",
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "id": "comment2",
+                                                "body": "LGTM",
+                                                "createdAt": "2024-01-02T00:00:00Z",
+                                                "author": null
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(&gh_mock)
+        .await;
+
+    // OpenCode mocks
+    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
+
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "sess123",
+            "projectID": "p1",
+            "directory": "/d",
+            "title": "Review Technical: Implement feature",
+            "version": "1",
+            "time": {"created": 1, "updated": 2}
+        })))
+        .mount(&oc_mock)
+        .await;
+
+    // Verify prompt_async body contains PR context
+    Mock::given(method("POST"))
+        .and(path("/session/sess123/prompt_async"))
+        .and(body_string_contains(
+            "https://github.com/owner/repo/pull/10",
+        ))
+        .and(body_string_contains("diff --git"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&oc_mock)
+        .await;
+
     let result = run_review_check(&deps, &ctx, &oc).await;
     assert!(
         result.is_ok(),

@@ -8,13 +8,18 @@
 pub mod checks;
 pub mod helpers;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::config::GitSection;
 use crate::external_agent::opencode::AgentInfo;
 use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::ParsedRepo;
 
-use self::checks::{OpencodeSessionConfig, run_review_check, run_todo_check, run_triage_check};
+use self::checks::{
+    OPENCODE_HEALTHY_LOGGED, OPENCODE_UNHEALTHY_LOGGED, OpencodeSessionConfig, run_review_check,
+    run_todo_check, run_triage_check, run_triage_completion_check,
+};
 use self::helpers::{
     LogLevel, WorkflowContext, WorkflowError, log_deduped, resolve_context,
     resolve_project_id_cached, write_project_id,
@@ -122,6 +127,7 @@ impl WorkflowStatus {
 /// Orchestrator that runs workflow checks in sequence.
 pub struct Workflow {
     deps: WorkflowContext,
+    error_count: AtomicUsize,
 }
 
 /// A single step in the workflow sequence.
@@ -130,17 +136,19 @@ pub enum WorkflowStep {
     Setup,
     OpencodeCheck,
     Triage,
+    TriageCompletion,
     Todo,
     Review,
 }
 
 impl WorkflowStep {
     /// All workflow steps in execution order.
-    pub fn all() -> [WorkflowStep; 5] {
+    pub fn all() -> [WorkflowStep; 6] {
         [
             WorkflowStep::Setup,
             WorkflowStep::OpencodeCheck,
             WorkflowStep::Triage,
+            WorkflowStep::TriageCompletion,
             WorkflowStep::Todo,
             WorkflowStep::Review,
         ]
@@ -153,6 +161,7 @@ impl WorkflowStep {
             WorkflowStep::Triage => "triage",
             WorkflowStep::Todo => "todo",
             WorkflowStep::Review => "review",
+            WorkflowStep::TriageCompletion => "triage_completion",
         }
     }
 
@@ -162,6 +171,7 @@ impl WorkflowStep {
             WorkflowStep::Setup => workflow.run_setup_check().await,
             WorkflowStep::OpencodeCheck => workflow.run_opencode_check().await,
             WorkflowStep::Triage => workflow.run_triage_check().await,
+            WorkflowStep::TriageCompletion => workflow.run_triage_completion_check().await,
             WorkflowStep::Todo => workflow.run_todo_check().await,
             WorkflowStep::Review => workflow.run_review_check().await,
         }
@@ -171,7 +181,14 @@ impl WorkflowStep {
 impl Workflow {
     /// Create a new `Workflow` with the given dependencies.
     pub fn new(deps: WorkflowContext) -> Self {
-        Self { deps }
+        Self {
+            deps,
+            error_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.error_count.load(Ordering::Relaxed)
     }
 
     // ── Public API ─────────────────────────────────────────────
@@ -195,14 +212,13 @@ impl Workflow {
                     .await;
                     break;
                 }
+                Err(WorkflowError::OpencodeCheckFailed(_)) => {
+                    tracing::warn!("OpenCode unhealthy — skipping remaining steps for this cycle");
+                    break;
+                }
                 Err(e) => {
-                    log_deduped(
-                        &self.deps.log_dedup,
-                        step.name(),
-                        LogLevel::Error,
-                        format!("Step {:?} failed: {}", step, e),
-                    )
-                    .await;
+                    tracing::error!("Step {:?} failed: {}", step, e);
+                    self.error_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -231,15 +247,7 @@ impl Workflow {
 
         let git = &self.deps.config.git;
         let project_name = Self::derive_project_name(git);
-        if let Err(e) = self.setup_project(&project_name, git, persist).await {
-            log_deduped(
-                &self.deps.log_dedup,
-                "setup",
-                LogLevel::Error,
-                format!("Setup check failed for {}: {}", project_name, e),
-            )
-            .await;
-        }
+        self.setup_project(&project_name, git, persist).await?;
         Ok(())
     }
 
@@ -252,16 +260,19 @@ impl Workflow {
         let git = &self.deps.config.git;
         let project_name = Self::derive_project_name(git);
         let oc = self.opencode_config(git);
-        if let Err(e) = self.check_opencode(&oc).await {
-            log_deduped(
-                &self.deps.log_dedup,
-                "opencode",
-                LogLevel::Error,
-                format!("OpenCode check failed for {}: {}", project_name, e),
-            )
-            .await;
+        match self.check_opencode(&oc).await {
+            Err(e) => {
+                log_deduped(
+                    &self.deps.log_dedup,
+                    "opencode",
+                    LogLevel::Error,
+                    format!("OpenCode check failed for {}: {}", project_name, e),
+                )
+                .await;
+                Err(e)
+            }
+            Ok(()) => Ok(()),
         }
-        Ok(())
     }
 
     /// For each project with an OpenCode config: resolve context, then run
@@ -298,6 +309,32 @@ impl Workflow {
                 format!("Triage check failed for {}: {}", project_name, e),
             )
             .await;
+        }
+        Ok(())
+    }
+
+    /// For each project with an OpenCode config: resolve context, then run
+    /// the triage completion check (completed triage sessions → sub-tasks).
+    pub async fn run_triage_completion_check(&self) -> Result<(), WorkflowError> {
+        let Some(_github) = self.deps.github.as_ref() else {
+            tracing::warn!("GitHub client not available — skipping triage completion check");
+            return Ok(());
+        };
+
+        if self.deps.config.opencode.is_none() {
+            return Ok(());
+        }
+
+        let git = &self.deps.config.git;
+        let project_name = Self::derive_project_name(git);
+        let result = async {
+            let ctx = resolve_context(&self.deps.context_deps(), &project_name, git).await?;
+            let oc = self.opencode_config(git);
+            run_triage_completion_check(&self.deps, &ctx, &oc).await
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::error!("Triage completion check failed for {}: {}", project_name, e);
         }
         Ok(())
     }
@@ -477,6 +514,7 @@ impl Workflow {
 
         self.ensure_status_options(&project_id).await?;
         self.ensure_session_id_field(&project_id).await?;
+        self.ensure_wave_id_field(&project_id).await?;
         Ok(())
     }
 
@@ -502,28 +540,49 @@ impl Workflow {
         helpers::ensure_session_id_field(github, project_id).await
     }
 
+    /// Ensure the project has a `waveId` number field.
+    async fn ensure_wave_id_field(&self, project_id: &str) -> Result<(), WorkflowError> {
+        let github = self
+            .deps
+            .github
+            .as_ref()
+            .ok_or_else(|| WorkflowError::NoGitHub(project_id.to_string()))?;
+        helpers::ensure_wave_id_field(github, project_id).await
+    }
+
     /// Check OpenCode server health and verify all required agents exist.
     async fn check_opencode(&self, oc: &OpencodeSessionConfig) -> Result<(), WorkflowError> {
         let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
 
         if !client.check_health().await {
+            if !OPENCODE_UNHEALTHY_LOGGED.swap(true, Ordering::Relaxed) {
+                log_deduped(
+                    &self.deps.log_dedup,
+                    "opencode",
+                    LogLevel::Warn,
+                    format!("OpenCode server at {} is not healthy", oc.url),
+                )
+                .await;
+            }
+            // Reset healthy-logged so the healthy message fires on next recovery.
+            OPENCODE_HEALTHY_LOGGED.store(false, Ordering::Relaxed);
+            return Err(WorkflowError::OpencodeCheckFailed(format!(
+                "OpenCode server at {} is not healthy",
+                oc.url
+            )));
+        }
+
+        if !OPENCODE_HEALTHY_LOGGED.swap(true, Ordering::Relaxed) {
             log_deduped(
                 &self.deps.log_dedup,
                 "opencode",
-                LogLevel::Warn,
-                format!("OpenCode server at {} is not healthy", oc.url),
+                LogLevel::Info,
+                format!("OpenCode server at {} is healthy", oc.url),
             )
             .await;
-            return Ok(());
         }
-
-        log_deduped(
-            &self.deps.log_dedup,
-            "opencode",
-            LogLevel::Info,
-            format!("OpenCode server at {} is healthy", oc.url),
-        )
-        .await;
+        // Reset unhealthy-logged so the warning fires on next degradation.
+        OPENCODE_UNHEALTHY_LOGGED.store(false, Ordering::Relaxed);
 
         let agents: Vec<AgentInfo> = client
             .get_agents(Some(oc.directory.as_str()))
@@ -712,6 +771,17 @@ mod tests {
             .mount(&mock)
             .await;
 
+        // Mock: createProjectV2Field for waveId (must be before createProjectV2 due to substring match)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
         // Mock: createProjectV2 → pid (expect 1)
         Mock::given(method("POST"))
             .and(path("/graphql"))
@@ -744,7 +814,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        // Mock: fields with sessionId present
+        // Mock: fields with sessionId present (hit twice: ensure_session_id_field + ensure_wave_id_field)
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_string_contains("fields(first:"))
@@ -760,6 +830,7 @@ mod tests {
                     }
                 }
             })))
+            .expect(2)
             .mount(&mock)
             .await;
 
@@ -843,7 +914,7 @@ mod tests {
         let workflow = Workflow::new(deps);
         let result = workflow.run_setup_check().await;
 
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(WorkflowError::NoStatusField(_))));
     }
 
     // ── run_triage_check skips project without opencode (test 5) ─
@@ -894,6 +965,17 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": { "user": { "id": "uid" }, "organization": null }
             })))
+            .mount(&mock)
+            .await;
+
+        // Mock createProjectV2Field for waveId (must be before createProjectV2 due to substring match)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
             .mount(&mock)
             .await;
 
@@ -1034,6 +1116,17 @@ mod tests {
             .mount(&mock)
             .await;
 
+        // Mock createProjectV2Field for waveId (missing from fields response)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
         // createProjectV2 should NOT be called
         Mock::given(method("POST"))
             .and(path("/graphql"))
@@ -1126,6 +1219,18 @@ mod tests {
                     }
                 }
             })))
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        // Mock createProjectV2Field for waveId (missing from fields response)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
             .mount(&mock)
             .await;
 
@@ -1416,7 +1521,7 @@ mod tests {
     // ── check_opencode when not healthy (test 14) ────────────
 
     #[tokio::test]
-    async fn check_opencode_unhealthy_returns_early() {
+    async fn check_opencode_unhealthy_returns_error() {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -1449,7 +1554,7 @@ mod tests {
         let workflow = Workflow::new(deps);
         let result = workflow.check_opencode(&oc).await;
 
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(WorkflowError::OpencodeCheckFailed(_))));
         mock.verify().await;
     }
 
@@ -1546,5 +1651,166 @@ mod tests {
         let workflow = Workflow::new(deps);
         let result = workflow.run_all().await;
         assert!(result.is_ok());
+    }
+
+    // ── run_all skips steps when opencode unhealthy (test 17) ─
+
+    /// Verify that when OpenCode is unhealthy, run_all breaks after
+    /// OpencodeCheck and does not run Triage/Todo/Review steps.
+    #[tokio::test]
+    async fn run_all_skips_steps_when_opencode_unhealthy() {
+        let oc_mock = MockServer::start().await;
+
+        // OpenCode health endpoint returns unhealthy
+        Mock::given(method("GET"))
+            .and(path("/global/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "healthy": false,
+                "version": "1.0.0"
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        // GitHub mocks for setup (should succeed)
+        let gh_mock = MockServer::start().await;
+        let client = gh_client(&gh_mock);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&gh_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"sessionId","dataType":"TEXT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(2)
+            .mount(&gh_mock)
+            .await;
+
+        // Mock createProjectV2Field for waveId (missing from fields response)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
+            .mount(&gh_mock)
+            .await;
+
+        // Agent endpoint should NOT be called (opencode check fails before agents)
+        Mock::given(method("GET"))
+            .and(path("/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let deps = WorkflowContext {
+            config: GitAutomateConfig {
+                git: GitSection {
+                    repository: "https://github.com/owner/repo".to_string(),
+                    project_id: Some("PID-123".to_string()),
+                    directory: "/test-work".to_string(),
+                    issue_provider: "github".to_string(),
+                    title_pattern: "@ai.*".to_string(),
+                    trello_api_key: None,
+                    trello_token: None,
+                    trello_board_id: None,
+                    token: None,
+                    branch_name: None,
+                },
+                opencode: Some(crate::config::OpencodeConfig {
+                    url: oc_mock.uri(),
+                    pw: "test-pw".to_string(),
+                    cwd: "/test-work".to_string(),
+                    project: "test-project".to_string(),
+                    concurrency: HashMap::new(),
+                }),
+            },
+            github: Some(client),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let workflow = Workflow::new(deps);
+        let result = workflow.run_all().await;
+
+        assert!(result.is_ok());
+        // Error count should be 0 — OpencodeCheckFailed breaks without incrementing
+        assert_eq!(workflow.error_count(), 0);
+        gh_mock.verify().await;
+        oc_mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn workflow_error_count_increments_on_failure() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "node": { "field": null } }
+            })))
+            .mount(&mock)
+            .await;
+
+        let client = gh_client(&mock);
+        let deps = WorkflowContext {
+            config: GitAutomateConfig {
+                git: GitSection {
+                    repository: "https://github.com/owner/repo".to_string(),
+                    project_id: Some("PID-1".to_string()),
+                    directory: "/test-work".to_string(),
+                    issue_provider: "github".to_string(),
+                    title_pattern: "@ai.*".to_string(),
+                    trello_api_key: None,
+                    trello_token: None,
+                    trello_board_id: None,
+                    token: None,
+                    branch_name: None,
+                },
+                opencode: None,
+            },
+            github: Some(client),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            log_dedup: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let workflow = Workflow::new(deps);
+        assert_eq!(workflow.error_count(), 0);
+
+        let result = workflow.run_all().await;
+        assert!(result.is_ok());
+        assert!(workflow.error_count() > 0);
     }
 }
