@@ -23,6 +23,7 @@ urlencoding = "2"
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+apollo-compiler = "1"
 
 [lib]
 path = "src/lib.rs"

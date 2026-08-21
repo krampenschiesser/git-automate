@@ -7,5 +7,8 @@ pub mod project;
 pub mod repo;
 pub mod types;
 
+#[cfg(test)]
+mod queries_test;
+
 // Convenience re-exports
 pub use client::{GitHubClient, GitHubError};
