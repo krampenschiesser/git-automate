@@ -16,9 +16,6 @@ query GetProjectItemValues($id: ID!) {
                             ... on ProjectV2IterationField {
                                 name
                             }
-                            ... on ProjectV2MultiSelectField {
-                                name
-                            }
                         }
                     }
                     ... on ProjectV2ItemFieldSingleSelectValue {
@@ -31,9 +28,6 @@ query GetProjectItemValues($id: ID!) {
                                 name
                             }
                             ... on ProjectV2IterationField {
-                                name
-                            }
-                            ... on ProjectV2MultiSelectField {
                                 name
                             }
                         }
@@ -50,9 +44,6 @@ query GetProjectItemValues($id: ID!) {
                             ... on ProjectV2IterationField {
                                 name
                             }
-                            ... on ProjectV2MultiSelectField {
-                                name
-                            }
                         }
                     }
                     ... on ProjectV2ItemFieldDateValue {
@@ -67,9 +58,6 @@ query GetProjectItemValues($id: ID!) {
                             ... on ProjectV2IterationField {
                                 name
                             }
-                            ... on ProjectV2MultiSelectField {
-                                name
-                            }
                         }
                     }
                     ... on ProjectV2ItemFieldIterationValue {
@@ -82,9 +70,6 @@ query GetProjectItemValues($id: ID!) {
                                 name
                             }
                             ... on ProjectV2IterationField {
-                                name
-                            }
-                            ... on ProjectV2MultiSelectField {
                                 name
                             }
                         }
