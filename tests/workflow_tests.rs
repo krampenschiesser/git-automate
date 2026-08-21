@@ -34,7 +34,7 @@ async fn test_full_triage_flow_with_mocks() {
         .and(body_string_contains("createProjectV2Field"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "createProjectV2Field": { "projectField": { "id": "wave-field-id" } }
+                "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } }
             }
         })))
         .mount(&gh_mock)
@@ -231,7 +231,7 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
         .and(path("/graphql"))
         .and(body_string_contains("createProjectV2(input"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "createProjectV2": { "id": "PVT-123" } }
+            "data": { "createProjectV2": { "projectV2": { "id": "PVT-123" } } }
         })))
         .expect(1)
         .named("create_project_v2")
@@ -276,7 +276,7 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
         .and(body_string_contains("waveId"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "createProjectV2Field": { "projectField": { "id": "wave-field-id" } }
+                "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } }
             }
         })))
         .expect(1)
@@ -310,7 +310,7 @@ async fn test_setup_initialization_creates_project_fields_and_statuses() {
         .and(body_string_contains("sessionId"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "createProjectV2Field": { "projectField": { "id": "session-field-id" } }
+                "createProjectV2Field": { "projectV2Field": { "id": "session-field-id" } }
             }
         })))
         .expect(1)
@@ -445,7 +445,7 @@ async fn test_setup_initialization_idempotent_when_everything_exists() {
         .and(body_string_contains("createProjectV2Field"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "createProjectV2Field": { "projectField": { "id": "session-field-id" } }
+                "createProjectV2Field": { "projectV2Field": { "id": "session-field-id" } }
             }
         })))
         .expect(0)
@@ -468,7 +468,7 @@ async fn test_setup_initialization_idempotent_when_everything_exists() {
         .and(path("/graphql"))
         .and(body_string_contains("createProjectV2(input"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "createProjectV2": { "id": "PVT-999" } }
+            "data": { "createProjectV2": { "projectV2": { "id": "PVT-999" } } }
         })))
         .expect(0)
         .named("create_project_v2_should_not_be_called")
@@ -565,7 +565,7 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
         .and(body_string_contains("waveId"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "createProjectV2Field": { "projectField": { "id": "wave-field-id" } }
+                "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } }
             }
         })))
         .expect(1)
@@ -599,7 +599,7 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
         .and(body_string_contains("sessionId"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "createProjectV2Field": { "projectField": { "id": "session-field-id" } }
+                "createProjectV2Field": { "projectV2Field": { "id": "session-field-id" } }
             }
         })))
         .expect(1)
@@ -611,7 +611,7 @@ async fn test_setup_initialization_adds_missing_status_options_and_field() {
         .and(path("/graphql"))
         .and(body_string_contains("createProjectV2(input"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "createProjectV2": { "id": "PVT-999" } }
+            "data": { "createProjectV2": { "projectV2": { "id": "PVT-999" } } }
         })))
         .expect(0)
         .named("create_project_v2_should_not_be_called")
@@ -747,7 +747,7 @@ async fn test_setup_resolves_numeric_project_id_to_global_id() {
         .and(body_string_contains("createProjectV2Field"))
         .and(body_string_contains("waveId"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
         })))
         .expect(1)
         .named("add_wave_id_field")

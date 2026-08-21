@@ -242,7 +242,7 @@ impl GitHubClient {
             )
             .await?;
 
-        Ok(result.create_project_v2.id)
+        Ok(result.create_project_v2.project_v2.id)
     }
 
     /// Resolve a Project V2 by its number to a global node ID.
@@ -347,7 +347,7 @@ impl GitHubClient {
             )
             .await?;
 
-        Ok(result.create_project_v2_field.project_field.id)
+        Ok(result.create_project_v2_field.project_v2_field.id)
     }
 
     /// Find the project's "Status" single-select field and its options.
@@ -1016,7 +1016,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2": { "id": "pid1" } }
+                "data": { "createProjectV2": { "projectV2": { "id": "pid1" } } }
             })))
             .mount(&mock)
             .await;
@@ -1026,7 +1026,7 @@ mod tests {
             .await
             .expect("graphql should succeed");
 
-        assert_eq!(result.create_project_v2.id, "pid1");
+        assert_eq!(result.create_project_v2.project_v2.id, "pid1");
     }
 
     /// Test 2: graphql<T> with mock returning 500 → Err(HttpStatus(500))
@@ -1134,7 +1134,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2": { "id": "pid1" } }
+                "data": { "createProjectV2": { "projectV2": { "id": "pid1" } } }
             })))
             .mount(&mock)
             .await;

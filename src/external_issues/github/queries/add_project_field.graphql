@@ -1,7 +1,9 @@
 mutation AddProjectField($input: CreateProjectV2FieldInput!) {
     createProjectV2Field(input: $input) {
-        projectField {
-            id
+        projectV2Field {
+            ... on Node {
+                id
+            }
         }
     }
 }
