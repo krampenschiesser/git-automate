@@ -339,6 +339,14 @@ pub struct RestCreatedIssue {
     pub state: String,
 }
 
+/// Information about a pull request, used by workflow checks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct PrInfo {
+    pub number: i64,
+    pub url: String,
+    pub title: String,
+}
+
 /// Helper struct for responses that just need an `id` field.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct IdHolder {
