@@ -1,0 +1,9 @@
+mutation RemoveProjectStatusOptions($input: UpdateProjectV2FieldInput!) {
+    updateProjectV2Field(input: $input) {
+        projectV2Field {
+            ... on ProjectV2Field {
+                id
+            }
+        }
+    }
+}

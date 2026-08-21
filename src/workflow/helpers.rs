@@ -26,6 +26,9 @@ pub const STATUS_FIELD_NAME: &str = "Status";
 /// Name of the custom text field that stores the OpenCode session ID.
 pub const SESSION_FIELD_NAME: &str = "sessionId";
 
+/// Name of the custom number field that stores the wave ID.
+pub const WAVE_FIELD_NAME: &str = "waveId";
+
 // ─── Error type ───────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +53,8 @@ pub enum WorkflowError {
     GitHub(#[from] GitHubError),
     #[error("OpenCode concurrency limit exceeded")]
     ConcurrencyExceeded,
+    #[error("OpenCode check failed: {0}")]
+    OpencodeCheckFailed(String),
     #[error("{0}")]
     Other(String),
 }
@@ -66,11 +71,12 @@ pub struct ProjectContext {
     pub project_id: String,
 }
 
-/// Resolved IDs for the Status field and (optionally) the sessionId field.
+/// Resolved IDs for the Status field and (optionally) the sessionId and waveId fields.
 #[derive(Debug, Clone)]
 pub struct FieldIds {
     pub status_field_id: String,
     pub session_field_id: Option<String>,
+    pub wave_field_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,10 +259,24 @@ pub fn parse_resolve_threads(messages: &[String]) -> Vec<String> {
 
 /// Build a branch name from the config's `branch_name` format template.
 /// Uses `{N}` as the placeholder for the issue/PR number.
+/// Uses `{M}` as the placeholder for the sub-issue index (optional).
 /// When the config field is unset, defaults to `"issue-{N}"`.
-pub fn branch_name_for_issue(issue_number: i64, git: &GitSection) -> String {
+/// When `sub_index` is `None`, the `{M}` placeholder and any preceding
+/// `-sub-` segment are removed from the output.
+pub fn branch_name_for_issue(
+    issue_number: i64,
+    git: &GitSection,
+    sub_index: Option<i64>,
+) -> String {
     let template = git.branch_name.as_deref().unwrap_or("issue-{N}");
-    template.replace("{N}", &issue_number.to_string())
+    let mut result = template.replace("{N}", &issue_number.to_string());
+    if let Some(m) = sub_index {
+        result = result.replace("{M}", &m.to_string());
+    } else {
+        result = result.replace("-sub-{M}", "");
+        result = result.replace("{M}", "");
+    }
+    result
 }
 
 // ─── Config helpers ───────────────────────────────────────────
@@ -438,6 +458,7 @@ pub async fn resolve_context(
     // checks are resilient even without setup_project having run first.
     ensure_status_options(github, &project_id).await?;
     ensure_session_id_field(github, &project_id).await?;
+    ensure_wave_id_field(github, &project_id).await?;
 
     Ok(ProjectContext {
         name: project_name.to_string(),
@@ -459,26 +480,44 @@ pub async fn ensure_status_options(
         .await?
         .ok_or_else(|| WorkflowError::NoStatusField(project_id.to_string()))?;
 
-    let existing: HashSet<&str> = status_field
+    let valid_names: HashSet<&str> = WorkflowStatus::all().iter().map(|s| s.as_str()).collect();
+
+    let stale_options: Vec<String> = status_field
         .options
         .iter()
+        .filter(|o| !valid_names.contains(o.name.as_str()))
+        .map(|o| o.id.clone())
+        .collect();
+
+    if !stale_options.is_empty() {
+        tracing::info!("Removing {} stale status options", stale_options.len());
+        github
+            .remove_project_status_options(&status_field.id, &stale_options)
+            .await?;
+    }
+
+    let final_existing: HashSet<&str> = status_field
+        .options
+        .iter()
+        .filter(|o| valid_names.contains(o.name.as_str()))
         .map(|o| o.name.as_str())
         .collect();
 
     let all_options: Vec<Value> = status_field
         .options
         .iter()
+        .filter(|o| valid_names.contains(o.name.as_str()))
         .map(|o| json!({ "id": o.id, "name": o.name, "color": "GRAY", "description": "" }))
         .chain(
             WorkflowStatus::all()
                 .iter()
                 .map(|s| s.as_str())
-                .filter(|opt| !existing.contains(opt))
+                .filter(|opt| !final_existing.contains(opt))
                 .map(|name| json!({ "name": name, "color": "GRAY", "description": "" })),
         )
         .collect();
 
-    let missing_count = all_options.len() - status_field.options.len();
+    let missing_count = all_options.len() - final_existing.len();
     if missing_count > 0 {
         tracing::info!("Adding {} status options", missing_count);
         github
@@ -506,6 +545,24 @@ pub async fn ensure_session_id_field(
     Ok(())
 }
 
+/// Ensure the project has a `waveId` number field, creating it if missing.
+/// Equivalent to the private `Workflow::ensure_wave_id_field` method in `mod.rs`.
+pub async fn ensure_wave_id_field(
+    github: &GitHubClient,
+    project_id: &str,
+) -> Result<(), WorkflowError> {
+    let fields = github.get_project_fields(project_id).await?;
+    let has_wave_id = fields.iter().any(|f| f.name == WAVE_FIELD_NAME);
+
+    if !has_wave_id {
+        tracing::info!("Adding waveId field");
+        github
+            .add_project_field(project_id, WAVE_FIELD_NAME, "NUMBER")
+            .await?;
+    }
+    Ok(())
+}
+
 /// Resolve the Status and sessionId field IDs for a project.
 ///
 /// Equivalent to TS `resolveFieldIds`.
@@ -523,10 +580,15 @@ pub async fn resolve_field_ids(
         .iter()
         .find(|f| f.name == SESSION_FIELD_NAME)
         .map(|f| f.id.clone());
+    let wave_field = fields
+        .iter()
+        .find(|f| f.name == WAVE_FIELD_NAME)
+        .map(|f| f.id.clone());
 
     Ok(FieldIds {
         status_field_id: status_field.id,
         session_field_id: session_field,
+        wave_field_id: wave_field,
     })
 }
 
@@ -1144,7 +1206,7 @@ mod tests {
                     }
                 }
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -1159,8 +1221,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -1235,6 +1299,16 @@ mod tests {
                     }
                 }
             })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -1300,6 +1374,16 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
             .and(body_string_contains("createProjectV2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "createProjectV2": { "id": "NEW_PID" } }
@@ -1344,7 +1428,7 @@ mod tests {
                     }
                 }
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -1529,6 +1613,107 @@ mod tests {
         server.verify().await;
     }
 
+    #[tokio::test]
+    async fn ensure_status_options_removes_stale_only() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o1","name":"Triage"},{"id":"o2","name":"Todo"},
+                                {"id":"o3","name":"In Development"},{"id":"o4","name":"Review Technical"},
+                                {"id":"o5","name":"Review Product"},{"id":"o6","name":"QA"},{"id":"o7","name":"Done"},
+                                {"id":"o8","name":"Obsolete"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("RemoveProjectStatusOptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "sf" } } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("AddProjectStatusOptions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let result = ensure_status_options(&client, "PID-123").await;
+        assert!(result.is_ok());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_status_options_removes_stale_and_adds_missing() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id":"o7","name":"Done"},
+                                {"id":"o8","name":"Obsolete"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("RemoveProjectStatusOptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "sf" } } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("AddProjectStatusOptions"))
+            .and(body_string_contains("... on ProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "updateProjectV2Field": { "projectV2Field": { "id": "sf" } } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = ensure_status_options(&client, "PID-123").await;
+        assert!(result.is_ok());
+        server.verify().await;
+    }
+
     // ── ensure_session_id_field standalone function tests ─────────
 
     #[tokio::test]
@@ -1606,6 +1791,83 @@ mod tests {
         server.verify().await;
     }
 
+    // ── ensure_wave_id_field standalone function tests ──────────
+
+    #[tokio::test]
+    async fn ensure_wave_id_field_exists_no_add() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                                {"id":"f2","name":"waveId","dataType":"NUMBER"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let result = ensure_wave_id_field(&client, "PID-123").await;
+        assert!(result.is_ok());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_wave_id_field_missing_calls_add() {
+        let server = MockServer::start().await;
+        let client = gh_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id":"f1","name":"Status","dataType":"SINGLE_SELECT"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("createProjectV2Field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = ensure_wave_id_field(&client, "PID-123").await;
+        assert!(result.is_ok());
+        server.verify().await;
+    }
+
     // ── resolve_context new behavior tests ────────────────────────
 
     #[tokio::test]
@@ -1647,7 +1909,7 @@ mod tests {
                     }
                 }
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -1665,8 +1927,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -1725,7 +1989,7 @@ mod tests {
                     }
                 }
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -1743,7 +2007,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "createProjectV2Field": { "projectField": { "id": "field-id" } } }
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -1812,6 +2076,7 @@ mod tests {
             .expect("resolve_field_ids should succeed");
         assert_eq!(ids.status_field_id, "status-field-id");
         assert_eq!(ids.session_field_id.as_deref(), Some("session-field-id"));
+        assert!(ids.wave_field_id.is_none());
     }
 
     #[tokio::test]
@@ -1878,6 +2143,7 @@ mod tests {
             .expect("resolve_field_ids should succeed");
         assert_eq!(ids.status_field_id, "status-field-id");
         assert!(ids.session_field_id.is_none());
+        assert!(ids.wave_field_id.is_none());
     }
 
     #[tokio::test]
@@ -2122,5 +2388,29 @@ mod tests {
         ];
         let result = parse_resolve_threads(&messages);
         assert_eq!(result, vec!["TH_123", "TH_456"]);
+    }
+
+    // ── branch_name_for_issue tests ──────────────────────────────
+
+    // Test: branch_name_for_sub_issue with sub_index → replaces {M}
+    #[test]
+    fn branch_name_for_sub_issue() {
+        let git = GitSection {
+            branch_name: Some("issue-{N}-sub-{M}".to_string()),
+            ..test_git_section(None)
+        };
+        let result = branch_name_for_issue(123, &git, Some(1));
+        assert_eq!(result, "issue-123-sub-1");
+    }
+
+    // Test: branch_name_for_main_issue_unchanged — {M} stripped when sub_index is None
+    #[test]
+    fn branch_name_for_main_issue_unchanged() {
+        let git = GitSection {
+            branch_name: Some("issue-{N}-sub-{M}".to_string()),
+            ..test_git_section(None)
+        };
+        let result = branch_name_for_issue(123, &git, None);
+        assert_eq!(result, "issue-123");
     }
 }

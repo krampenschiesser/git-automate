@@ -396,6 +396,54 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Remove stale options from a single-select field by updating it with
+    /// only the remaining (non-stale) options.
+    ///
+    /// Fetches the current field options, filters out the given option IDs,
+    /// and calls `updateProjectV2Field` with the filtered list.
+    pub async fn remove_project_status_options(
+        &self,
+        field_id: &str,
+        option_ids_to_remove: &[String],
+    ) -> Result<(), GitHubError> {
+        let result = self
+            .graphql::<StatusFieldResult>(
+                include_str!("queries/get_project_status_field.graphql"),
+                Some(&json!({ "id": field_id, "name": "Status" })),
+            )
+            .await?;
+
+        let field = match result.node.and_then(|n| n.field) {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+
+        let options_len = field.options.len();
+        let remaining: Vec<Value> = field
+            .options
+            .into_iter()
+            .filter(|o| !option_ids_to_remove.contains(&o.id))
+            .map(|o| json!({ "id": o.id, "name": o.name, "color": "GRAY", "description": "" }))
+            .collect();
+
+        if remaining.len() == options_len {
+            return Ok(());
+        }
+
+        self.graphql::<UpdateFieldConfigResult>(
+            include_str!("queries/remove_project_status_options.graphql"),
+            Some(&json!({
+                "input": {
+                    "fieldId": field_id,
+                    "singleSelectOptions": remaining,
+                }
+            })),
+        )
+        .await?;
+
+        Ok(())
+    }
+
     /// List all items in a Project V2 with their content reference.
     ///
     /// Items whose `content` is `null` are filtered out.
@@ -480,6 +528,30 @@ impl GitHubClient {
                     "itemId": item_id,
                     "fieldId": field_id,
                     "value": { "text": session_id },
+                }
+            })),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Set a number field (e.g. waveId) value on a project item.
+    pub async fn update_project_item_wave_id(
+        &self,
+        project_id: &str,
+        item_id: &str,
+        field_id: &str,
+        wave_id: i64,
+    ) -> Result<(), GitHubError> {
+        self.graphql::<UpdateItemFieldValueResult>(
+            include_str!("queries/update_project_item_wave_id.graphql"),
+            Some(&json!({
+                "input": {
+                    "projectId": project_id,
+                    "itemId": item_id,
+                    "fieldId": field_id,
+                    "value": { "number": wave_id as f64 },
                 }
             })),
         )
@@ -845,6 +917,77 @@ impl GitHubClient {
         .await?;
 
         Ok(())
+    }
+
+    // ── PR lookup methods (REST) ───────────────────────────────
+
+    /// Find a pull request for a given branch in a repository.
+    ///
+    /// Returns `Ok(Some(pr))` if a PR exists for the branch,
+    /// `Ok(None)` if no PR is found, or `Err` for other HTTP errors.
+    pub async fn get_pull_request_for_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<PrInfo>, GitHubError> {
+        let path = format!("/repos/{}/{}/pulls", owner, repo);
+        let url = format!(
+            "{}{}?head={}:{}&state=all",
+            self.base_url, path, owner, branch
+        );
+        let request = self.client.get(&url).build()?;
+        let response = self.execute_with_retry(request).await?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            return Err(GitHubError::HttpStatus(status));
+        }
+
+        let body_str = response.text().await?;
+        let prs: Vec<PrInfo> = serde_json::from_str(&body_str)?;
+
+        Ok(prs.into_iter().next())
+    }
+
+    /// Get the diff for a pull request.
+    pub async fn get_pr_diff(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<String, GitHubError> {
+        let path = format!("/repos/{}/{}/pulls/{}", owner, repo, pr_number);
+        let url = format!("{}{}", self.base_url, path);
+        let request = self
+            .client
+            .get(&url)
+            .header(
+                header::ACCEPT,
+                HeaderValue::from_static("application/vnd.github.v3.diff"),
+            )
+            .build()?;
+        let response = self.execute_with_retry(request).await?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            return Err(GitHubError::HttpStatus(status));
+        }
+
+        Ok(response.text().await?)
+    }
+
+    /// Get the URL for a pull request.
+    pub async fn get_pr_url(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<String, GitHubError> {
+        let path = format!("/repos/{}/{}/pulls/{}", owner, repo, pr_number);
+        let data = self.rest_get(&path, None).await?;
+        let pr: PrInfo = serde_json::from_value(data)?;
+        Ok(pr.url)
     }
 }
 
@@ -1964,5 +2107,249 @@ mod tests {
 
         let result = client.resolve_review_thread("thread1").await;
         assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
+    }
+
+    /// T34: remove_project_status_options fetches field, filters stale options,
+    /// and calls updateProjectV2Field with remaining options only.
+    #[tokio::test]
+    async fn remove_project_status_options_removes_stale() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        // First call: get_project_status_field → returns 3 options (2 valid + 1 stale)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id": "o1", "name": "Triage"},
+                                {"id": "o2", "name": "Todo"},
+                                {"id": "o3", "name": "Obsolete"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Second call: remove_project_status_options → updateProjectV2Field with 2 remaining
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("RemoveProjectStatusOptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2Field": {
+                        "projectV2Field": { "id": "sf" }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .remove_project_status_options("sf", &["o3".to_string()])
+            .await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
+    /// T35: remove_project_status_options with no stale options → no update call
+    #[tokio::test]
+    async fn remove_project_status_options_no_stale_returns_ok() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "sf",
+                            "options": [
+                                {"id": "o1", "name": "Triage"},
+                                {"id": "o2", "name": "Todo"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Remove mutation should NOT be called — no stale options
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("RemoveProjectStatusOptions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .remove_project_status_options("sf", &["o99".to_string()])
+            .await;
+
+        assert!(result.is_ok());
+        mock.verify().await;
+    }
+
+    /// T36: get_pull_request_for_branch → returns Some(PrInfo) when PR exists
+    #[tokio::test]
+    async fn get_pull_request_for_branch_returns_pr() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "number": 42,
+                    "url": "https://api.github.com/repos/owner/repo/pulls/42",
+                    "title": "Fix bug"
+                }
+            ])))
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .get_pull_request_for_branch("owner", "repo", "issue-42")
+            .await
+            .expect("should succeed");
+
+        assert!(result.is_some());
+        let pr = result.unwrap();
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.url, "https://api.github.com/repos/owner/repo/pulls/42");
+        assert_eq!(pr.title, "Fix bug");
+    }
+
+    /// T37: get_pull_request_for_branch → returns None when no PR exists
+    #[tokio::test]
+    async fn get_pull_request_for_branch_returns_none() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .get_pull_request_for_branch("owner", "repo", "issue-99")
+            .await
+            .expect("should succeed");
+
+        assert!(result.is_none());
+    }
+
+    /// T38: get_pull_request_for_branch → 500 returns error
+    #[tokio::test]
+    async fn get_pull_request_for_branch_500_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .get_pull_request_for_branch("owner", "repo", "issue-42")
+            .await;
+
+        assert!(matches!(result, Err(GitHubError::HttpStatus(500))));
+    }
+
+    /// T39: get_pr_diff → returns diff string
+    #[tokio::test]
+    async fn get_pr_diff_returns_diff() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("diff --git a/main.rs b/main.rs\n+println!(\"hello\");\n"),
+            )
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .get_pr_diff("owner", "repo", 42)
+            .await
+            .expect("should succeed");
+
+        assert!(result.contains("diff --git"));
+        assert!(result.contains("println!(\"hello\");"));
+    }
+
+    /// T40: get_pr_diff → 404 returns error
+    #[tokio::test]
+    async fn get_pr_diff_404_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/99"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+
+        let result = client.get_pr_diff("owner", "repo", 99).await;
+        assert!(matches!(result, Err(GitHubError::HttpStatus(404))));
+    }
+
+    /// T41: get_pr_url → returns PR URL
+    #[tokio::test]
+    async fn get_pr_url_returns_url() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "number": 42,
+                "url": "https://api.github.com/repos/owner/repo/pulls/42",
+                "title": "Fix bug"
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = client
+            .get_pr_url("owner", "repo", 42)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result, "https://api.github.com/repos/owner/repo/pulls/42");
+    }
+
+    /// T42: get_pr_url → 404 returns error
+    #[tokio::test]
+    async fn get_pr_url_404_returns_error() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/99"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+
+        let result = client.get_pr_url("owner", "repo", 99).await;
+        assert!(matches!(result, Err(GitHubError::HttpStatus(404))));
     }
 }
