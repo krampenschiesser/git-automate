@@ -1546,7 +1546,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -1631,7 +1631,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -1700,7 +1700,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -1710,7 +1710,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2": { "id": "NEW_PID" } }
+                "data": { "createProjectV2": { "projectV2": { "id": "NEW_PID" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -2104,7 +2104,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "field-id" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -2181,7 +2181,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -2252,7 +2252,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&server)
@@ -2329,7 +2329,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "field-id" } } }
             })))
             .expect(2)
             .mount(&server)

@@ -776,7 +776,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&mock)
@@ -787,7 +787,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2": { "id": "new-pid" } }
+                "data": { "createProjectV2": { "projectV2": { "id": "new-pid" } } }
             })))
             .expect(1)
             .mount(&mock)
@@ -973,7 +973,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&mock)
@@ -984,7 +984,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2": { "id": "new-pid" } }
+                "data": { "createProjectV2": { "projectV2": { "id": "new-pid" } } }
             })))
             .expect(1)
             .mount(&mock)
@@ -1121,7 +1121,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&mock)
@@ -1132,7 +1132,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2": { "id": "should-not-be-called" } }
+                "data": { "createProjectV2": { "projectV2": { "id": "should-not-be-called" } } }
             })))
             .expect(0)
             .mount(&mock)
@@ -1228,7 +1228,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&mock)
@@ -1238,7 +1238,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2": { "id": "should-not-be-called" } }
+                "data": { "createProjectV2": { "projectV2": { "id": "should-not-be-called" } } }
             })))
             .expect(0)
             .mount(&mock)
@@ -1414,7 +1414,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "should-not" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "should-not" } } }
             })))
             .expect(0)
             .mount(&mock)
@@ -1457,7 +1457,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "new-field" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "new-field" } } }
             })))
             .expect(1)
             .mount(&mock)
@@ -1720,7 +1720,7 @@ mod tests {
             .and(path("/graphql"))
             .and(body_string_contains("createProjectV2Field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "createProjectV2Field": { "projectField": { "id": "wave-field-id" } } }
+                "data": { "createProjectV2Field": { "projectV2Field": { "id": "wave-field-id" } } }
             })))
             .expect(1)
             .mount(&gh_mock)

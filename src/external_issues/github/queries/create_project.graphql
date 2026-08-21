@@ -1,5 +1,7 @@
 mutation CreateProject($input: CreateProjectV2Input!) {
     createProjectV2(input: $input) {
-        id
+        projectV2 {
+            id
+        }
     }
 }

@@ -73,7 +73,8 @@ pub struct CreateProjectV2Result {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct CreateProjectV2Inner {
-    pub id: String,
+    #[serde(rename = "projectV2")]
+    pub project_v2: IdHolder,
 }
 
 /// Response for `get_project` query.
@@ -145,8 +146,8 @@ pub struct CreateFieldResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct CreateFieldInner {
-    #[serde(rename = "projectField")]
-    pub project_field: IdHolder,
+    #[serde(rename = "projectV2Field")]
+    pub project_v2_field: IdHolder,
 }
 
 /// Response for `get_project_status_field` query.
