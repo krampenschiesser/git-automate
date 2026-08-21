@@ -86,6 +86,14 @@ pub struct OpencodeSessionConfig {
 /// current daemon cycle. Reset to `false` on daemon restart (static variable).
 static CAPACITY_EXCEEDED: AtomicBool = AtomicBool::new(false);
 
+/// Tracks whether the healthy log message has already been emitted for the
+/// current health-check cycle. Reset to `false` on daemon restart (static).
+pub(crate) static OPENCODE_HEALTHY_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Tracks whether the unhealthy log message has already been emitted for the
+/// current health-check cycle. Reset to `false` on daemon restart (static).
+pub(crate) static OPENCODE_UNHEALTHY_LOGGED: AtomicBool = AtomicBool::new(false);
+
 // ─── start_opencode_session ────────────────────────────────────
 
 /// Start an OpenCode session with the given system prompt and user message.
@@ -330,16 +338,52 @@ pub async fn run_todo_check(
     let project_items = github.list_project_items(&ctx.project_id).await?;
     let issue_map = get_issue_body_map(github, &ctx.owner, &ctx.repo).await?;
 
+    // Build a map of item_id → (wave_id, status, has_session) for wave
+    // dependency checking.
+    let mut item_wave_status: HashMap<String, (Option<i64>, String, bool)> = HashMap::new();
+    for item in &project_items {
+        let item_values = github.get_project_item_values(&item.id).await?;
+        let status = item_values
+            .get("Status")
+            .and_then(|v| v.as_deref())
+            .unwrap_or("")
+            .to_string();
+        let wave_id = if let Some(wave_str) = item_values.get("waveId") {
+            wave_str.as_ref().unwrap().parse::<i64>().ok()
+        } else {
+            None
+        };
+        let has_session = extract_session_id(&item_values).is_some();
+        item_wave_status.insert(item.id.clone(), (wave_id, status, has_session));
+    }
+
     // Collect items that are "Todo" and have no session yet.
     let mut todo_items: Vec<(String, i64)> = Vec::new();
     for item in &project_items {
-        let item_values = github.get_project_item_values(&item.id).await?;
-        let status = item_values.get("Status").and_then(|v| v.as_deref());
-        if status == Some("Todo") {
-            let session_text = extract_session_id(&item_values);
-            if session_text.is_none() {
-                todo_items.push((item.id.clone(), item.content_number));
+        let (wave_id, ref status, has_session) = item_wave_status[&item.id];
+        if status == "Todo" && !has_session {
+            // Wave dependency filtering for sub-issues: a sub-issue with
+            // waveId=W may only start if all sub-issues with waveId < W are
+            // in "Done" status.
+            if let Some(wave) = wave_id {
+                let all_lower_waves_done =
+                    item_wave_status
+                        .iter()
+                        .all(|(_, (other_wave, other_status, _))| match other_wave {
+                            Some(ow) if *ow < wave => other_status == "Done",
+                            _ => true,
+                        });
+                if !all_lower_waves_done {
+                    tracing::info!(
+                        "{}: skipping sub-issue #{} (waveId={}) — lower wave dependencies not met",
+                        ctx.name,
+                        item.content_number,
+                        wave
+                    );
+                    continue;
+                }
             }
+            todo_items.push((item.id.clone(), item.content_number));
         }
     }
 
@@ -363,7 +407,7 @@ pub async fn run_todo_check(
 
     for (item_id, issue_number) in &todo_items {
         let issue = issue_map.get(issue_number);
-        let branch_name = branch_name_for_issue(*issue_number, &deps.config.git);
+        let branch_name = branch_name_for_issue(*issue_number, &deps.config.git, None);
 
         let exists = github
             .branch_exists(&ctx.owner, &ctx.repo, &branch_name)
@@ -392,6 +436,48 @@ pub async fn run_todo_check(
             format!("Issue #{}", issue_number)
         };
 
+        // Gather PR context if a PR exists for the branch.
+        let pr_info = github
+            .get_pull_request_for_branch(&ctx.owner, &ctx.repo, &branch_name)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "{}: could not fetch PR for branch '{}': {}",
+                    ctx.name,
+                    branch_name,
+                    e
+                );
+                None
+            });
+
+        let (pr_url, pr_changes, pr_comments) = if let Some(pr) = &pr_info {
+            let diff = github
+                .get_pr_diff(&ctx.owner, &ctx.repo, pr.number)
+                .await
+                .unwrap_or_default();
+            let comments = github
+                .list_pr_review_comments(&ctx.owner, &ctx.repo, pr.number)
+                .await
+                .map(|threads| {
+                    threads
+                        .into_iter()
+                        .filter(|t| !t.is_resolved)
+                        .flat_map(|t| {
+                            t.comments
+                                .nodes
+                                .iter()
+                                .map(|c| c.body.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let comments_text = comments.join("\n");
+            (pr.url.clone(), diff, comments_text)
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+
         log_deduped(
             &deps.log_dedup,
             "todo",
@@ -404,7 +490,7 @@ pub async fn run_todo_check(
         .await;
         let system_prompt = load_agent_template("developer")?;
         let template = load_prompt_template("developer")?;
-        let branch_name = branch_name_for_issue(*issue_number, &deps.config.git);
+        let branch_name = branch_name_for_issue(*issue_number, &deps.config.git, None);
         let values = HashMap::from([
             ("ISSUE_TITLE".to_string(), title.clone()),
             ("ISSUE_NUMBER".to_string(), issue_number.to_string()),
@@ -414,6 +500,9 @@ pub async fn run_todo_check(
                 "PROJECT_REPOSITORY".to_string(),
                 format!("{}/{}", ctx.owner, ctx.repo),
             ),
+            ("PR_URL".to_string(), pr_url),
+            ("PR_CHANGES".to_string(), pr_changes),
+            ("PR_COMMENTS".to_string(), pr_comments),
         ]);
         let user_prompt = fill_prompt(&template, &values);
         let session_id = start_opencode_session(
@@ -512,7 +601,49 @@ pub async fn run_review_check(
 
             let issue = issue_map.get(&item.content_number);
             let issue_number = item.content_number;
-            let branch_name = branch_name_for_issue(issue_number, &deps.config.git);
+            let branch_name = branch_name_for_issue(issue_number, &deps.config.git, None);
+
+            // Gather PR context if a PR exists for the branch.
+            let pr_info = github
+                .get_pull_request_for_branch(&ctx.owner, &ctx.repo, &branch_name)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "{}: could not fetch PR for branch '{}': {}",
+                        ctx.name,
+                        branch_name,
+                        e
+                    );
+                    None
+                });
+
+            let (pr_url, pr_changes, pr_comments) = if let Some(pr) = &pr_info {
+                let diff = github
+                    .get_pr_diff(&ctx.owner, &ctx.repo, pr.number)
+                    .await
+                    .unwrap_or_default();
+                let comments = github
+                    .list_pr_review_comments(&ctx.owner, &ctx.repo, pr.number)
+                    .await
+                    .map(|threads| {
+                        threads
+                            .into_iter()
+                            .filter(|t| !t.is_resolved)
+                            .flat_map(|t| {
+                                t.comments
+                                    .nodes
+                                    .iter()
+                                    .map(|c| c.body.clone())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let comments_text = comments.join("\n");
+                (pr.url.clone(), diff, comments_text)
+            } else {
+                (String::new(), String::new(), String::new())
+            };
 
             let filled_prompt = fill_prompt(
                 &template,
@@ -533,8 +664,9 @@ pub async fn run_review_check(
                             .and_then(|i| i.body.clone())
                             .unwrap_or_default(),
                     ),
-                    ("PR_URL".to_string(), String::new()),
-                    ("PR_CHANGES".to_string(), String::new()),
+                    ("PR_URL".to_string(), pr_url),
+                    ("PR_CHANGES".to_string(), pr_changes),
+                    ("PR_COMMENTS".to_string(), pr_comments),
                 ]),
             );
 
@@ -945,6 +1077,213 @@ pub async fn run_dev_completion_check(
     Ok(())
 }
 
+/// Detect completed triage sessions in "Triage" status, parse session output
+/// for sub-task definitions, create sub-issues via the GitHub API, add them
+/// to the project with "Todo" status and a waveId, and clear the session ID
+/// on the parent issue. If no sub-tasks are found, transitions the parent
+/// issue directly to "Todo".
+///
+/// Sub-task format: lines under a `## Sub-tasks` heading matching
+/// `^\d+\.\s+(.+?):?\s*(.*)$`.
+pub async fn run_triage_completion_check(
+    deps: &WorkflowContext,
+    ctx: &ProjectContext,
+    oc: &OpencodeSessionConfig,
+) -> Result<(), WorkflowError> {
+    let github = deps
+        .github
+        .as_ref()
+        .ok_or_else(|| WorkflowError::NoGitHub(ctx.name.clone()))?;
+
+    let field_ids = resolve_field_ids(github, &ctx.project_id).await?;
+    let session_field_id = field_ids
+        .session_field_id
+        .ok_or_else(|| WorkflowError::NoSessionField(ctx.project_id.clone()))?;
+    let wave_field_id = field_ids
+        .wave_field_id
+        .ok_or_else(|| WorkflowError::Other("waveId field not found".to_string()))?;
+
+    let project_items = github.list_project_items(&ctx.project_id).await?;
+    if project_items.is_empty() {
+        tracing::info!("{}: no project items for triage completion check", ctx.name);
+        return Ok(());
+    }
+
+    let status_field = github.get_project_status_field(&ctx.project_id).await?;
+
+    let Some(status_field) = status_field else {
+        tracing::warn!(
+            "{}: no Status field found for triage completion check",
+            ctx.name
+        );
+        return Ok(());
+    };
+
+    let todo_option_id = resolve_option_id(&status_field.options, "Todo")
+        .ok_or_else(|| WorkflowError::StatusOptionNotFound("Todo".to_string()))?;
+
+    let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
+    let active_sessions = oc_client.get_session_statuses().await.unwrap_or_else(|e| {
+        tracing::warn!(
+            "{}: could not fetch OpenCode session statuses for triage completion check: {}",
+            ctx.name,
+            e
+        );
+        std::collections::HashMap::new()
+    });
+
+    let mut item_values = Vec::new();
+    for item in &project_items {
+        item_values.push(github.get_project_item_values(&item.id).await?);
+    }
+
+    for (item, values) in project_items.iter().zip(&item_values) {
+        let current_status = values.get("Status").and_then(|v| v.as_deref());
+        if current_status != Some("Triage") {
+            continue;
+        }
+
+        let session_id = match extract_session_id(values) {
+            Some(id) => id,
+            None => continue,
+        };
+
+        if active_sessions.contains_key(&session_id) {
+            continue;
+        }
+
+        tracing::info!(
+            "{}: triage session {} for issue #{} has completed, parsing sub-tasks",
+            ctx.name,
+            session_id,
+            item.content_number
+        );
+
+        let messages = oc_client
+            .get_session_messages(&session_id, Some(oc.directory.as_str()))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "{}: could not fetch session messages for {}: {}",
+                    ctx.name,
+                    session_id,
+                    e
+                );
+                Vec::new()
+            });
+        let sub_tasks = parse_sub_tasks(&messages.iter().map(|m| m.text()).collect::<Vec<_>>());
+
+        if sub_tasks.is_empty() {
+            tracing::info!(
+                "{}: no sub-tasks found for issue #{}, transitioning to Todo",
+                ctx.name,
+                item.content_number
+            );
+            github
+                .update_project_item_status(
+                    &ctx.project_id,
+                    &item.id,
+                    &field_ids.status_field_id,
+                    &todo_option_id,
+                )
+                .await?;
+        } else {
+            tracing::info!(
+                "{}: creating {} sub-tasks for issue #{}",
+                ctx.name,
+                sub_tasks.len(),
+                item.content_number
+            );
+            for (index, (title, description)) in sub_tasks.iter().enumerate() {
+                let wave_id = (index + 1) as i64;
+                let sub_title = format!("[#{:?}] {}", item.content_number, title);
+                let sub_body = format!(
+                    "Sub-task of #[{}]\n\n{}\n\n**Wave:** {}",
+                    item.content_number, description, wave_id
+                );
+
+                let created_issue = github
+                    .create_issue(&ctx.owner, &ctx.repo, &sub_title, &sub_body)
+                    .await?;
+
+                let sub_item_id = github
+                    .add_issue_to_project(&created_issue.node_id, &ctx.project_id)
+                    .await?;
+
+                github
+                    .update_project_item_status(
+                        &ctx.project_id,
+                        &sub_item_id,
+                        &field_ids.status_field_id,
+                        &todo_option_id,
+                    )
+                    .await?;
+
+                github
+                    .update_project_item_wave_id(
+                        &ctx.project_id,
+                        &sub_item_id,
+                        &wave_field_id,
+                        wave_id,
+                    )
+                    .await?;
+
+                tracing::info!(
+                    "{}: created sub-task #{} (waveId={}) for issue #{}",
+                    ctx.name,
+                    created_issue.number,
+                    wave_id,
+                    item.content_number
+                );
+            }
+        }
+
+        github
+            .update_project_item_session_id(&ctx.project_id, &item.id, &session_field_id, None)
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Parse sub-task definitions from session messages.
+///
+/// Looks for a `## Sub-tasks` heading and parses lines matching
+/// `^\d+\.\s+(.+?):?\s*(.*)$` into `(title, description)` tuples.
+pub fn parse_sub_tasks(messages: &[String]) -> Vec<(String, String)> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"^\s*\d+\.\s+([^:]+)(?:\s*:\s*(.*))?$")
+            .expect("hardcoded sub-task regex literal is valid")
+    });
+    let mut in_section = false;
+    let mut sub_tasks = Vec::new();
+
+    for line in messages {
+        if line.contains("## Sub-tasks") {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if line.starts_with("###") {
+                break;
+            }
+            if let Some(captures) = re.captures(line)
+                && let Some(title_match) = captures.get(1)
+            {
+                let title = title_match.as_str().trim().to_string();
+                let description = captures
+                    .get(2)
+                    .map(|m| m.as_str().trim().to_string())
+                    .unwrap_or_default();
+                sub_tasks.push((title, description));
+            }
+        }
+    }
+
+    sub_tasks
+}
+
 // ─── Tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1008,6 +1347,15 @@ mod tests {
         json!({
             "__typename": "ProjectV2ItemFieldSingleSelectValue",
             "name": option_name,
+            "field": {"__typename": "ProjectV2Field", "name": name}
+        })
+    }
+
+    /// Build a field-value node for a number field (e.g. `waveId`).
+    fn number_field_value(name: &str, number: Option<f64>) -> serde_json::Value {
+        json!({
+            "__typename": "ProjectV2ItemFieldNumberValue",
+            "number": number,
             "field": {"__typename": "ProjectV2Field", "name": name}
         })
     }
@@ -2004,6 +2352,455 @@ mod tests {
         let result = run_todo_check(&deps, &ctx, &oc).await;
         assert!(result.is_ok());
         oc_mock.verify().await;
+    }
+
+    // Test 10b: Sub-issue with unmet wave dependency is filtered out
+    #[tokio::test]
+    async fn todo_filters_sub_issue_with_unmet_wave_dependency() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        // Two sub-issues: #10 (waveId=1, Todo) and #11 (waveId=2, Todo)
+        // #11 should be filtered because #10 (lower wave) is not Done.
+        let issues = json!([
+            {"node_id": "issue-node-10", "number": 10, "title": "Wave 1 sub", "body": "body10", "state": "open", "pull_request": null},
+            {"node_id": "issue-node-11", "number": 11, "title": "Wave 2 sub", "body": "body11", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-10", "content": {"__typename": "Issue", "id": "issue-node-10", "number": 10}},
+                {"id": "item-11", "content": {"__typename": "Issue", "id": "issue-node-11", "number": 11}},
+            ]
+        });
+        // Both items are Todo; item-10 has waveId=1, item-11 has waveId=2
+        let field_values = json!({
+            "nodes": [
+                single_select_field_value("Status", "Todo"),
+                number_field_value("waveId", Some(1.0)),
+            ]
+        });
+        let field_values_11 = json!({
+            "nodes": [
+                single_select_field_value("Status", "Todo"),
+                number_field_value("waveId", Some(2.0)),
+            ]
+        });
+
+        // Fields query includes waveId
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                                {"id": "wave-field-id", "name": "waveId", "dataType": "NUMBER"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "todo-opt-id", "name": "Todo"},
+                                {"id": "done-opt-id", "name": "Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Project items query
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("items(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "items": project_items } }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Field values for item-10
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fieldValues(first:"))
+            .and(body_string_contains("item-10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "fieldValues": field_values } }
+            })))
+            .mount(&mock)
+            .await;
+
+        // Field values for item-11
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fieldValues(first:"))
+            .and(body_string_contains("item-11"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "fieldValues": field_values_11 } }
+            })))
+            .mount(&mock)
+            .await;
+
+        // REST issues endpoint
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issues))
+            .mount(&mock)
+            .await;
+
+        // Only item-10 should get a session; item-11 is filtered
+        mount_branch_mocks(&mock, false, "main", "abc123").await;
+
+        // Workspace + worktree for item-10 only
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1", "type": "git", "name": "w1", "branch": null,
+                "directory": null, "extra": null, "projectID": "p1", "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1", "branch": "issue-10", "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(body_string_contains("\"title\":\"Wave 1 sub\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess10", "projectID": "p1", "directory": "/d",
+                "title": "t", "version": "1", "time": {"created": 1, "updated": 2}
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/session/sess10/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&oc_mock)
+            .await;
+
+        // Session for item-11 should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(body_string_contains("\"title\":\"Wave 2 sub\""))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-10" } }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = run_todo_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // Test 10c: Sub-issue starts when all lower-wave sub-issues are Done
+    #[tokio::test]
+    async fn todo_starts_sub_issue_when_wave_done() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        // Two sub-issues: #20 (waveId=1, Done) and #21 (waveId=2, Todo)
+        // #21 should proceed because #20 (lower wave) is Done.
+        let issues = json!([
+            {"node_id": "issue-node-20", "number": 20, "title": "Wave 1 done", "body": "body20", "state": "closed", "pull_request": null},
+            {"node_id": "issue-node-21", "number": 21, "title": "Wave 2 todo", "body": "body21", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-20", "content": {"__typename": "Issue", "id": "issue-node-20", "number": 20}},
+                {"id": "item-21", "content": {"__typename": "Issue", "id": "issue-node-21", "number": 21}},
+            ]
+        });
+        let field_values_20 = json!({
+            "nodes": [
+                single_select_field_value("Status", "Done"),
+                number_field_value("waveId", Some(1.0)),
+            ]
+        });
+        let field_values_21 = json!({
+            "nodes": [
+                single_select_field_value("Status", "Todo"),
+                number_field_value("waveId", Some(2.0)),
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                                {"id": "wave-field-id", "name": "waveId", "dataType": "NUMBER"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "todo-opt-id", "name": "Todo"},
+                                {"id": "done-opt-id", "name": "Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("items(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "items": project_items } }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fieldValues(first:"))
+            .and(body_string_contains("item-20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "fieldValues": field_values_20 } }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fieldValues(first:"))
+            .and(body_string_contains("item-21"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "fieldValues": field_values_21 } }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issues))
+            .mount(&mock)
+            .await;
+
+        mount_branch_mocks(&mock, false, "main", "abc123").await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "wrk1", "type": "git", "name": "w1", "branch": null,
+                "directory": null, "extra": null, "projectID": "p1", "timeUsed": 0
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .and(query_param("workspace", "wrk1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "wt1", "branch": "issue-21", "directory": "/wt/dir1"
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(body_string_contains("\"title\":\"Wave 2 todo\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sess21", "projectID": "p1", "directory": "/d",
+                "title": "t", "version": "1", "time": {"created": 1, "updated": 2}
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/session/sess21/prompt_async"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-11" } }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = run_todo_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // Test 10d: Main issue without waveId proceeds normally
+    #[tokio::test]
+    async fn todo_starts_main_issue_without_wave_filter() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        // Main issue #30 (no waveId, Status=Todo) — should proceed normally.
+        let issues = json!([
+            {"node_id": "issue-node-30", "number": 30, "title": "Main issue", "body": "body30", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-30", "content": {"__typename": "Issue", "id": "issue-node-30", "number": 30}},
+            ]
+        });
+        // No waveId field value — this is a main issue.
+        let field_values = json!({
+            "nodes": [
+                single_select_field_value("Status", "Todo"),
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                                {"id": "wave-field-id", "name": "waveId", "dataType": "NUMBER"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "todo-opt-id", "name": "Todo"},
+                                {"id": "done-opt-id", "name": "Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("items(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "items": project_items } }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fieldValues(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "fieldValues": field_values } }
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issues))
+            .mount(&mock)
+            .await;
+
+        mount_branch_mocks(&mock, false, "main", "abc123").await;
+        mount_opencode_mocks(&oc_mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-30" } }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let result = run_todo_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
     }
 
     // ─── Review Check Integration Tests ───────────────────────
@@ -3796,5 +4593,356 @@ mod tests {
         let result = run_dev_completion_check(&deps, &ctx, &oc).await;
         assert!(result.is_ok());
         oc_mock.verify().await;
+    }
+
+    // ── Triage Completion Check Tests ────────────────────────────
+
+    fn triage_field_values(session_id: &str) -> serde_json::Value {
+        json!({
+            "nodes": [
+                single_select_field_value("Status", "Triage"),
+                text_field_value("sessionId", Some(session_id)),
+            ]
+        })
+    }
+
+    async fn mount_triage_completion_github_mocks(
+        server: &MockServer,
+        project_items: serde_json::Value,
+        field_values: serde_json::Value,
+    ) {
+        // Status field query
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("field(name:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "field": {
+                            "id": "status-field-id",
+                            "options": [
+                                {"id": "triage-opt-id", "name": "Triage"},
+                                {"id": "todo-opt-id", "name": "Todo"},
+                                {"id": "in-dev-opt-id", "name": "In Development"},
+                                {"id": "review-tech-opt-id", "name": "Review Technical"},
+                                {"id": "review-prod-opt-id", "name": "Review Product"},
+                                {"id": "qa-opt-id", "name": "QA"},
+                                {"id": "done-opt-id", "name": "Done"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(server)
+            .await;
+
+        // Fields query (includes waveId)
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fields(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "node": {
+                        "fields": {
+                            "nodes": [
+                                {"id": "status-field-id", "name": "Status", "dataType": "SINGLE_SELECT"},
+                                {"id": "session-field-id", "name": "sessionId", "dataType": "TEXT"},
+                                {"id": "wave-field-id", "name": "waveId", "dataType": "NUMBER"},
+                            ]
+                        }
+                    }
+                }
+            })))
+            .mount(server)
+            .await;
+
+        // Project items query
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("items(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "items": project_items } }
+            })))
+            .mount(server)
+            .await;
+
+        // Field values query
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("fieldValues(first:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "node": { "fieldValues": field_values } }
+            })))
+            .mount(server)
+            .await;
+
+        // Update item field value mutation
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-id" } }
+                }
+            })))
+            .mount(server)
+            .await;
+
+        // Add issue to project mutation
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("addProjectV2ItemById"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "addProjectV2ItemById": { "item": { "id": "new-sub-item-id" } }
+                }
+            })))
+            .mount(server)
+            .await;
+
+        // Create issue REST endpoint
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "node_id": "sub-issue-node-1",
+                "number": 101,
+                "title": "[#42] Sub-task 1",
+                "body": "body",
+                "state": "open"
+            })))
+            .mount(server)
+            .await;
+    }
+
+    // T24: Completed triage session with sub-tasks → creates sub-issues, sets Todo, sets waveId, clears session
+    #[tokio::test]
+    async fn triage_completion_creates_sub_tasks() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = triage_field_values("triage-session-1");
+
+        mount_triage_completion_github_mocks(&mock, project_items, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/triage-session-1/message"))
+            .and(query_param("directory", "/test-work"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "info": {"role": "user", "sessionID": "triage-session-1"},
+                    "parts": [{"type": "text", "text": "Triage prompt"}]
+                },
+                {
+                    "info": {"role": "assistant", "sessionID": "triage-session-1"},
+                    "parts": [{"type": "text", "text": "## Sub-tasks\n1. Implement auth: Add OAuth login\n2. Add tests: Write unit tests"}]
+                }
+            ])))
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_triage_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T25: Completed triage session with no sub-tasks → transitions main to Todo
+    #[tokio::test]
+    async fn triage_completion_no_sub_tasks_transitions_to_todo() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = triage_field_values("triage-session-2");
+
+        mount_triage_completion_github_mocks(&mock, project_items, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/triage-session-2/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "info": {"role": "assistant", "sessionID": "triage-session-2"},
+                    "parts": [{"type": "text", "text": "The issue is simple, no sub-tasks needed."}]
+                }
+            ])))
+            .mount(&oc_mock)
+            .await;
+
+        // Verify no create_issue calls
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/issues"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let result = run_triage_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T26: Active triage session → ignored
+    #[tokio::test]
+    async fn triage_completion_active_session_ignored() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = triage_field_values("triage-session-active");
+
+        mount_triage_completion_github_mocks(&mock, project_items, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "triage-session-active": {"type": "busy"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/triage-session-active/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_triage_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T27: No GitHub client → returns NoGitHub error
+    #[tokio::test]
+    async fn triage_completion_no_github_client_returns_error() {
+        let deps = make_deps(None);
+        let ctx = make_context();
+        let oc = make_oc_config("http://localhost:8081".to_string());
+
+        let result = run_triage_completion_check(&deps, &ctx, &oc).await;
+        assert!(matches!(result, Err(WorkflowError::NoGitHub(_))));
+    }
+
+    // T28: Item not in Triage status → skipped
+    #[tokio::test]
+    async fn triage_completion_skips_non_triage_items() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = json!({
+            "nodes": [
+                single_select_field_value("Status", "Todo"),
+                text_field_value("sessionId", Some("triage-session-1")),
+            ]
+        });
+
+        mount_triage_completion_github_mocks(&mock, project_items, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/session/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&oc_mock)
+            .await;
+
+        let result = run_triage_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T29: parse_sub_tasks — extracts sub-tasks from messages
+    #[test]
+    fn parse_sub_tasks_extracts_numbered_list() {
+        let messages = vec![
+            "Here is my analysis.".to_string(),
+            "## Sub-tasks".to_string(),
+            "1. Implement auth: Add OAuth login flow".to_string(),
+            "2. Add tests: Write unit tests for auth".to_string(),
+            "### Next steps".to_string(),
+            "Done.".to_string(),
+        ];
+        let sub_tasks = parse_sub_tasks(&messages);
+        assert_eq!(sub_tasks.len(), 2);
+        assert_eq!(
+            sub_tasks[0],
+            (
+                "Implement auth".to_string(),
+                "Add OAuth login flow".to_string()
+            )
+        );
+        assert_eq!(
+            sub_tasks[1],
+            (
+                "Add tests".to_string(),
+                "Write unit tests for auth".to_string()
+            )
+        );
+    }
+
+    // T30: parse_sub_tasks — no sub-tasks section returns empty
+    #[test]
+    fn parse_sub_tasks_no_section_returns_empty() {
+        let messages = vec![
+            "Here is my analysis.".to_string(),
+            "The issue is simple.".to_string(),
+        ];
+        let sub_tasks = parse_sub_tasks(&messages);
+        assert!(sub_tasks.is_empty());
+    }
+
+    // T31: parse_sub_tasks — sub-task without description
+    #[test]
+    fn parse_sub_tasks_without_description() {
+        let messages = vec!["## Sub-tasks".to_string(), "1. Standalone task".to_string()];
+        let sub_tasks = parse_sub_tasks(&messages);
+        assert_eq!(sub_tasks.len(), 1);
+        assert_eq!(
+            sub_tasks[0],
+            ("Standalone task".to_string(), "".to_string())
+        );
     }
 }

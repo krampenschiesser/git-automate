@@ -16,6 +16,16 @@ You are the developer agent for the git-automate workflow. A GitHub issue has be
 
 **Project Repository:** {{PROJECT_REPOSITORY}}
 
+**Pull Request URL:** {{PR_URL}}
+
+**Pull Request Changes:**
+
+{{PR_CHANGES}}
+
+**Unresolved PR Comments:**
+
+{{PR_COMMENTS}}
+
 ## Instructions
 
 1. Create a feature branch named `issue-{{ISSUE_NUMBER}}` from the default branch.
