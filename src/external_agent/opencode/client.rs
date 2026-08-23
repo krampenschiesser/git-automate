@@ -289,9 +289,11 @@ impl OpenCodeClient {
         }
         let response = request.send().await?;
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
             return Err(OpenCodeError::FetchSessionMessages(format!(
-                "HTTP status {}",
-                response.status().as_u16()
+                "HTTP status {}: {}",
+                status, body
             )));
         }
         let messages: Vec<SessionMessage> = response.json().await?;
@@ -300,7 +302,9 @@ impl OpenCodeClient {
 
     /// `POST /experimental/workspace` — create a new workspace.
     ///
-    /// Sends `{"type": "git"}` as the body with `directory` as a query param.
+    /// Sends `{"type": "worktree", "branch": null}` as the body with `directory`
+    /// as a query param. `"worktree"` is OpenCode's built-in git-worktree
+    /// adapter name; `branch: null` uses the current/default branch.
     /// Returns the created [`Workspace`] on success.
     pub async fn create_workspace(&self, directory: &str) -> Result<Workspace, OpenCodeError> {
         let response = self
@@ -308,13 +312,15 @@ impl OpenCodeClient {
             .post(format!("{}/experimental/workspace", self.base_url))
             .query(&[("directory", directory)])
             .header("Authorization", &self.auth_header)
-            .json(&json!({ "type": "git" }))
+            .json(&json!({ "type": "worktree", "branch": null }))
             .send()
             .await?;
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
             return Err(OpenCodeError::CreateWorkspace(format!(
-                "workspace creation HTTP status {}",
-                response.status().as_u16()
+                "workspace creation HTTP status {}: {}",
+                status, body
             )));
         }
         let workspace: Workspace = response.json().await?;
@@ -339,9 +345,11 @@ impl OpenCodeClient {
             .send()
             .await?;
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
             return Err(OpenCodeError::CreateWorktree(format!(
-                "worktree creation HTTP status {}",
-                response.status().as_u16()
+                "worktree creation HTTP status {}: {}",
+                status, body
             )));
         }
         let worktree: Worktree = response.json().await?;
@@ -379,9 +387,11 @@ pub(crate) async fn start_session_http(
         .await?;
 
     if !create_response.status().is_success() {
+        let status = create_response.status().as_u16();
+        let body = create_response.text().await.unwrap_or_default();
         return Err(OpenCodeError::CreateSession(format!(
-            "session creation HTTP status {}",
-            create_response.status().as_u16()
+            "session creation HTTP status {}: {}",
+            status, body
         )));
     }
 
@@ -399,9 +409,11 @@ pub(crate) async fn start_session_http(
         .await?;
 
     if !prompt_response.status().is_success() {
+        let status = prompt_response.status().as_u16();
+        let body = prompt_response.text().await.unwrap_or_default();
         return Err(OpenCodeError::CreateSession(format!(
-            "prompt_async HTTP status {}",
-            prompt_response.status().as_u16()
+            "prompt_async HTTP status {}: {}",
+            status, body
         )));
     }
 
@@ -1032,10 +1044,10 @@ mod tests {
             .and(path("/experimental/workspace"))
             .and(query_param("directory", "/d"))
             .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .and(body_json(json!({ "type": "git" })))
+            .and(body_json(json!({ "type": "worktree", "branch": null })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "wrk1",
-                "type": "git",
+                "type": "worktree",
                 "name": "w1",
                 "branch": null,
                 "directory": null,
@@ -1051,7 +1063,7 @@ mod tests {
         let client = client(&server);
         let ws = client.create_workspace("/d").await.unwrap();
         assert_eq!(ws.id, "wrk1");
-        assert_eq!(ws.kind, "git");
+        assert_eq!(ws.kind, "worktree");
         assert_eq!(ws.name, "w1");
         assert_eq!(ws.project_id, "p1");
 
@@ -1070,6 +1082,31 @@ mod tests {
         let client = client(&server);
         let result = client.create_workspace("/d").await;
         assert!(matches!(result, Err(OpenCodeError::CreateWorkspace(_))));
+    }
+
+    #[tokio::test]
+    async fn create_workspace_400_includes_response_body() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "name": "WorkspaceCreateError",
+                "data": { "message": "Adapter 'git' not found" }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.create_workspace("/d").await;
+        match result {
+            Err(OpenCodeError::CreateWorkspace(msg)) => {
+                assert!(
+                    msg.contains("Adapter 'git' not found"),
+                    "error message should contain response body, got: {msg}"
+                );
+            }
+            other => panic!("expected CreateWorkspace error, got {other:?}"),
+        }
     }
 
     // --- create_worktree (tests 27-28) ----------------------------------
