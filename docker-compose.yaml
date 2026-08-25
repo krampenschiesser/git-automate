@@ -1,0 +1,11 @@
+services:
+  opencode:
+    env_file: .env
+    image: smanx/opencode:1.18.21
+    ports:
+      - "10082:4096"
+    environment:
+      -OPENCODE_LOG_LEVEL: INFO
+      -OPENCODE_PRINT_LOGS: true
+    volumes:
+      - "./docker/opencode-cfg.json:/root/.config/opencode/opencode.json"

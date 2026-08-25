@@ -4,7 +4,7 @@ opencode:
     myprovider/fast: 4
   url: ${env:OPENCODE_URL}
   pw: ${env:OPENCODE_PW}
-  cwd: /path/to/your/checkout
+  cwd: ${env:PROJECT_PATH}
   project: git-automate
 git:
   repository: https://github.com/krampenschiesser/git-automate

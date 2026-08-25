@@ -1,0 +1,48 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "enabled_providers": ["test"],
+  "shell": "/bin/bash",
+  "default_agent": "Build",
+  "model": "test/testmodel",
+  "small_model": "test/testmodel",
+  "share": "disabled",
+  "formatter": true,
+  "lsp": true,
+  "compaction": {
+    "prune": false
+  },
+  "experimental": {
+    "batch_tool": true,
+    "continue_loop_on_deny": true
+  },
+  "permission": "allow",
+  "provider": {
+    "test": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "test",
+      "options": {
+        "apiKey": "{env:OPENROUTER_API_KEY}",
+        "baseURL": "https://openrouter.ai/api/v1",
+        "includeUsage": true
+      },
+      "models": {
+        "testmodel": {
+          "id": "poolside/laguna-s-2.1:free",
+          "name": "testmodel",
+          "limit": {
+            "context": 128000,
+            "output": 128000
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
