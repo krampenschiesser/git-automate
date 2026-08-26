@@ -265,20 +265,6 @@ pub async fn mount_opencode_mocks(server: &MockServer) {
         })))
         .mount(server)
         .await;
-
-    // Agents — all 6 required agents
-    Mock::given(method("GET"))
-        .and(path("/agent"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {"name": "git-automate-triage", "description": "t", "mode": "subagent", "builtIn": true},
-            {"name": "git-automate-taskmanager", "description": "t", "mode": "subagent", "builtIn": true},
-            {"name": "git-automate-developer", "description": "t", "mode": "subagent", "builtIn": true},
-            {"name": "git-automate-reviewer", "description": "t", "mode": "subagent", "builtIn": true},
-            {"name": "git-automate-product", "description": "t", "mode": "subagent", "builtIn": true},
-            {"name": "git-automate-qa", "description": "t", "mode": "subagent", "builtIn": true},
-        ])))
-        .mount(server)
-        .await;
 }
 
 /// Mount OpenCode experimental workspace + worktree creation mocks.

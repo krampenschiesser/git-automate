@@ -11,7 +11,6 @@ pub mod helpers;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::GitSection;
-use crate::external_agent::opencode::AgentInfo;
 use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::ParsedRepo;
@@ -550,7 +549,7 @@ impl Workflow {
         helpers::ensure_wave_id_field(github, project_id).await
     }
 
-    /// Check OpenCode server health and verify all required agents exist.
+    /// Check OpenCode server health.
     async fn check_opencode(&self, oc: &OpencodeSessionConfig) -> Result<(), WorkflowError> {
         let client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
 
@@ -584,37 +583,6 @@ impl Workflow {
         // Reset unhealthy-logged so the warning fires on next degradation.
         OPENCODE_UNHEALTHY_LOGGED.store(false, Ordering::Relaxed);
 
-        let agents: Vec<AgentInfo> = client
-            .get_agents(Some(oc.directory.as_str()))
-            .await
-            .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
-
-        let agent_names: std::collections::HashSet<&str> =
-            agents.iter().map(|a| a.name.as_str()).collect();
-
-        let missing: Vec<&str> = REQUIRED_AGENTS
-            .iter()
-            .map(|a| a.as_str())
-            .filter(|a| !agent_names.contains(a))
-            .collect();
-
-        if !missing.is_empty() {
-            log_deduped(
-                &self.deps.log_dedup,
-                "opencode",
-                LogLevel::Warn,
-                format!("Missing required agents: {}", missing.join(", ")),
-            )
-            .await;
-        } else {
-            log_deduped(
-                &self.deps.log_dedup,
-                "opencode",
-                LogLevel::Info,
-                "All required agents present".to_string(),
-            )
-            .await;
-        }
         Ok(())
     }
 }
@@ -1473,31 +1441,15 @@ mod tests {
     // ── check_opencode when healthy (test 13) ────────────────
 
     #[tokio::test]
-    async fn check_opencode_healthy_checks_agents() {
+    async fn check_opencode_healthy_returns_ok() {
         let mock = MockServer::start().await;
 
-        // Mock health endpoint
         Mock::given(method("GET"))
             .and(path("/global/health"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "healthy": true,
                 "version": "1.0.0"
             })))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        // Mock agent list → all 6 required agents
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-taskmanager","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-developer","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-reviewer","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-product","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-qa","description":"t","mode":"subagent","native":true},
-            ])))
             .expect(1)
             .mount(&mock)
             .await;
@@ -1518,7 +1470,7 @@ mod tests {
         mock.verify().await;
     }
 
-    // ── check_opencode when not healthy (test 14) ────────────
+    // ── check_opencode when not healthy ──────────────────────
 
     #[tokio::test]
     async fn check_opencode_unhealthy_returns_error() {
@@ -1531,14 +1483,6 @@ mod tests {
                 "version": "1.0.0"
             })))
             .expect(1)
-            .mount(&mock)
-            .await;
-
-        // Agent endpoint should NOT be called
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .expect(0)
             .mount(&mock)
             .await;
 
@@ -1556,91 +1500,6 @@ mod tests {
 
         assert!(matches!(result, Err(WorkflowError::OpencodeCheckFailed(_))));
         mock.verify().await;
-    }
-
-    // ── check_opencode with missing agents (test 15) ─────────
-
-    #[tokio::test]
-    async fn check_opencode_missing_agents_warns() {
-        let mock = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": true,
-                "version": "1.0.0"
-            })))
-            .mount(&mock)
-            .await;
-
-        // Only 2 agents (missing 4)
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","description":"t","mode":"subagent","native":true},
-                {"name":"git-automate-developer","description":"t","mode":"subagent","native":true},
-            ])))
-            .mount(&mock)
-            .await;
-
-        let oc = OpencodeSessionConfig {
-            url: mock.uri(),
-            pw: "test-pw".to_string(),
-            directory: "/test-work".to_string(),
-            project: None,
-            concurrency: HashMap::new(),
-        };
-
-        let deps = make_deps(None);
-
-        let workflow = Workflow::new(deps);
-        let result = workflow.check_opencode(&oc).await;
-
-        assert!(result.is_ok());
-    }
-
-    // ── check_opencode with all agents present (test 16) ─────
-
-    #[tokio::test]
-    async fn check_opencode_all_agents_succeeds() {
-        let mock = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": true,
-                "version": "1.0.0"
-            })))
-            .mount(&mock)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"name":"git-automate-triage","mode":"subagent","native":true},
-                {"name":"git-automate-taskmanager","mode":"subagent","native":true},
-                {"name":"git-automate-developer","mode":"subagent","native":true},
-                {"name":"git-automate-reviewer","mode":"subagent","native":true},
-                {"name":"git-automate-product","mode":"subagent","native":true},
-                {"name":"git-automate-qa","mode":"subagent","native":true},
-            ])))
-            .mount(&mock)
-            .await;
-
-        let oc = OpencodeSessionConfig {
-            url: mock.uri(),
-            pw: "test-pw".to_string(),
-            directory: "/test-work".to_string(),
-            project: None,
-            concurrency: HashMap::new(),
-        };
-
-        let deps = make_deps(None);
-
-        let workflow = Workflow::new(deps);
-        let result = workflow.check_opencode(&oc).await;
-
-        assert!(result.is_ok());
     }
 
     // ── run_all with no projects returns Ok ───────────────────
@@ -1724,14 +1583,6 @@ mod tests {
             })))
             .expect(1)
             .mount(&gh_mock)
-            .await;
-
-        // Agent endpoint should NOT be called (opencode check fails before agents)
-        Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .expect(0)
-            .mount(&oc_mock)
             .await;
 
         let deps = WorkflowContext {
