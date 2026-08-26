@@ -164,7 +164,21 @@ impl GitHubClient {
             ));
         }
 
-        Ok(serde_json::from_value(data.clone())?)
+        serde_json::from_value::<T>(data.clone()).map_err(|e| {
+            let vars_str =
+                serde_json::to_string_pretty(&vars).unwrap_or_else(|_| "<unprintable>".into());
+            let data_str =
+                serde_json::to_string_pretty(data).unwrap_or_else(|_| "<unprintable>".into());
+            let expected_type = std::any::type_name::<T>();
+            let details = format!(
+                "GraphQL response deserialization failed — the response did not match the \
+                 expected Rust type.\n  query: {}\n  variables: {}\n  expected type: \
+                 {}\n  deserialization error: {}\n  response data:\n{}",
+                query, vars_str, expected_type, e, data_str
+            );
+            tracing::error!("{}", details);
+            GitHubError::Other(details)
+        })
     }
 
     /// GET `{base_url}{path}?{query}` (query is optional).
@@ -1095,6 +1109,89 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    /// Test 5: graphql<T> with response missing 'id' field → error includes
+    /// query, variables, expected type, deserialization error, and response data
+    #[tokio::test]
+    async fn graphql_missing_field_error_includes_details() {
+        let mock = MockServer::start().await;
+        let client = make_client(&mock).await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "createProjectV2": {
+                        "projectV2": {}
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let variables = json!({ "input": { "title": "My Project", "ownerId": "OID-1" } });
+
+        let result: Result<CreateProjectV2Result, _> = client
+            .graphql(
+                include_str!("queries/create_project.graphql"),
+                Some(&variables),
+            )
+            .await;
+
+        let err = result.expect_err("should fail — missing field id");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("GraphQL response deserialization failed"),
+            "error should mention deserialization failure, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("query:"),
+            "error should mention query, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("createProjectV2"),
+            "error should contain query content, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("variables:"),
+            "error should mention variables, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("My Project"),
+            "error should contain variable values, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("expected type:"),
+            "error should mention expected type, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("CreateProjectV2Result"),
+            "error should contain the Rust type name, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("deserialization error:"),
+            "error should mention deserialization error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("missing field"),
+            "error should contain serde error message, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("response data:"),
+            "error should mention response data, got: {}",
+            msg
+        );
     }
 
     // ── Constructor ──────────────────────────────────────────
