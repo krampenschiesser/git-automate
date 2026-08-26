@@ -4,11 +4,11 @@ opencode:
     myprovider/fast: 4
   url: ${env:OPENCODE_URL}
   pw: ${env:OPENCODE_PW}
-  cwd: ${env:PROJECT_PATH}
-  project: git-automate
+  cwd: /workspace/git-automate-e2e
+  project: git-automate-e2e
 git:
-  repository: https://github.com/krampenschiesser/git-automate
-  projectId: 5
+  repository: https://github.com/krampenschiesser/git-automate-e2e
+  projectId: 6
   issueProvider: github
   directory: /path/to/your/checkout
   token: ${env:GITHUB_TOKEN}
