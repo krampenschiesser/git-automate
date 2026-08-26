@@ -9,6 +9,5 @@ opencode:
 git:
   repository: https://github.com/krampenschiesser/git-automate-e2e
   projectId: 6
-  issueProvider: github
   directory: /path/to/your/checkout
   token: ${env:GITHUB_TOKEN}

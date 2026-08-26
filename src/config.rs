@@ -40,8 +40,6 @@ pub struct GitSection {
     pub project_id: Option<String>,
     #[serde(deserialize_with = "deserialize_directory")]
     pub directory: String,
-    #[serde(rename = "issueProvider", default = "default_issue_provider")]
-    pub issue_provider: String,
     #[serde(
         rename = "titlePattern",
         default = "default_title_pattern",
@@ -58,10 +56,6 @@ pub struct GitSection {
     pub token: Option<String>,
     #[serde(rename = "branchName", default)]
     pub branch_name: Option<String>,
-}
-
-fn default_issue_provider() -> String {
-    "github".to_string()
 }
 
 fn default_title_pattern() -> String {
@@ -204,8 +198,6 @@ mod tests {
     const ENV_MULTI_B: &str = "GA_TEST_MULTI_B";
     const ENV_UNDERSCORE_VAR: &str = "GA_TEST_UNDERSCORE_VAR";
     const ENV_PW: &str = "GA_TEST_PW";
-    const ENV_TRELLO_KEY: &str = "GA_TEST_TRELLO_KEY";
-    const ENV_TRELLO_TOKEN: &str = "GA_TEST_TRELLO_TOKEN";
     const ENV_GH_TOKEN: &str = "GA_TEST_GH_TOKEN";
     const ENV_GH_TOKEN_ALL: &str = "GA_TEST_GH_TOKEN_ALL";
     const ENV_GH_TOKEN_UNSET: &str = "GA_TEST_GH_TOKEN_UNSET";
@@ -462,109 +454,6 @@ git:
         assert_eq!(config.opencode.as_ref().unwrap().pw, "testpassword");
     }
 
-    // --- issueProvider config tests ---
-
-    // Test 15: parse_config with issueProvider: github → issue_provider = "github"
-    #[test]
-    fn parse_config_with_issue_provider_github() {
-        let yaml = r#"
-git:
-  repository: https://github.com/user/repo
-  issueProvider: github
-  directory: /test-dir
-"#;
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(yaml.as_bytes()).unwrap();
-        tmp.flush().unwrap();
-
-        let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.git.issue_provider, "github");
-    }
-
-    // Test 16: parse_config without issueProvider → defaults to "github"
-    #[test]
-    fn parse_config_without_issue_provider_defaults_to_github() {
-        let yaml = r#"
-git:
-  repository: https://github.com/user/repo
-  directory: /test-dir
-"#;
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(yaml.as_bytes()).unwrap();
-        tmp.flush().unwrap();
-
-        let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.git.issue_provider, "github");
-    }
-
-    // Test 17: parse_config with custom issueProvider → stored correctly
-    #[test]
-    fn parse_config_with_custom_issue_provider() {
-        let yaml = r#"
-git:
-  repository: https://github.com/user/repo
-  issueProvider: jira
-  directory: /test-dir
-"#;
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(yaml.as_bytes()).unwrap();
-        tmp.flush().unwrap();
-
-        let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.git.issue_provider, "jira");
-    }
-
-    // Test 18: GitSection serde round-trip preserves issueProvider
-    #[test]
-    fn git_section_serde_round_trip_issue_provider() {
-        let gs = GitSection {
-            repository: "https://github.com/user/repo".to_string(),
-            project_id: None,
-            directory: "/test-work".to_string(),
-            issue_provider: "github".to_string(),
-            title_pattern: "@ai.*".to_string(),
-            trello_api_key: None,
-            trello_token: None,
-            trello_board_id: None,
-            token: None,
-            branch_name: None,
-        };
-        let yaml = serde_yaml::to_string(&gs).unwrap();
-        let parsed: GitSection = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed.issue_provider, "github");
-    }
-
-    // Test: parse_config with issueProvider: trello + trello fields + env var substitution
-    #[test]
-    fn parse_config_with_trello_provider_and_credentials() {
-        unsafe {
-            std::env::set_var(ENV_TRELLO_KEY, "secret-key");
-            std::env::set_var(ENV_TRELLO_TOKEN, "secret-token");
-        }
-        let yaml = format!(
-            "
-git:
-  repository: https://github.com/user/repo
-  issueProvider: trello
-  titlePattern: \"@ai.*\"
-  trelloApiKey: ${{env:{}}}
-  trelloToken: ${{env:{}}}
-  trelloBoardId: BRD-123
-  directory: /test-dir
-",
-            ENV_TRELLO_KEY, ENV_TRELLO_TOKEN
-        );
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(yaml.as_bytes()).unwrap();
-        tmp.flush().unwrap();
-
-        let config = parse_config(tmp.path()).unwrap();
-        assert_eq!(config.git.issue_provider, "trello");
-        assert_eq!(config.git.trello_api_key.as_deref(), Some("secret-key"));
-        assert_eq!(config.git.trello_token.as_deref(), Some("secret-token"));
-        assert_eq!(config.git.trello_board_id.as_deref(), Some("BRD-123"));
-    }
-
     // --- concurrency config tests ---
 
     // Test: parse_config with opencode.concurrency → hashmap with entries
@@ -625,7 +514,6 @@ git:
                 repository: String::new(),
                 project_id: None,
                 directory: "/test-work".to_string(),
-                issue_provider: "github".to_string(),
                 title_pattern: "@ai.*".to_string(),
                 trello_api_key: None,
                 trello_token: None,
