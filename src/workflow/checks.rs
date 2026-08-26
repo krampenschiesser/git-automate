@@ -1315,7 +1315,6 @@ mod tests {
                 repository: "https://github.com/owner/repo".to_string(),
                 project_id: Some("PID-123".to_string()),
                 directory: "/test-work".to_string(),
-                issue_provider: "github".to_string(),
                 title_pattern: "@ai.*".to_string(),
                 trello_api_key: None,
                 trello_token: None,

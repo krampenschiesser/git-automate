@@ -797,7 +797,7 @@ mod tests {
     }
 
     // T-n: write_doctor_config preserves existing config fields (
-    // issueProvider, opencode sections) when updating projectId.
+    // opencode sections) when updating projectId.
     #[tokio::test]
     async fn write_doctor_config_preserves_existing_fields() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -805,13 +805,11 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"
-issueProvider: github
 opencode:
   url: http://localhost:8081
   pw: ${env:OPENCODE_PW}
 git:
   repository: https://github.com/owner/my-repo
-  issueProvider: github
 "#,
         )
         .unwrap();
@@ -828,11 +826,6 @@ git:
         let content = std::fs::read_to_string(&config_path).unwrap();
         let data: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
 
-        assert_eq!(
-            data.get("issueProvider").and_then(|v| v.as_str()),
-            Some("github")
-        );
-
         let opencode = data.get("opencode").and_then(|v| v.as_mapping()).unwrap();
         assert_eq!(
             opencode.get("url").and_then(|v| v.as_str()),
@@ -847,10 +840,6 @@ git:
         assert_eq!(
             project.get("projectId").and_then(|v| v.as_str()),
             Some("PID-789")
-        );
-        assert_eq!(
-            project.get("issueProvider").and_then(|v| v.as_str()),
-            Some("github")
         );
     }
 }
