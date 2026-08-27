@@ -21,5 +21,17 @@ services:
     volumes:
       - "./docker/opencode-cfg.json:/root/.config/opencode/opencode.json"
       - data:/workspace
+      - opencode-logs:/root/.local/share/opencode/logs
+  opencode-logs:
+    depends_on:
+      opencode:
+        condition: service_started
+    image: smanx/opencode:1.18.23
+    volumes:
+      - opencode-logs:/root/.local/share/opencode/logs
+      - data:/workspace
+    entrypoint: []
+    command: tail -f /root/.local/share/opencode/logs/log/*
 volumes:
   data:
+  opencode-logs:
