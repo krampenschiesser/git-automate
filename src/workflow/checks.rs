@@ -152,7 +152,7 @@ async fn start_opencode_session(
         .await
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
     let worktree = client
-        .create_worktree_v2(&location.project.id, None)
+        .create_worktree(&location.project.id, None)
         .await
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
     log_deduped(
@@ -1096,7 +1096,7 @@ pub async fn run_dev_completion_check(
         )
         .await;
 
-        let messages = match oc_client.get_session_messages_v2(&session_id).await {
+        let messages = match oc_client.get_session_messages(&session_id).await {
             Ok(msgs) => msgs,
             Err(e) => {
                 log_deduped(
@@ -1281,7 +1281,7 @@ pub async fn run_triage_completion_check(
         );
 
         let messages = oc_client
-            .get_session_messages_v2(&session_id)
+            .get_session_messages(&session_id)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(

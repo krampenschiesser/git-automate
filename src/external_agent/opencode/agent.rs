@@ -3,19 +3,19 @@
 //! Contains the `impl ExternalAgent for OpenCodeClient` block against the
 //! OpenCode v2 HTTP API (`POST /api/session`, `POST /api/session/{id}/prompt`,
 //! `GET /api/session/active`, `GET /api/session/{id}`) and the
-//! `From<SessionV2Info> for SessionInfo` projection. All tests for the trait
+//! `From<Session> for SessionInfo` projection. All tests for the trait
 //! implementation live here.
 
 use crate::external_agent::common::{
     AgentSessionStatus, ExternalAgent, ExternalAgentError, SessionInfo,
 };
 use crate::external_agent::opencode::client::OpenCodeClient;
-use crate::external_agent::opencode::types::SessionV2Info;
+use crate::external_agent::opencode::types::Session;
 
-// ─── From<SessionV2Info> for SessionInfo ───────────────────────
+// ─── From<Session> for SessionInfo ───────────────────────
 
-impl From<SessionV2Info> for SessionInfo {
-    fn from(session: SessionV2Info) -> Self {
+impl From<Session> for SessionInfo {
+    fn from(session: Session) -> Self {
         SessionInfo {
             id: session.id,
             title: session.title.unwrap_or_default(),
@@ -468,12 +468,12 @@ mod tests {
         assert!(matches!(result, Err(ExternalAgentError::GetSession(_))));
     }
 
-    // ── SessionInfo / SessionV2Info conversion ──────────────────
+    // ── SessionInfo / Session conversion ──────────────────
 
-    // Test 15: SessionInfo From<SessionV2Info> with all fields populated.
+    // Test 15: SessionInfo From<Session> with all fields populated.
     #[test]
     fn session_info_from_session_v2_full() {
-        let session: SessionV2Info = serde_json::from_value(json!({
+        let session: Session = serde_json::from_value(json!({
             "id": "ses1",
             "title": "Title",
             "location": { "directory": "/proj" },
@@ -487,11 +487,11 @@ mod tests {
         assert_eq!(info.project_id, "p1");
     }
 
-    // Test 16: SessionInfo From<SessionV2Info> with missing optional fields
+    // Test 16: SessionInfo From<Session> with missing optional fields
     // falls back to empty strings.
     #[test]
     fn session_info_from_session_v2_minimal_defaults() {
-        let session: SessionV2Info = serde_json::from_value(json!({ "id": "ses1" })).unwrap();
+        let session: Session = serde_json::from_value(json!({ "id": "ses1" })).unwrap();
         let info = SessionInfo::from(session);
         assert_eq!(info.id, "ses1");
         assert_eq!(info.title, "");

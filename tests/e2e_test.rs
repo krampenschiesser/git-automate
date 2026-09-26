@@ -275,7 +275,7 @@ async fn e2e_triage_flow_creates_session() {
 
     // ── 12. Verify: initial prompt contains issue content ───────────
     let messages = opencode
-        .get_session_messages_v2(session_id)
+        .get_session_messages(session_id)
         .await
         .expect("Failed to fetch session messages");
 

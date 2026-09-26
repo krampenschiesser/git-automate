@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::WorkflowStatus;
 use crate::config::{GitAutomateConfig, GitSection};
-use crate::external_agent::opencode::types::{SessionOutcome, SessionV2Info};
+use crate::external_agent::opencode::types::{Session, SessionOutcome};
 use crate::external_issues::github::client::{GitHubClient, GitHubError};
 use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::{IssueInfo, ParsedRepo, StatusOption};
@@ -331,7 +331,7 @@ pub enum SessionCompletion {
 /// - outcome `succeeded` -> `Succeeded`; `failed` -> `Failed("failed")`; `interrupted` -> `Failed("interrupted")`
 /// - no outcome but `time.idle` present -> `Succeeded`
 /// - no outcome and no idle -> `Waiting`
-pub fn session_completion(is_active: bool, session: Option<&SessionV2Info>) -> SessionCompletion {
+pub fn session_completion(is_active: bool, session: Option<&Session>) -> SessionCompletion {
     if is_active {
         return SessionCompletion::Waiting;
     }
@@ -2661,8 +2661,8 @@ mod tests {
 
     // ── session_completion tests ─────────────────────────────────
 
-    /// Build a `SessionV2Info` from a JSON value, as returned by the API.
-    fn session_info(value: Value) -> SessionV2Info {
+    /// Build a `Session` from a JSON value, as returned by the API.
+    fn session_info(value: Value) -> Session {
         serde_json::from_value(value).expect("test session JSON should deserialize")
     }
 
@@ -2676,7 +2676,7 @@ mod tests {
         let time_empty = session_info(json!({ "id": "s1", "time": {} }));
         let no_time = session_info(json!({ "id": "s1" }));
 
-        let cases: Vec<(&str, bool, Option<&SessionV2Info>, SessionCompletion)> = vec![
+        let cases: Vec<(&str, bool, Option<&Session>, SessionCompletion)> = vec![
             (
                 "active session",
                 true,

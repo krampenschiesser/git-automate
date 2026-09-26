@@ -11,142 +11,7 @@ pub enum AgentMode {
     Other,
 }
 
-/// An agent descriptor returned by the OpenCode `/agent` endpoint.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
-pub struct Agent {
-    pub name: String,
-    pub description: Option<String>,
-    pub mode: AgentMode,
-    pub native: bool,
-}
-
-/// Timestamps associated with a session.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
-pub struct SessionTime {
-    pub created: u64,
-    pub updated: u64,
-}
-
-/// A session created via the OpenCode `/session` endpoint.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct Session {
-    pub id: String,
-    #[serde(rename = "projectID")]
-    pub project_id: String,
-    pub directory: String,
-    pub title: String,
-    pub version: String,
-    pub time: SessionTime,
-}
-
-/// Health-check response from the OpenCode `/global/health` endpoint.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct HealthResponse {
-    pub healthy: bool,
-    pub version: String,
-}
-
-/// Non-serde info struct returned by `get_agents`.
-///
-/// Strips the `mode` and `native` fields, projecting an [`Agent`] down to
-/// just the user-facing `name` and `description`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AgentInfo {
-    pub name: String,
-    pub description: Option<String>,
-}
-
-impl From<Agent> for AgentInfo {
-    fn from(agent: Agent) -> Self {
-        AgentInfo {
-            name: agent.name,
-            description: agent.description,
-        }
-    }
-}
-
-// ─── Session messages (GET /session/{id}/message) ──────────────────
-
-/// A message entry returned by `GET /session/{id}/message`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SessionMessage {
-    pub info: SessionMessageInfo,
-    #[serde(default)]
-    pub parts: Vec<SessionMessagePart>,
-}
-
-impl SessionMessage {
-    pub fn is_user(&self) -> bool {
-        self.info.role == "user"
-    }
-
-    pub fn text(&self) -> String {
-        let mut result = String::new();
-        for part in &self.parts {
-            if let SessionMessagePart::Text { text } = part
-                && !text.is_empty()
-            {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(text);
-            }
-        }
-        result
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct SessionMessageInfo {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub role: String,
-    #[serde(default, rename = "sessionID")]
-    pub session_id: String,
-    #[serde(default)]
-    pub time: Option<SessionTime>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum SessionMessagePart {
-    Text {
-        text: String,
-    },
-    #[serde(other)]
-    Other,
-}
-
-/// A workspace returned by `POST /experimental/workspace`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct Workspace {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub name: String,
-    #[serde(default)]
-    pub branch: Option<String>,
-    #[serde(default)]
-    pub directory: Option<String>,
-    #[serde(default)]
-    pub extra: Option<serde_json::Value>,
-    #[serde(rename = "projectID")]
-    pub project_id: String,
-    #[serde(default)]
-    pub time_used: Option<serde_json::Value>,
-}
-
-/// A git worktree returned by `POST /experimental/worktree`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct Worktree {
-    pub name: String,
-    #[serde(default)]
-    pub branch: Option<String>,
-    pub directory: String,
-}
-
-// ─── Session V2 listing (GET /api/session) ─────────────────────────
+// ─── Session listing (GET /api/session) ────────────────────────────
 
 /// A model reference as returned by the OpenCode `/api/session` endpoint.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
@@ -167,7 +32,7 @@ impl ModelRef {
 
 /// A minimal session entry from `GET /api/session` — only the fields we need.
 #[derive(Debug, Clone, Deserialize)]
-pub struct SessionV2Info {
+pub struct Session {
     pub id: String,
     pub model: Option<ModelRef>,
     #[serde(rename = "parentID")]
@@ -175,7 +40,7 @@ pub struct SessionV2Info {
     pub agent: Option<String>,
     pub outcome: Option<SessionOutcome>,
     #[serde(default)]
-    pub time: Option<SessionTimeV2>,
+    pub time: Option<SessionTime>,
     #[serde(default)]
     pub location: Option<LocationRef>,
     #[serde(rename = "projectID")]
@@ -183,14 +48,6 @@ pub struct SessionV2Info {
     pub project_id: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
-}
-
-/// Response wrapper for `GET /api/session`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SessionsResponse {
-    pub data: Vec<SessionV2Info>,
-    #[serde(default)]
-    pub cursor: Option<Cursor>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -256,9 +113,9 @@ pub enum SessionOutcome {
     Interrupted,
 }
 
-/// Timestamps associated with a v2 session. JSON numbers may be int or float.
+/// Timestamps associated with a session. JSON numbers may be int or float.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct SessionTimeV2 {
+pub struct SessionTime {
     pub created: Option<f64>,
     pub updated: Option<f64>,
     pub idle: Option<f64>,
@@ -280,9 +137,9 @@ pub struct PromptReceipt {
     pub id: String,
 }
 
-/// An agent descriptor from the v2 `GET /api/agent` endpoint.
+/// An agent descriptor from the `GET /api/agent` endpoint.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct AgentV2 {
+pub struct Agent {
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -297,14 +154,14 @@ pub struct AgentV2 {
     pub hidden: Option<bool>,
 }
 
-/// A message entry from the v2 `GET /api/session/{id}/message` endpoint.
+/// A message entry from the `GET /api/session/{id}/message` endpoint.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
-pub enum SessionMessageV2 {
+pub enum SessionMessage {
     User {
         id: String,
         #[serde(default)]
-        time: Option<SessionTimeV2>,
+        time: Option<SessionTime>,
         #[serde(default)]
         text: String,
         #[serde(default)]
@@ -313,7 +170,7 @@ pub enum SessionMessageV2 {
     Assistant {
         id: String,
         #[serde(default)]
-        time: Option<SessionTimeV2>,
+        time: Option<SessionTime>,
         #[serde(default)]
         content: Vec<AssistantContent>,
     },
@@ -321,11 +178,11 @@ pub enum SessionMessageV2 {
     Other,
 }
 
-impl SessionMessageV2 {
+impl SessionMessage {
     pub fn text(&self) -> String {
         match self {
-            SessionMessageV2::User { text, .. } => text.clone(),
-            SessionMessageV2::Assistant { content, .. } => {
+            SessionMessage::User { text, .. } => text.clone(),
+            SessionMessage::Assistant { content, .. } => {
                 let mut result = String::new();
                 for entry in content {
                     if let AssistantContent::Text { text } = entry {
@@ -337,12 +194,12 @@ impl SessionMessageV2 {
                 }
                 result
             }
-            SessionMessageV2::Other => String::new(),
+            SessionMessage::Other => String::new(),
         }
     }
 
     pub fn is_user(&self) -> bool {
-        matches!(self, SessionMessageV2::User { .. })
+        matches!(self, SessionMessage::User { .. })
     }
 }
 
@@ -357,10 +214,10 @@ pub enum AssistantContent {
     Other,
 }
 
-/// Response wrapper for the v2 `GET /api/session/{id}/message` endpoint.
+/// Response wrapper for the `GET /api/session/{id}/message` endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionMessagesResponse {
-    pub data: Vec<SessionMessageV2>,
+    pub data: Vec<SessionMessage>,
     #[serde(default)]
     pub cursor: Option<Cursor>,
 }
@@ -390,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn session_v2_info_deserializes() {
+    fn session_deserializes() {
         let json = serde_json::json!({
             "id": "ses_abc123",
             "model": {
@@ -398,7 +255,7 @@ mod tests {
                 "providerID": "myprovider"
             }
         });
-        let info: SessionV2Info = serde_json::from_value(json).unwrap();
+        let info: Session = serde_json::from_value(json).unwrap();
         assert_eq!(info.id, "ses_abc123");
         assert!(info.model.is_some());
         let model = info.model.unwrap();
@@ -407,56 +264,25 @@ mod tests {
     }
 
     #[test]
-    fn session_v2_info_missing_model() {
+    fn session_missing_model() {
         let json = serde_json::json!({
             "id": "ses_xyz789"
         });
-        let info: SessionV2Info = serde_json::from_value(json).unwrap();
+        let info: Session = serde_json::from_value(json).unwrap();
         assert_eq!(info.id, "ses_xyz789");
         assert!(info.model.is_none());
     }
 
     #[test]
-    fn sessions_response_deserializes() {
-        let json = serde_json::json!({
-            "data": [
-                { "id": "ses_1", "model": { "id": "m1", "providerID": "p" } },
-                { "id": "ses_2" }
-            ],
-            "cursor": { "previous": "prev", "next": "next" }
-        });
-        let resp: SessionsResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(resp.data.len(), 2);
-        assert_eq!(resp.data[0].id, "ses_1");
-        assert_eq!(resp.data[1].id, "ses_2");
-        assert!(resp.cursor.is_some());
-        let cursor = resp.cursor.unwrap();
-        assert_eq!(cursor.previous, Some("prev".into()));
-        assert_eq!(cursor.next, Some("next".into()));
-    }
-
-    #[test]
-    fn sessions_response_no_cursor() {
-        let json = serde_json::json!({
-            "data": []
-        });
-        let resp: SessionsResponse = serde_json::from_value(json).unwrap();
-        assert!(resp.data.is_empty());
-        assert!(resp.cursor.is_none());
-    }
-
-    // ─── v2 response types ─────────────────────────────────────────
-
-    #[test]
     fn data_envelope_unwraps() {
         let json = serde_json::json!({ "data": { "id": "ses_1" } });
-        let envelope: Data<SessionV2Info> = serde_json::from_value(json).unwrap();
+        let envelope: Data<Session> = serde_json::from_value(json).unwrap();
         assert_eq!(envelope.data.id, "ses_1");
         assert!(envelope.data.model.is_none());
     }
 
     #[test]
-    fn session_v2_info_deserializes_outcome_and_idle_time() {
+    fn session_deserializes_outcome_and_idle_time() {
         let json = serde_json::json!({
             "id": "ses_1",
             "model": { "id": "m1", "providerID": "p" },
@@ -465,7 +291,7 @@ mod tests {
             "location": { "directory": "/wt" },
             "projectID": "p1"
         });
-        let info: SessionV2Info = serde_json::from_value(json).unwrap();
+        let info: Session = serde_json::from_value(json).unwrap();
         assert_eq!(info.id, "ses_1");
         assert_eq!(info.outcome, Some(SessionOutcome::Succeeded));
         let time = info.time.unwrap();
@@ -481,8 +307,8 @@ mod tests {
     }
 
     #[test]
-    fn session_message_v2_text_extracts_user_flat_and_assistant_content() {
-        let user: SessionMessageV2 = serde_json::from_value(serde_json::json!({
+    fn session_message_text_extracts_user_flat_and_assistant_content() {
+        let user: SessionMessage = serde_json::from_value(serde_json::json!({
             "id": "m1",
             "type": "user",
             "text": "hello",
@@ -492,7 +318,7 @@ mod tests {
         assert!(user.is_user());
         assert_eq!(user.text(), "hello");
 
-        let assistant: SessionMessageV2 = serde_json::from_value(serde_json::json!({
+        let assistant: SessionMessage = serde_json::from_value(serde_json::json!({
             "id": "m2",
             "type": "assistant",
             "content": [
@@ -505,7 +331,7 @@ mod tests {
         assert!(!assistant.is_user());
         assert_eq!(assistant.text(), "a\nb");
 
-        let other: SessionMessageV2 =
+        let other: SessionMessage =
             serde_json::from_value(serde_json::json!({ "type": "shell" })).unwrap();
         assert!(!other.is_user());
         assert_eq!(other.text(), "");
@@ -564,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_v2_deserializes() {
+    fn agent_deserializes() {
         let json = serde_json::json!({
             "id": "git-automate-developer",
             "name": "Developer",
@@ -574,14 +400,14 @@ mod tests {
             "system": "you are a dev",
             "hidden": false
         });
-        let agent: AgentV2 = serde_json::from_value(json).unwrap();
+        let agent: Agent = serde_json::from_value(json).unwrap();
         assert_eq!(agent.id, "git-automate-developer");
         assert_eq!(agent.name, "Developer");
         assert_eq!(agent.description, Some("writes code".into()));
         assert_eq!(agent.mode, Some(AgentMode::Primary));
         assert_eq!(agent.model.unwrap().id, "m1");
 
-        let minimal: AgentV2 = serde_json::from_value(serde_json::json!({
+        let minimal: Agent = serde_json::from_value(serde_json::json!({
             "id": "a",
             "name": "A"
         }))

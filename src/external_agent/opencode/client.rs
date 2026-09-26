@@ -4,9 +4,8 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::external_agent::opencode::types::{
-    ActiveSessionEntry, AgentV2, Data, LocationInfo, ModelRef, PromptReceipt, ServerInfo, Session,
-    SessionMessage, SessionMessageV2, SessionMessagesResponse, SessionV2Info, Workspace, Worktree,
-    WorktreeInfo,
+    ActiveSessionEntry, Agent, Data, LocationInfo, ModelRef, PromptReceipt, ServerInfo, Session,
+    SessionMessage, SessionMessagesResponse, WorktreeInfo,
 };
 
 /// Response wrapper for `GET /api/agent` — `{ "location": ..., "data": [...] }`.
@@ -18,7 +17,7 @@ struct AgentListResponse {
     #[serde(default)]
     #[allow(dead_code)]
     location: Option<serde_json::Value>,
-    data: Vec<AgentV2>,
+    data: Vec<Agent>,
 }
 
 const OPENCODE_USERNAME: &str = "opencode";
@@ -30,20 +29,14 @@ pub enum OpenCodeError {
     Http(String),
     #[error("HTTP status {0}")]
     HttpStatus(u16),
-    #[error("Failed to fetch agents: {0}")]
-    FetchAgents(String),
     #[error("Failed to create session: {0}")]
     CreateSession(String),
     #[error("Session creation returned no data")]
     NoSessionData,
     #[error("Failed to fetch session messages: {0}")]
     FetchSessionMessages(String),
-    #[error("Failed to create workspace: {0}")]
-    CreateWorkspace(String),
     #[error("Failed to create worktree: {0}")]
     CreateWorktree(String),
-    #[error("Failed to fetch location: {0}")]
-    FetchLocation(String),
     #[error("Failed to fetch active sessions: HTTP status {0}")]
     FetchActiveSessions(u16),
     #[error("Failed to get session: {0}")]
@@ -131,7 +124,7 @@ impl OpenCodeClient {
     /// When `directory` is `Some`, it is sent as the deepObject query
     /// parameter `location[directory]=<dir>`. The response wraps the agent
     /// list in `{ "location": ..., "data": [...] }`; only `data` is returned.
-    pub async fn get_agents(&self, directory: Option<&str>) -> Result<Vec<AgentV2>, OpenCodeError> {
+    pub async fn get_agents(&self, directory: Option<&str>) -> Result<Vec<Agent>, OpenCodeError> {
         let mut request = self
             .client
             .get(format!("{}/api/agent", self.base_url))
@@ -145,104 +138,6 @@ impl OpenCodeClient {
         }
         let agents: AgentListResponse = response.json().await?;
         Ok(agents.data)
-    }
-
-    /// Create a session and immediately send it a prompt.
-    ///
-    /// 1. `POST /session?directory=<dir>` with body `{"title": <title>}` to
-    ///    obtain a [`Session`]; its `id` is returned on success.
-    /// 2. `POST /session/<id>/prompt_async` with body
-    ///    `{"agent": <agent>, "parts": [{"type": "text", "text": <message>}]}`
-    ///    to deliver the prompt. The 204 response body is ignored.
-    pub async fn start_session(
-        &self,
-        directory: &str,
-        title: &str,
-        agent: &str,
-        message: &str,
-        model: Option<&str>,
-    ) -> Result<String, OpenCodeError> {
-        let prompt_body = json!({
-            "agent": agent,
-            "parts": [{ "type": "text", "text": message }]
-        });
-        start_session_http(
-            &self.client,
-            &self.base_url,
-            &self.auth_header,
-            directory,
-            None,
-            title,
-            prompt_body,
-            model,
-        )
-        .await
-    }
-
-    /// Create a session and send a prompt with an optional system prompt.
-    ///
-    /// Like [`start_session`](Self::start_session) but uses a `system` field
-    /// for instructions and an *optional* `agent` field. When `agent` is empty
-    /// the field is omitted, so OpenCode uses its default agent with the
-    /// provided `system` instructions — enabling prompt construction from
-    /// embedded markdown without pre-installed agents.
-    #[expect(clippy::too_many_arguments)]
-    pub async fn start_session_with_system(
-        &self,
-        directory: &str,
-        title: &str,
-        system_prompt: &str,
-        agent: &str,
-        message: &str,
-        workspace: Option<&str>,
-        model: Option<&str>,
-    ) -> Result<String, OpenCodeError> {
-        let mut prompt_body = json!({
-            "parts": [{ "type": "text", "text": message }]
-        });
-        if !system_prompt.is_empty() {
-            prompt_body["system"] = json!(system_prompt);
-        }
-        if !agent.is_empty() {
-            prompt_body["agent"] = json!(agent);
-        }
-        start_session_http(
-            &self.client,
-            &self.base_url,
-            &self.auth_header,
-            directory,
-            workspace,
-            title,
-            prompt_body,
-            model,
-        )
-        .await
-    }
-
-    /// `GET /session/status` — count active (non-Done) sessions.
-    /// Sessions present in the status map (idle, busy, retry) are considered active.
-    /// Sessions absent from the map are Done and do not count.
-    pub async fn count_active_sessions(&self) -> Result<usize, OpenCodeError> {
-        self.get_session_statuses().await.map(|m| m.len())
-    }
-
-    /// `GET /session/status` — return all active session IDs and their statuses.
-    /// Session IDs absent from the returned map have completed.
-    pub async fn get_session_statuses(
-        &self,
-    ) -> Result<std::collections::HashMap<String, serde_json::Value>, OpenCodeError> {
-        let response = self
-            .client
-            .get(format!("{}/session/status", self.base_url))
-            .header("Authorization", &self.auth_header)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
-        }
-        let statuses: std::collections::HashMap<String, serde_json::Value> =
-            response.json().await?;
-        Ok(statuses)
     }
 
     /// `GET /api/session/active` + `GET /api/session/{id}` — per-model counts
@@ -264,91 +159,6 @@ impl OpenCodeClient {
             }
         }
         Ok(counts)
-    }
-
-    /// `GET /session/{id}/message` — list messages in a session.
-    ///
-    /// Each entry has `info` (id, role, sessionID, time) and `parts` (content).
-    /// Use [`SessionMessage::text`] to extract prompt text.
-    pub async fn get_session_messages(
-        &self,
-        session_id: &str,
-        directory: Option<&str>,
-    ) -> Result<Vec<SessionMessage>, OpenCodeError> {
-        let mut request = self
-            .client
-            .get(format!("{}/session/{}/message", self.base_url, session_id))
-            .header("Authorization", &self.auth_header);
-        if let Some(dir) = directory {
-            request = request.query(&[("directory", dir)]);
-        }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(OpenCodeError::FetchSessionMessages(format!(
-                "HTTP status {}: {}",
-                status, body
-            )));
-        }
-        let messages: Vec<SessionMessage> = response.json().await?;
-        Ok(messages)
-    }
-
-    /// `POST /experimental/workspace` — create a new workspace.
-    ///
-    /// Sends `{"type": "worktree", "branch": null}` as the body with `directory`
-    /// as a query param. `"worktree"` is OpenCode's built-in git-worktree
-    /// adapter name; `branch: null` uses the current/default branch.
-    /// Returns the created [`Workspace`] on success.
-    pub async fn create_workspace(&self, directory: &str) -> Result<Workspace, OpenCodeError> {
-        let response = self
-            .client
-            .post(format!("{}/experimental/workspace", self.base_url))
-            .query(&[("directory", directory)])
-            .header("Authorization", &self.auth_header)
-            .json(&json!({ "type": "worktree", "branch": null }))
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(OpenCodeError::CreateWorkspace(format!(
-                "workspace creation HTTP status {}: {}",
-                status, body
-            )));
-        }
-        let workspace: Workspace = response.json().await?;
-        Ok(workspace)
-    }
-
-    /// `POST /experimental/worktree` — create a new git worktree.
-    ///
-    /// Uses `directory` and `workspace_id` as query params with an empty JSON
-    /// body. Returns the created [`Worktree`] on success.
-    pub async fn create_worktree(
-        &self,
-        directory: &str,
-        workspace_id: &str,
-    ) -> Result<Worktree, OpenCodeError> {
-        let response = self
-            .client
-            .post(format!("{}/experimental/worktree", self.base_url))
-            .query(&[("directory", directory), ("workspace", workspace_id)])
-            .header("Authorization", &self.auth_header)
-            .json(&json!({}))
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(OpenCodeError::CreateWorktree(format!(
-                "worktree creation HTTP status {}: {}",
-                status, body
-            )));
-        }
-        let worktree: Worktree = response.json().await?;
-        Ok(worktree)
     }
 
     /// `GET /api/info` — v2 server information (bare response, no envelope).
@@ -389,7 +199,7 @@ impl OpenCodeClient {
     ///
     /// Body is `{"projectID": <id>}` plus an optional `"branch"` key.
     /// Bare `{"directory": ...}` response, no envelope.
-    pub async fn create_worktree_v2(
+    pub async fn create_worktree(
         &self,
         project_id: &str,
         branch: Option<&str>,
@@ -425,7 +235,7 @@ impl OpenCodeClient {
         agent: &str,
         model: Option<&ModelRef>,
         directory: &str,
-    ) -> Result<SessionV2Info, OpenCodeError> {
+    ) -> Result<Session, OpenCodeError> {
         let mut body = json!({
             "title": title,
             "agent": agent,
@@ -453,7 +263,7 @@ impl OpenCodeClient {
             let body = response.text().await.unwrap_or_default();
             return Err(OpenCodeError::CreateSession(format!("{status}: {body}")));
         }
-        let session: Data<SessionV2Info> = response.json().await?;
+        let session: Data<Session> = response.json().await?;
         if session.data.id.is_empty() {
             return Err(OpenCodeError::NoSessionData);
         }
@@ -523,10 +333,7 @@ impl OpenCodeClient {
     /// Named `get_session_v2` (not `get_session`) because an inherent
     /// `get_session` would shadow the `ExternalAgent::get_session` trait
     /// method on `OpenCodeClient` at every method-call site.
-    pub async fn get_session_v2(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionV2Info>, OpenCodeError> {
+    pub async fn get_session_v2(&self, session_id: &str) -> Result<Option<Session>, OpenCodeError> {
         let response = self
             .client
             .get(format!("{}/api/session/{}", self.base_url, session_id))
@@ -541,16 +348,16 @@ impl OpenCodeClient {
             let body = response.text().await.unwrap_or_default();
             return Err(OpenCodeError::GetSession(format!("{status}: {body}")));
         }
-        let session: Data<SessionV2Info> = response.json().await?;
+        let session: Data<Session> = response.json().await?;
         Ok(Some(session.data))
     }
 
     /// `GET /api/session/{id}/message` — list v2 session messages, unwrapped
     /// from the `{"data": [...], "cursor": ...}` envelope (cursor ignored).
-    pub async fn get_session_messages_v2(
+    pub async fn get_session_messages(
         &self,
         session_id: &str,
-    ) -> Result<Vec<SessionMessageV2>, OpenCodeError> {
+    ) -> Result<Vec<SessionMessage>, OpenCodeError> {
         let response = self
             .client
             .get(format!(
@@ -570,69 +377,6 @@ impl OpenCodeClient {
         let messages: SessionMessagesResponse = response.json().await?;
         Ok(messages.data)
     }
-}
-
-/// Shared two-step HTTP flow used by [`OpenCodeClient::start_session`] and the
-/// `ExternalAgent` trait impl to create a session and deliver a prompt.
-#[expect(clippy::too_many_arguments)]
-pub(crate) async fn start_session_http(
-    client: &Client,
-    base_url: &str,
-    auth_header: &str,
-    directory: &str,
-    workspace: Option<&str>,
-    title: &str,
-    prompt_body: serde_json::Value,
-    model: Option<&str>,
-) -> Result<String, OpenCodeError> {
-    let mut query = vec![("directory", directory)];
-    if let Some(ws) = workspace {
-        query.push(("workspace", ws));
-    }
-    let mut create_body = json!({ "title": title });
-    if let Some(m) = model {
-        create_body["model"] = json!(m);
-    }
-    let create_response = client
-        .post(format!("{}/session", base_url))
-        .query(&query)
-        .header("Authorization", auth_header)
-        .json(&create_body)
-        .send()
-        .await?;
-
-    if !create_response.status().is_success() {
-        let status = create_response.status().as_u16();
-        let body = create_response.text().await.unwrap_or_default();
-        return Err(OpenCodeError::CreateSession(format!(
-            "session creation HTTP status {}: {}",
-            status, body
-        )));
-    }
-
-    let session: Session = create_response.json().await?;
-    if session.id.is_empty() {
-        return Err(OpenCodeError::NoSessionData);
-    }
-    let session_id = session.id;
-
-    let prompt_response = client
-        .post(format!("{}/session/{}/prompt_async", base_url, session_id))
-        .header("Authorization", auth_header)
-        .json(&prompt_body)
-        .send()
-        .await?;
-
-    if !prompt_response.status().is_success() {
-        let status = prompt_response.status().as_u16();
-        let body = prompt_response.text().await.unwrap_or_default();
-        return Err(OpenCodeError::CreateSession(format!(
-            "prompt_async HTTP status {}: {}",
-            status, body
-        )));
-    }
-
-    Ok(session_id)
 }
 
 /// Encode credentials for HTTP Basic authentication.
@@ -928,686 +672,7 @@ mod tests {
         assert!(matches!(result, Err(OpenCodeError::HttpStatus(500))));
     }
 
-    // --- start_session (tests 11-14) ------------------------------------
-
-    #[tokio::test]
-    async fn test_start_session_returns_id() {
-        // Session creation mock.
-        let create = Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(query_param("directory", "/d"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        create.mount(&server).await;
-
-        // prompt_async mock.
-        let prompt = Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1);
-        prompt.mount(&server).await;
-
-        let client = client(&server);
-        let id = client
-            .start_session(
-                "/d",
-                "Session Title",
-                "git-automate-triage",
-                "issue body",
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(id, "sess123");
-    }
-
-    #[tokio::test]
-    async fn test_start_session_500_on_create_returns_error() {
-        let create = Mock::given(method("POST"))
-            .and(path("/session"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1);
-        let server = MockServer::start().await;
-        create.mount(&server).await;
-
-        let client = client(&server);
-        let result = client
-            .start_session("/d", "t", "git-automate-triage", "m", None)
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_start_session_prompt_async_body() {
-        let create = Mock::given(method("POST"))
-            .and(path("/session"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        create.mount(&server).await;
-
-        let prompt = Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .and(body_json(json!({
-                "agent": "git-automate-triage",
-                "parts": [{ "type": "text", "text": "issue body" }]
-            })))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1);
-        prompt.mount(&server).await;
-
-        let client = client(&server);
-        client
-            .start_session(
-                "/d",
-                "Session Title",
-                "git-automate-triage",
-                "issue body",
-                None,
-            )
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_start_session_create_body_is_title() {
-        let create = Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .and(body_json(json!({ "title": "Session Title" })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        create.mount(&server).await;
-
-        let prompt = Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1);
-        prompt.mount(&server).await;
-
-        let client = client(&server);
-        client
-            .start_session(
-                "/d",
-                "Session Title",
-                "git-automate-triage",
-                "issue body",
-                None,
-            )
-            .await
-            .unwrap();
-    }
-
-    // --- auth header on all requests (test 15) --------------------------
-
-    #[tokio::test]
-    async fn test_auth_header_sent_on_all_requests() {
-        // health
-        let health = Mock::given(method("GET"))
-            .and(path("/api/info"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "version": "2.0.18",
-                "pid": 47234,
-                "urls": ["http://127.0.0.1:4096"],
-                "paths": { "tmp": "/tmp/opencode" }
-            })))
-            .expect(1)
-            .named("health");
-        // agent
-        let agent = Mock::given(method("GET"))
-            .and(path("/api/agent"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "location": {}, "data": [] })),
-            )
-            .expect(1)
-            .named("agent");
-        // session create
-        let create = Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess1",
-                "projectID": "p",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(1)
-            .named("create");
-        // prompt_async
-        let prompt = Mock::given(method("POST"))
-            .and(path("/session/sess1/prompt_async"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .named("prompt");
-
-        let server = MockServer::start().await;
-        health.mount(&server).await;
-        agent.mount(&server).await;
-        create.mount(&server).await;
-        prompt.mount(&server).await;
-
-        let client = client(&server);
-        assert!(client.check_health().await);
-        client.get_agents(None).await.unwrap();
-        client
-            .start_session("/d", "t", "git-automate-triage", "m", None)
-            .await
-            .unwrap();
-
-        server.verify().await;
-    }
-
-    // --- count_active_sessions (tests 16-19) ------------------------------
-
-    #[tokio::test]
-    async fn count_active_sessions_with_mixed_statuses() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "sess1": { "type": "idle" },
-                "sess2": { "type": "busy" },
-                "sess3": { "type": "retry", "attempt": 1, "message": "fail" }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        assert_eq!(client.count_active_sessions().await.unwrap(), 3);
-    }
-
-    #[tokio::test]
-    async fn count_active_sessions_empty_map() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        assert_eq!(client.count_active_sessions().await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn count_active_sessions_500_returns_error() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let result = client.count_active_sessions().await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn count_active_sessions_sends_auth_header() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        client.count_active_sessions().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_get_session_statuses_returns_full_map() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "sess1": { "type": "idle" },
-                "sess2": { "type": "busy" },
-                "sess3": { "type": "retry", "attempt": 1 }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let statuses = client.get_session_statuses().await.unwrap();
-        assert_eq!(statuses.len(), 3);
-        assert!(statuses.contains_key("sess1"));
-        assert!(statuses.contains_key("sess2"));
-        assert!(statuses.contains_key("sess3"));
-        // A completed session should NOT be in the map
-        assert!(!statuses.contains_key("sess-done"));
-    }
-
-    #[tokio::test]
-    async fn test_get_session_statuses_empty_map() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let statuses = client.get_session_statuses().await.unwrap();
-        assert!(statuses.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_get_session_statuses_500_returns_error() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let result = client.get_session_statuses().await;
-        assert!(result.is_err());
-    }
-
-    // --- get_session_messages (tests 20-24) ------------------------------
-
-    #[tokio::test]
-    async fn test_get_session_messages_returns_user_prompt() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/sess1/message"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {
-                    "info": {
-                        "id": "msg1",
-                        "role": "user",
-                        "sessionID": "sess1",
-                        "time": { "created": 1, "updated": 1 }
-                    },
-                    "parts": [{ "type": "text", "text": "issue body content" }]
-                },
-                {
-                    "info": {
-                        "id": "msg2",
-                        "role": "assistant",
-                        "sessionID": "sess1",
-                        "time": { "created": 2, "updated": 2 }
-                    },
-                    "parts": [{ "type": "text", "text": "response" }]
-                }
-            ])))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let messages = client.get_session_messages("sess1", None).await.unwrap();
-
-        assert_eq!(messages.len(), 2);
-        let user_msg = messages.iter().find(|m| m.is_user()).unwrap();
-        assert_eq!(user_msg.info.id, "msg1");
-        assert_eq!(user_msg.text(), "issue body content");
-        assert!(
-            !messages
-                .iter()
-                .any(|m| !m.is_user() && m.text() == "issue body content")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_session_messages_empty_array() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/sess1/message"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let messages = client.get_session_messages("sess1", None).await.unwrap();
-        assert!(messages.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_get_session_messages_500_returns_error() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/sess1/message"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let result = client.get_session_messages("sess1", None).await;
-        assert!(matches!(
-            result,
-            Err(OpenCodeError::FetchSessionMessages(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_get_session_messages_with_directory_query_param() {
-        let mock = Mock::given(method("GET"))
-            .and(path("/session/sess1/message"))
-            .and(query_param("directory", "/d"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        client
-            .get_session_messages("sess1", Some("/d"))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_session_message_text_concatenates_parts() {
-        let body = json!([{
-            "info": { "id": "m1", "role": "user", "sessionID": "s" },
-            "parts": [
-                { "type": "text", "text": "first" },
-                { "type": "text", "text": "second" }
-            ]
-        }]);
-        let msg: SessionMessage = serde_json::from_value(body[0].clone()).unwrap();
-        assert_eq!(msg.text(), "first\nsecond");
-        assert!(msg.is_user());
-    }
-
-    // --- create_workspace (tests 25-26) ---------------------------------
-
-    #[tokio::test]
-    async fn create_workspace_happy_path() {
-        let mock = Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
-            .and(query_param("directory", "/d"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .and(body_json(json!({ "type": "worktree", "branch": null })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "worktree",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
-            })))
-            .expect(1)
-            .named("create_workspace");
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let ws = client.create_workspace("/d").await.unwrap();
-        assert_eq!(ws.id, "wrk1");
-        assert_eq!(ws.kind, "worktree");
-        assert_eq!(ws.name, "w1");
-        assert_eq!(ws.project_id, "p1");
-
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn create_workspace_500_returns_error() {
-        let mock = Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let result = client.create_workspace("/d").await;
-        assert!(matches!(result, Err(OpenCodeError::CreateWorkspace(_))));
-    }
-
-    #[tokio::test]
-    async fn create_workspace_400_includes_response_body() {
-        let mock = Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "name": "WorkspaceCreateError",
-                "data": { "message": "Adapter 'git' not found" }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let result = client.create_workspace("/d").await;
-        match result {
-            Err(OpenCodeError::CreateWorkspace(msg)) => {
-                assert!(
-                    msg.contains("Adapter 'git' not found"),
-                    "error message should contain response body, got: {msg}"
-                );
-            }
-            other => panic!("expected CreateWorkspace error, got {other:?}"),
-        }
-    }
-
-    // --- create_worktree (tests 27-28) ----------------------------------
-
-    #[tokio::test]
-    async fn create_worktree_happy_path() {
-        let mock = Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("directory", "/d"))
-            .and(query_param("workspace", "wrk1"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .and(body_json(json!({})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-1",
-                "directory": "/wt/dir1"
-            })))
-            .expect(1)
-            .named("create_worktree");
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let wt = client.create_worktree("/d", "wrk1").await.unwrap();
-        assert_eq!(wt.name, "wt1");
-        assert_eq!(wt.branch.as_deref(), Some("issue-1"));
-        assert_eq!(wt.directory, "/wt/dir1");
-
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn create_worktree_500_returns_error() {
-        let mock = Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1);
-        let server = MockServer::start().await;
-        mock.mount(&server).await;
-
-        let client = client(&server);
-        let result = client.create_worktree("/d", "wrk1").await;
-        assert!(matches!(result, Err(OpenCodeError::CreateWorktree(_))));
-    }
-
-    // --- start_session_with_system with workspace (tests 29-30) ----------
-
-    #[tokio::test]
-    async fn start_session_with_system_workspace_query_param() {
-        let create = Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(query_param("directory", "/d"))
-            .and(query_param("workspace", "wrk1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        create.mount(&server).await;
-
-        let prompt = Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1);
-        prompt.mount(&server).await;
-
-        let client = client(&server);
-        let id = client
-            .start_session_with_system("/d", "t", "sys", "", "m", Some("wrk1"), None)
-            .await
-            .unwrap();
-        assert_eq!(id, "sess123");
-    }
-
-    #[tokio::test]
-    async fn start_session_with_system_none_workspace_omits_param() {
-        // A mock that matches when a `workspace` query param is present must NOT match.
-        let ws_present = Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(query_param("workspace", "x"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "should-not-happen",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(0);
-        let server = MockServer::start().await;
-        ws_present.mount(&server).await;
-
-        // Fallback: matches the no-workspace-param request.
-        let ok = Mock::given(method("POST"))
-            .and(path("/session"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(1);
-        ok.mount(&server).await;
-
-        let prompt = Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1);
-        prompt.mount(&server).await;
-
-        let client = client(&server);
-        let id = client
-            .start_session_with_system("/d", "t", "sys", "", "m", None, None)
-            .await
-            .unwrap();
-        assert_eq!(id, "sess123");
-    }
-
-    // --- start_session_with_system model (tests 31-32) -----------------
-
-    #[tokio::test]
-    async fn start_session_with_system_includes_model_in_body() {
-        let create = Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(body_json(
-                json!({ "title": "t", "model": "myprovider/fast" }),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        create.mount(&server).await;
-
-        let prompt = Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1);
-        prompt.mount(&server).await;
-
-        let client = client(&server);
-        let id = client
-            .start_session_with_system("/d", "t", "sys", "", "m", None, Some("myprovider/fast"))
-            .await
-            .unwrap();
-        assert_eq!(id, "sess123");
-    }
-
-    #[tokio::test]
-    async fn start_session_with_system_omits_model_when_none() {
-        let create = Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(body_json(json!({ "title": "t" })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": { "created": 1, "updated": 2 }
-            })))
-            .expect(1);
-        let server = MockServer::start().await;
-        create.mount(&server).await;
-
-        let prompt = Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1);
-        prompt.mount(&server).await;
-
-        let client = client(&server);
-        let id = client
-            .start_session_with_system("/d", "t", "sys", "", "m", None, None)
-            .await
-            .unwrap();
-        assert_eq!(id, "sess123");
-    }
-
-    // --- get_session_models (tests 33-36) --------------------------
+    // --- get_session_models ---------------------------------------------
 
     #[tokio::test]
     async fn get_session_models_happy_path() {
@@ -2033,7 +1098,7 @@ mod tests {
 
     // T46: GET /api/session/{id}/message unwraps the data envelope.
     #[tokio::test]
-    async fn get_session_messages_v2_unwraps_data() {
+    async fn get_session_messages_unwraps_data() {
         let mock = Mock::given(method("GET"))
             .and(path("/api/session/ses_1/message"))
             .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
@@ -2047,7 +1112,7 @@ mod tests {
         mock.mount(&server).await;
 
         let client = client(&server);
-        let messages = client.get_session_messages_v2("ses_1").await.unwrap();
+        let messages = client.get_session_messages("ses_1").await.unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].is_user());
         assert_eq!(messages[0].text(), "hi");
@@ -2058,7 +1123,7 @@ mod tests {
     // T47: POST /api/worktree posts the project id and returns a bare
     // {"directory": ...} response.
     #[tokio::test]
-    async fn create_worktree_v2_posts_project_id() {
+    async fn create_worktree_posts_project_id() {
         let mock = Mock::given(method("POST"))
             .and(path("/api/worktree"))
             .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
@@ -2071,7 +1136,7 @@ mod tests {
         mock.mount(&server).await;
 
         let client = client(&server);
-        let wt = client.create_worktree_v2("p1", None).await.unwrap();
+        let wt = client.create_worktree("p1", None).await.unwrap();
         assert_eq!(wt.directory, "/wt/x");
 
         server.verify().await;

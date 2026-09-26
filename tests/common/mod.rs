@@ -251,8 +251,7 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
     mount_ai_issue_mock(server).await;
 }
 
-/// Mount OpenCode health + agents mocks.
-/// Session/prompt_async are mounted separately when call counts matter.
+/// Mount the OpenCode v2 health (`GET /api/info`) mock.
 pub async fn mount_opencode_mocks(server: &MockServer) {
     // Health (v2: GET /api/info)
     Mock::given(method("GET"))
@@ -267,61 +266,11 @@ pub async fn mount_opencode_mocks(server: &MockServer) {
         .await;
 }
 
-/// Mount OpenCode experimental workspace + worktree creation mocks.
-///
-/// Call alongside `mount_opencode_mocks` when a test starts sessions (which
-/// now create a workspace and worktree before the session).
-#[allow(dead_code)]
-pub async fn mount_opencode_workspace_worktree_mocks(server: &MockServer) {
-    // Workspace creation
-    Mock::given(method("POST"))
-        .and(path("/experimental/workspace"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "wrk1",
-            "type": "git",
-            "name": "w1",
-            "branch": null,
-            "directory": null,
-            "extra": null,
-            "projectID": "p1",
-            "timeUsed": 0
-        })))
-        .mount(server)
-        .await;
-
-    // Worktree creation
-    Mock::given(method("POST"))
-        .and(path("/experimental/worktree"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "name": "wt1",
-            "branch": "issue-1",
-            "directory": "/wt/dir1"
-        })))
-        .mount(server)
-        .await;
-}
-
 // ── OpenCode v2 API mock fixtures ─────────────────────────────
-
-/// Mount the OpenCode v2 `GET /api/info` mock.
-#[allow(dead_code)]
-pub async fn mount_opencode_v2_mocks(server: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path("/api/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "version": "2.0.18",
-            "pid": 1234,
-            "urls": ["http://127.0.0.1:4096"],
-            "paths": { "tmp": "/tmp" }
-        })))
-        .mount(server)
-        .await;
-}
 
 /// Mount the OpenCode v2 location + worktree creation mocks.
 ///
 /// The location mock accepts any `location[directory]` query parameter.
-#[allow(dead_code)]
 pub async fn mount_opencode_v2_location_worktree_mocks(server: &MockServer) {
     // Location lookup (accept any `location[directory]` query).
     Mock::given(method("GET"))
@@ -347,49 +296,7 @@ pub async fn mount_opencode_v2_location_worktree_mocks(server: &MockServer) {
         .await;
 }
 
-/// Mount the OpenCode v2 session creation + prompt mocks.
-#[allow(dead_code)]
-pub async fn mount_opencode_v2_session_flow_mocks(server: &MockServer) {
-    // Session creation.
-    Mock::given(method("POST"))
-        .and(path("/api/session"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": {
-                "id": "ses123",
-                "projectID": "p1",
-                "cost": 0,
-                "tokens": {
-                    "input": 0,
-                    "output": 0,
-                    "reasoning": 0,
-                    "cache": { "read": 0, "write": 0 }
-                },
-                "time": { "created": 1, "updated": 1 },
-                "location": { "directory": "/test-work/.worktrees/wt1" }
-            }
-        })))
-        .mount(server)
-        .await;
-
-    // Prompt dispatch.
-    Mock::given(method("POST"))
-        .and(path("/api/session/ses123/prompt"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": {
-                "id": "msg_1",
-                "sessionID": "ses123",
-                "time": { "created": 1 },
-                "type": "user",
-                "payload": { "text": "x" },
-                "delivery": "queue"
-            }
-        })))
-        .mount(server)
-        .await;
-}
-
 /// Mount the OpenCode v2 active-sessions mock for the given session ids.
-#[allow(dead_code)]
 pub async fn mount_opencode_v2_active_sessions_mock(server: &MockServer, active: &[&str]) {
     let active_map: serde_json::Map<String, serde_json::Value> = active
         .iter()
@@ -406,7 +313,6 @@ pub async fn mount_opencode_v2_active_sessions_mock(server: &MockServer, active:
 /// Mount the OpenCode v2 `GET /api/session/{session_id}` mock.
 ///
 /// `outcome` and `idle` are omitted from the payload when `None`.
-#[allow(dead_code)]
 pub async fn mount_opencode_v2_get_session_mock(
     server: &MockServer,
     session_id: &str,
@@ -437,23 +343,6 @@ pub async fn mount_opencode_v2_get_session_mock(
     Mock::given(method("GET"))
         .and(path(format!("/api/session/{session_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": data })))
-        .mount(server)
-        .await;
-}
-
-/// Mount the OpenCode v2 `GET /api/session/{session_id}/message` mock.
-#[allow(dead_code)]
-pub async fn mount_opencode_v2_message_mock(
-    server: &MockServer,
-    session_id: &str,
-    messages_json: serde_json::Value,
-) {
-    Mock::given(method("GET"))
-        .and(path(format!("/api/session/{session_id}/message")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": messages_json,
-            "cursor": null
-        })))
         .mount(server)
         .await;
 }

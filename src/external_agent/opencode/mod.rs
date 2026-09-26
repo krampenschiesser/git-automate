@@ -11,9 +11,7 @@ pub mod types;
 // Convenience re-exports
 pub use client::{OpenCodeClient, OpenCodeError, encode_basic_auth};
 pub use types::{
-    ActiveSessionEntry, Agent, AgentInfo, AgentV2, AssistantContent, Cursor, Data, HealthResponse,
-    LocationInfo, LocationProject, LocationRef, ModelRef, PromptReceipt, ServerInfo,
-    ServerInfoPaths, Session, SessionMessage, SessionMessageInfo, SessionMessageV2,
-    SessionMessagesResponse, SessionOutcome, SessionTime, SessionTimeV2, SessionV2Info,
-    SessionsResponse, Workspace, Worktree, WorktreeInfo,
+    ActiveSessionEntry, Agent, AgentMode, AssistantContent, Cursor, Data, LocationInfo,
+    LocationProject, LocationRef, ModelRef, PromptReceipt, ServerInfo, ServerInfoPaths, Session,
+    SessionMessage, SessionMessagesResponse, SessionOutcome, SessionTime, WorktreeInfo,
 };
