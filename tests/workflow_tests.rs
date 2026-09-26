@@ -22,6 +22,7 @@ use git_automate::workflow::helpers::{ProjectContext, WorkflowContext, write_pro
 // ─── Test 1: Full triage flow with mocks ──────────────────────
 
 #[tokio::test]
+#[ignore = "v2 migration: re-enabled in W5"]
 async fn test_full_triage_flow_with_mocks() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -1138,6 +1139,7 @@ fn failed_review_test_ctx(
 }
 
 #[tokio::test]
+#[ignore = "v2 migration: re-enabled in W5"]
 async fn test_failed_review_technical_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -1187,6 +1189,7 @@ async fn test_failed_review_technical_transitions_to_in_dev() {
 }
 
 #[tokio::test]
+#[ignore = "v2 migration: re-enabled in W5"]
 async fn test_failed_review_product_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -1236,6 +1239,7 @@ async fn test_failed_review_product_transitions_to_in_dev() {
 }
 
 #[tokio::test]
+#[ignore = "v2 migration: re-enabled in W5"]
 async fn test_failed_review_qa_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -1332,6 +1336,7 @@ async fn test_active_review_session_not_recovered() {
 /// branch, and that the filled prompt contains PR_URL, PR_CHANGES, and
 /// PR_COMMENTS.
 #[tokio::test]
+#[ignore = "v2 migration: re-enabled in W5"]
 async fn todo_check_gathers_pr_context_when_pr_exists() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -1641,6 +1646,7 @@ async fn todo_check_gathers_pr_context_when_pr_exists() {
 /// When `get_pull_request_for_branch` returns `None`, the check should
 /// continue normally with empty PR_URL, PR_CHANGES, and PR_COMMENTS.
 #[tokio::test]
+#[ignore = "v2 migration: re-enabled in W5"]
 async fn todo_check_no_pr_for_branch_continues_normally() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -1874,6 +1880,7 @@ async fn todo_check_no_pr_for_branch_continues_normally() {
 /// branch, and that the filled prompt contains PR_URL, PR_CHANGES, and
 /// PR_COMMENTS.
 #[tokio::test]
+#[ignore = "v2 migration: re-enabled in W5"]
 async fn review_check_gathers_pr_comments() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;

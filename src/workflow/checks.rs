@@ -20,11 +20,12 @@ use crate::external_agent::opencode::OpenCodeClient;
 use crate::external_issues::github::types::IssueInfo;
 
 use super::helpers::{
-    LogLevel, ProjectContext, WorkflowContext, WorkflowError, branch_name_for_issue,
-    extract_session_id, fill_prompt, get_issue_body_map, issue_body_or_title, load_agent_template,
-    load_prompt_template, log_deduped, parse_resolve_threads, resolve_field_ids, resolve_option_id,
-    resolve_status_option_and_session,
+    LogLevel, ProjectContext, SessionCompletion, WorkflowContext, WorkflowError,
+    branch_name_for_issue, extract_session_id, fill_prompt, get_issue_body_map,
+    issue_body_or_title, load_prompt_template, log_deduped, parse_resolve_threads,
+    resolve_field_ids, resolve_option_id, resolve_status_option_and_session, session_completion,
 };
+use crate::workflow::AgentName;
 
 // ─── Constants ─────────────────────────────────────────────────
 
@@ -97,11 +98,11 @@ pub(crate) static OPENCODE_UNHEALTHY_LOGGED: AtomicBool = AtomicBool::new(false)
 
 // ─── start_opencode_session ────────────────────────────────────
 
-/// Start an OpenCode session with the given system prompt and user message.
+/// Start an OpenCode session with the given agent and user message.
 ///
-/// Creates a new [`OpenCodeClient`] per call. The `system_prompt` carries
-/// agent instructions; the `agent` field is omitted so OpenCode uses its
-/// default agent.
+/// Creates a new [`OpenCodeClient`] per call. The `agent` names the OpenCode
+/// agent (e.g. `git-automate-triage`) whose instructions drive the session;
+/// v2 has no per-session system prompt.
 ///
 /// When `concurrency` is `Some(limit)`, the active session count is queried
 /// first; if it meets or exceeds the limit the session is **not** created and
@@ -113,7 +114,7 @@ async fn start_opencode_session(
     oc: &OpencodeSessionConfig,
     directory: &str,
     title: &str,
-    system_prompt: &str,
+    agent: crate::workflow::AgentName,
     message: &str,
     concurrency: &HashMap<String, usize>,
     log_dedup: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
@@ -146,22 +147,19 @@ async fn start_opencode_session(
         }
     }
 
-    let workspace = client
-        .create_workspace(directory)
+    let location = client
+        .get_location(directory)
         .await
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
     let worktree = client
-        .create_worktree(directory, &workspace.id)
+        .create_worktree_v2(&location.project.id, None)
         .await
         .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
     log_deduped(
         log_dedup,
         step,
         LogLevel::Info,
-        format!(
-            "starting session in worktree {} (workspace {})",
-            worktree.directory, workspace.id
-        ),
+        format!("starting session in worktree {}", worktree.directory),
     )
     .await;
     if CAPACITY_EXCEEDED.swap(false, Ordering::Relaxed) {
@@ -177,18 +175,15 @@ async fn start_opencode_session(
         .await;
     }
 
-    client
-        .start_session_with_system(
-            &worktree.directory,
-            title,
-            system_prompt,
-            "",
-            message,
-            Some(&workspace.id),
-            None,
-        )
+    let session = client
+        .create_session(title, agent.as_str(), None, &worktree.directory)
         .await
-        .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))
+        .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
+    client
+        .send_prompt(&session.id, message)
+        .await
+        .map_err(|e| WorkflowError::Other(format!("OpenCode: {}", e)))?;
+    Ok(session.id)
 }
 
 // ── Triage Check ──
@@ -275,8 +270,6 @@ pub async fn run_triage_check(
                 ),
             )
             .await;
-            let system_prompt =
-                load_agent_template("triage", Some(Path::new(&ctx.config.directory)))?;
             let template = load_prompt_template("triage", Some(Path::new(&ctx.config.directory)))?;
             let values = HashMap::from([
                 ("ISSUE_TITLE".to_string(), issue.title.clone()),
@@ -293,7 +286,7 @@ pub async fn run_triage_check(
                 oc,
                 oc.directory.as_str(),
                 &issue.title,
-                &system_prompt,
+                AgentName::Triage,
                 &user_prompt,
                 deps.config
                     .opencode
@@ -490,8 +483,6 @@ pub async fn run_todo_check(
             ),
         )
         .await;
-        let system_prompt =
-            load_agent_template("developer", Some(Path::new(&ctx.config.directory)))?;
         let template = load_prompt_template("developer", Some(Path::new(&ctx.config.directory)))?;
         let branch_name = branch_name_for_issue(*issue_number, &deps.config.git, None);
         let values = HashMap::from([
@@ -512,7 +503,7 @@ pub async fn run_todo_check(
             oc,
             oc.directory.as_str(),
             &title,
-            &system_prompt,
+            AgentName::Developer,
             &user_prompt,
             deps.config
                 .opencode
@@ -591,8 +582,6 @@ pub async fn run_review_check(
 
         let template =
             load_prompt_template(state.prompt(), Some(Path::new(&ctx.config.directory)))?;
-        let system_prompt =
-            load_agent_template(state.prompt(), Some(Path::new(&ctx.config.directory)))?;
 
         for (item, values) in project_items.iter().zip(&item_values) {
             let current_status = values.get("Status").and_then(|v| v.as_deref());
@@ -701,7 +690,7 @@ pub async fn run_review_check(
                 oc,
                 oc.directory.as_str(),
                 &title,
-                &system_prompt,
+                state.agent(),
                 &filled_prompt,
                 deps.config
                     .opencode
@@ -779,7 +768,7 @@ pub async fn run_failed_review_check(
     let in_dev_option_id = resolve_option_id(&status_field.options, "In Development");
 
     let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
-    let active_sessions = match oc_client.get_session_statuses().await {
+    let active_sessions = match oc_client.get_active_sessions().await {
         Ok(sessions) => sessions,
         Err(e) => {
             log_deduped(
@@ -787,12 +776,12 @@ pub async fn run_failed_review_check(
                 "review",
                 LogLevel::Warn,
                 format!(
-                    "{}: could not fetch OpenCode session statuses for failed review check: {}",
+                    "{}: could not fetch OpenCode active sessions for failed review check: {}",
                     ctx.name, e
                 ),
             )
             .await;
-            std::collections::HashMap::new()
+            return Ok(());
         }
     };
 
@@ -815,6 +804,40 @@ pub async fn run_failed_review_check(
 
             if active_sessions.contains_key(&session_id) {
                 continue;
+            }
+
+            let session = match oc_client.get_session_v2(&session_id).await {
+                Ok(session) => session,
+                Err(e) => {
+                    log_deduped(
+                        &deps.log_dedup,
+                        "review",
+                        LogLevel::Warn,
+                        format!(
+                            "{}: could not fetch OpenCode session {} for failed review check: {}",
+                            ctx.name, session_id, e
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+
+            match session_completion(false, session.as_ref()) {
+                SessionCompletion::Waiting => continue,
+                SessionCompletion::Failed(reason) => {
+                    log_deduped(
+                        &deps.log_dedup,
+                        "review",
+                        LogLevel::Warn,
+                        format!(
+                            "{}: review session {} for issue #{} ended abnormally ({}), recovering",
+                            ctx.name, session_id, item.content_number, reason
+                        ),
+                    )
+                    .await;
+                }
+                SessionCompletion::Succeeded => {}
             }
 
             log_deduped(
@@ -863,8 +886,6 @@ pub async fn run_failed_review_check(
             )
             .await;
 
-            let system_prompt =
-                load_agent_template("developer", Some(Path::new(&ctx.config.directory)))?;
             let template =
                 load_prompt_template("developer", Some(Path::new(&ctx.config.directory)))?;
             let branch_name = format!("issue-{}", issue_number);
@@ -883,7 +904,7 @@ pub async fn run_failed_review_check(
                 oc,
                 oc.directory.as_str(),
                 &title,
-                &system_prompt,
+                AgentName::Developer,
                 &user_prompt,
                 deps.config
                     .opencode
@@ -971,9 +992,10 @@ pub async fn run_dev_completion_check(
 
     let _in_dev_option_id = resolve_option_id(&status_field.options, "In Development");
     let review_tech_option_id = resolve_option_id(&status_field.options, "Review Technical");
+    let todo_option_id = resolve_option_id(&status_field.options, "Todo");
 
     let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
-    let active_sessions = match oc_client.get_session_statuses().await {
+    let active_sessions = match oc_client.get_active_sessions().await {
         Ok(sessions) => sessions,
         Err(e) => {
             log_deduped(
@@ -981,12 +1003,12 @@ pub async fn run_dev_completion_check(
                 "review",
                 LogLevel::Warn,
                 format!(
-                    "{}: could not fetch OpenCode session statuses for dev completion check: {}",
+                    "{}: could not fetch OpenCode active sessions for dev completion check: {}",
                     ctx.name, e
                 ),
             )
             .await;
-            std::collections::HashMap::new()
+            return Ok(());
         }
     };
 
@@ -1010,6 +1032,59 @@ pub async fn run_dev_completion_check(
             continue;
         }
 
+        let session = match oc_client.get_session_v2(&session_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                log_deduped(
+                    &deps.log_dedup,
+                    "review",
+                    LogLevel::Warn,
+                    format!(
+                        "{}: could not fetch OpenCode session {} for dev completion check: {}",
+                        ctx.name, session_id, e
+                    ),
+                )
+                .await;
+                continue;
+            }
+        };
+
+        match session_completion(false, session.as_ref()) {
+            SessionCompletion::Waiting => continue,
+            SessionCompletion::Failed(reason) => {
+                log_deduped(
+                    &deps.log_dedup,
+                    "review",
+                    LogLevel::Warn,
+                    format!(
+                        "{}: developer session {} for issue #{} ended abnormally ({}), resetting to Todo",
+                        ctx.name, session_id, item.content_number, reason
+                    ),
+                )
+                .await;
+                github
+                    .update_project_item_session_id(
+                        &ctx.project_id,
+                        &item.id,
+                        &session_field_id,
+                        None,
+                    )
+                    .await?;
+                if let Some(ref option_id) = todo_option_id {
+                    github
+                        .update_project_item_status(
+                            &ctx.project_id,
+                            &item.id,
+                            &field_ids.status_field_id,
+                            option_id,
+                        )
+                        .await?;
+                }
+                continue;
+            }
+            SessionCompletion::Succeeded => {}
+        }
+
         log_deduped(
             &deps.log_dedup,
             "review",
@@ -1021,7 +1096,7 @@ pub async fn run_dev_completion_check(
         )
         .await;
 
-        let messages = match oc_client.get_session_messages(&session_id, None).await {
+        let messages = match oc_client.get_session_messages_v2(&session_id).await {
             Ok(msgs) => msgs,
             Err(e) => {
                 log_deduped(
@@ -1130,14 +1205,17 @@ pub async fn run_triage_completion_check(
         .ok_or_else(|| WorkflowError::StatusOptionNotFound("Todo".to_string()))?;
 
     let oc_client = OpenCodeClient::new(oc.url.clone(), oc.pw.clone());
-    let active_sessions = oc_client.get_session_statuses().await.unwrap_or_else(|e| {
-        tracing::warn!(
-            "{}: could not fetch OpenCode session statuses for triage completion check: {}",
-            ctx.name,
-            e
-        );
-        std::collections::HashMap::new()
-    });
+    let active_sessions = match oc_client.get_active_sessions().await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::warn!(
+                "{}: could not fetch OpenCode active sessions for triage completion check: {}",
+                ctx.name,
+                e
+            );
+            return Ok(());
+        }
+    };
 
     let mut item_values = Vec::new();
     for item in &project_items {
@@ -1159,6 +1237,42 @@ pub async fn run_triage_completion_check(
             continue;
         }
 
+        let session = match oc_client.get_session_v2(&session_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(
+                    "{}: could not fetch OpenCode session {} for triage completion check: {}",
+                    ctx.name,
+                    session_id,
+                    e
+                );
+                continue;
+            }
+        };
+
+        match session_completion(false, session.as_ref()) {
+            SessionCompletion::Waiting => continue,
+            SessionCompletion::Failed(reason) => {
+                tracing::warn!(
+                    "{}: triage session {} for issue #{} ended abnormally ({}), clearing session",
+                    ctx.name,
+                    session_id,
+                    item.content_number,
+                    reason
+                );
+                github
+                    .update_project_item_session_id(
+                        &ctx.project_id,
+                        &item.id,
+                        &session_field_id,
+                        None,
+                    )
+                    .await?;
+                continue;
+            }
+            SessionCompletion::Succeeded => {}
+        }
+
         tracing::info!(
             "{}: triage session {} for issue #{} has completed, parsing sub-tasks",
             ctx.name,
@@ -1167,7 +1281,7 @@ pub async fn run_triage_completion_check(
         );
 
         let messages = oc_client
-            .get_session_messages(&session_id, Some(oc.directory.as_str()))
+            .get_session_messages_v2(&session_id)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
@@ -1302,10 +1416,20 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::Mutex;
-    use wiremock::matchers::{body_string_contains, method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ─── Test helpers ────────────────────────────────────────
+
+    /// Matches when the request body does NOT contain the given substring.
+    struct BodyNotContains(&'static str);
+
+    impl wiremock::Match for BodyNotContains {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            let body = String::from_utf8_lossy(&request.body);
+            !body.contains(self.0)
+        }
+    }
 
     /// Build a [`ProjectContext`] for testing.
     fn make_context() -> ProjectContext {
@@ -1467,51 +1591,42 @@ mod tests {
             .await;
     }
 
-    /// Mount OpenCode mocks for session creation + prompt_async.
+    /// Mount OpenCode mocks for the v2 session flow (location → worktree → session → prompt).
     async fn mount_opencode_mocks(server: &MockServer) {
-        // Workspace creation
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location lookup (directory → project id)
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/test-work",
+                "project": {"id": "p1", "directory": "/test-work", "canonical": "/test-work"}
             })))
             .mount(server)
             .await;
 
         // Worktree creation
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-1",
                 "directory": "/wt/dir1"
             })))
             .mount(server)
             .await;
 
+        // Session creation
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": {"created": 1, "updated": 2}
+                "data": {"id": "sess123"}
             })))
             .mount(server)
             .await;
 
+        // Prompt
         Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path("/api/session/sess123/prompt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .mount(server)
             .await;
     }
@@ -2090,7 +2205,7 @@ mod tests {
 
         // OpenCode should never be called — use expect(0) on the session endpoint
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "should-not-happen",
                 "projectID": "p",
@@ -2139,7 +2254,7 @@ mod tests {
 
         // OpenCode should never be called
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "x", "projectID": "p", "directory": "/d", "title": "t",
                 "version": "1", "time": {"created": 1, "updated": 2}
@@ -2303,29 +2418,20 @@ mod tests {
         mount_todo_github_mocks(&mock, project_items, issues, field_values).await;
         mount_branch_mocks(&mock, false, "main", "abc123").await;
 
-        // Workspace + worktree creation
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location + worktree creation
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/test-work",
+                "project": {"id": "p1", "directory": "/test-work", "canonical": "/test-work"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("workspace", "wrk1"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-42",
                 "directory": "/wt/dir1"
             })))
             .expect(1)
@@ -2334,24 +2440,21 @@ mod tests {
 
         // Specific session mock: expects title "Dev work for issue #42"
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .and(body_string_contains("\"title\":\"Dev work for issue #42\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": {"created": 1, "updated": 2}
+                "data": {"id": "sess123"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
-        // Prompt async mock
+        // Prompt mock
         Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path("/api/session/sess123/prompt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .mount(&oc_mock)
             .await;
 
@@ -2477,47 +2580,47 @@ mod tests {
         // Only item-10 should get a session; item-11 is filtered
         mount_branch_mocks(&mock, false, "main", "abc123").await;
 
-        // Workspace + worktree for item-10 only
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location + worktree for item-10 only
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1", "type": "git", "name": "w1", "branch": null,
-                "directory": null, "extra": null, "projectID": "p1", "timeUsed": 0
+                "directory": "/test-work",
+                "project": {"id": "p1", "directory": "/test-work", "canonical": "/test-work"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("workspace", "wrk1"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1", "branch": "issue-10", "directory": "/wt/dir1"
+                "directory": "/wt/dir1"
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .and(body_string_contains("\"title\":\"Wave 1 sub\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess10", "projectID": "p1", "directory": "/d",
-                "title": "t", "version": "1", "time": {"created": 1, "updated": 2}
+                "data": {"id": "sess10"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session/sess10/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path("/api/session/sess10/prompt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .mount(&oc_mock)
             .await;
 
         // Session for item-11 should NOT be called
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .and(body_string_contains("\"title\":\"Wave 2 sub\""))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
@@ -2650,40 +2753,40 @@ mod tests {
 
         mount_branch_mocks(&mock, false, "main", "abc123").await;
 
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1", "type": "git", "name": "w1", "branch": null,
-                "directory": null, "extra": null, "projectID": "p1", "timeUsed": 0
+                "directory": "/test-work",
+                "project": {"id": "p1", "directory": "/test-work", "canonical": "/test-work"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("workspace", "wrk1"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1", "branch": "issue-21", "directory": "/wt/dir1"
+                "directory": "/wt/dir1"
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .and(body_string_contains("\"title\":\"Wave 2 todo\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess21", "projectID": "p1", "directory": "/d",
-                "title": "t", "version": "1", "time": {"created": 1, "updated": 2}
+                "data": {"id": "sess21"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session/sess21/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path("/api/session/sess21/prompt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .mount(&oc_mock)
             .await;
 
@@ -2841,7 +2944,7 @@ mod tests {
 
         // OpenCode should never be called
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "x", "projectID": "p", "directory": "/d", "title": "t",
                 "version": "1", "time": {"created": 1, "updated": 2}
@@ -2886,29 +2989,20 @@ mod tests {
         mount_review_github_mocks(&mock, project_items, issues, field_values, status_options).await;
         mount_review_branch_mocks(&mock).await;
 
-        // Workspace + worktree creation
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location + worktree creation
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/test-work",
+                "project": {"id": "p1", "directory": "/test-work", "canonical": "/test-work"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("workspace", "wrk1"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-42",
                 "directory": "/wt/dir1"
             })))
             .expect(1)
@@ -2917,22 +3011,24 @@ mod tests {
 
         // Specific session mock: expects title "Review Technical: Fix login"
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .and(body_string_contains(
                 "\"title\":\"Review Technical: Fix login\"",
             ))
+            .and(body_string_contains("\"agent\":\"git-automate-reviewer\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123", "projectID": "p1", "directory": "/d", "title": "t",
-                "version": "1", "time": {"created": 1, "updated": 2}
+                "data": {"id": "sess123"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .and(body_string_contains("\"system\""))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path("/api/session/sess123/prompt"))
+            .and(body_string_contains("\"text\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .expect(1)
             .mount(&oc_mock)
             .await;
@@ -2974,29 +3070,20 @@ mod tests {
         mount_review_github_mocks(&mock, project_items, issues, field_values, status_options).await;
         mount_review_branch_mocks(&mock).await;
 
-        // Workspace + worktree creation
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location + worktree creation
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/test-work",
+                "project": {"id": "p1", "directory": "/test-work", "canonical": "/test-work"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("workspace", "wrk1"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-7",
                 "directory": "/wt/dir1"
             })))
             .expect(1)
@@ -3005,22 +3092,24 @@ mod tests {
 
         // Session mock for QA state
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
+            .and(body_string_contains("\"agent\":\"git-automate-qa\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123", "projectID": "p1", "directory": "/d", "title": "t",
-                "version": "1", "time": {"created": 1, "updated": 2}
+                "data": {"id": "sess123"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
-        // Verify prompt_async body: system field present (agent template) and
-        // contains filled BRANCH_NAME ("issue-7") — proves fill_prompt was called.
+        // Verify prompt body: text field present and contains filled
+        // BRANCH_NAME ("issue-7") — proves fill_prompt was called.
         Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .and(body_string_contains("\"system\""))
+            .and(path("/api/session/sess123/prompt"))
+            .and(body_string_contains("\"text\""))
             .and(body_string_contains("issue-7"))
-            .respond_with(ResponseTemplate::new(204))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .expect(1)
             .mount(&oc_mock)
             .await;
@@ -3063,29 +3152,20 @@ mod tests {
         mount_review_github_mocks(&mock, project_items, issues, field_values, status_options).await;
         mount_review_branch_mocks(&mock).await;
 
-        // Workspace + worktree creation
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location + worktree creation
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/test-work",
+                "project": {"id": "p1", "directory": "/test-work", "canonical": "/test-work"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("workspace", "wrk1"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-99",
                 "directory": "/wt/dir1"
             })))
             .expect(1)
@@ -3094,22 +3174,24 @@ mod tests {
 
         // Specific session mock: expects title "Review Product: Update landing page"
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .and(body_string_contains(
                 "\"title\":\"Review Product: Update landing page\"",
             ))
+            .and(body_string_contains("\"agent\":\"git-automate-product\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123", "projectID": "p1", "directory": "/d", "title": "t",
-                "version": "1", "time": {"created": 1, "updated": 2}
+                "data": {"id": "sess123"}
             })))
             .expect(1)
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .and(body_string_contains("\"system\""))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path("/api/session/sess123/prompt"))
+            .and(body_string_contains("\"text\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .expect(1)
             .mount(&oc_mock)
             .await;
@@ -3149,7 +3231,7 @@ mod tests {
 
         // OpenCode should never be called
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "x", "projectID": "p", "directory": "/d", "title": "t",
                 "version": "1", "time": {"created": 1, "updated": 2}
@@ -3216,34 +3298,26 @@ mod tests {
     async fn start_opencode_session_maps_open_code_error() {
         let mock = MockServer::start().await;
 
-        // Workspace + worktree succeed; the 500 comes from /session
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location + worktree succeed; the 500 comes from /api/session
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/dir",
+                "project": {"id": "p1", "directory": "/dir", "canonical": "/dir"}
             })))
             .mount(&mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-1",
                 "directory": "/wt/dir1"
             })))
             .mount(&mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&mock)
             .await;
@@ -3260,7 +3334,7 @@ mod tests {
             &oc,
             "/dir",
             "title",
-            "system",
+            crate::workflow::AgentName::Triage,
             "message",
             &HashMap::new(),
             &Arc::new(Mutex::new(HashMap::new())),
@@ -3303,44 +3377,30 @@ mod tests {
                 .await;
         }
 
-        // Workspace + worktree should NOT be created — limit is 2 and there are 4 active
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location + worktree + session should NOT be created — limit is 2 and there are 4 active
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/dir",
+                "project": {"id": "p1", "directory": "/dir", "canonical": "/dir"}
             })))
             .expect(0)
             .mount(&mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-1",
                 "directory": "/wt/dir1"
             })))
             .expect(0)
             .mount(&mock)
             .await;
 
-        // POST /session should NOT be called — limit is 2 and there are 4 active
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "should-not-happen",
-                "projectID": "p",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": {"created": 1, "updated": 2}
+                "data": {"id": "should-not-happen"}
             })))
             .expect(0)
             .mount(&mock)
@@ -3361,7 +3421,7 @@ mod tests {
             &oc,
             "/dir",
             "title",
-            "system",
+            crate::workflow::AgentName::Triage,
             "message",
             &concurrency,
             &Arc::new(Mutex::new(HashMap::new())),
@@ -3403,56 +3463,42 @@ mod tests {
                 .await;
         }
 
-        // Workspace + worktree creation succeed
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        // Location + worktree creation succeed
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/dir",
+                "project": {"id": "p1", "directory": "/dir", "canonical": "/dir"}
             })))
             .expect(1)
             .mount(&mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("workspace", "wrk1"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-1",
                 "directory": "/wt/dir1"
             })))
             .expect(1)
             .mount(&mock)
             .await;
 
-        // POST /session should be called exactly once and return "sess123"
+        // POST /api/session should be called exactly once and return "sess123"
         Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(query_param("workspace", "wrk1"))
-            .and(query_param("directory", "/wt/dir1"))
+            .and(path("/api/session"))
+            .and(body_string_contains("\"directory\":\"/wt/dir1\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": {"created": 1, "updated": 2}
+                "data": {"id": "sess123"}
             })))
             .expect(1)
             .mount(&mock)
             .await;
 
-        // POST /session/sess123/prompt_async — 204
         Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path("/api/session/sess123/prompt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .expect(1)
             .mount(&mock)
             .await;
@@ -3472,7 +3518,7 @@ mod tests {
             &oc,
             "/dir",
             "title",
-            "system",
+            crate::workflow::AgentName::Triage,
             "message",
             &concurrency,
             &Arc::new(Mutex::new(HashMap::new())),
@@ -3483,63 +3529,66 @@ mod tests {
         assert_eq!(result.unwrap(), "sess123");
     }
 
-    // T19: start_opencode_session full flow — workspace → worktree → session in worktree dir
+    // T22: full v2 flow — location → worktree → session(named agent) → prompt
     #[tokio::test]
-    async fn start_opencode_session_full_flow_creates_workspace_and_worktree() {
+    async fn start_opencode_session_full_flow_uses_v2_endpoints() {
         let mock = MockServer::start().await;
 
-        // Workspace creation
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
-            .and(query_param("directory", "/dir"))
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
+            .and(query_param("location[directory]", "/dir"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/dir",
+                "project": {"id": "p1", "directory": "/dir", "canonical": "/dir"}
             })))
             .expect(1)
             .mount(&mock)
             .await;
 
-        // Worktree creation — must reference the workspace
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .and(query_param("workspace", "wrk1"))
+            .and(path("/api/worktree"))
+            .and(body_string_contains("\"projectID\":\"p1\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-1",
                 "directory": "/wt/dir1"
             })))
             .expect(1)
             .mount(&mock)
             .await;
 
-        // POST /session — created in the worktree directory with the workspace param
+        // Named agent + worktree location, and no `system` prompt field in v2.
         Mock::given(method("POST"))
-            .and(path("/session"))
-            .and(query_param("workspace", "wrk1"))
-            .and(query_param("directory", "/wt/dir1"))
+            .and(path("/api/session"))
+            .and(body_string_contains("\"agent\":\"git-automate-triage\""))
+            .and(body_string_contains("\"directory\":\"/wt/dir1\""))
+            .and(BodyNotContains("\"system\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123",
-                "projectID": "p1",
-                "directory": "/wt/dir1",
-                "title": "t",
-                "version": "1",
-                "time": {"created": 1, "updated": 2}
+                "data": {"id": "ses123"}
             })))
             .expect(1)
             .mount(&mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path("/api/session/ses123/prompt"))
+            .and(body_string_contains("\"text\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "prompt1"}
+            })))
             .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/workspace"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/experimental/worktree"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
             .mount(&mock)
             .await;
 
@@ -3555,33 +3604,32 @@ mod tests {
             &oc,
             "/dir",
             "title",
-            "system",
+            crate::workflow::AgentName::Triage,
             "message",
             &HashMap::new(),
             &Arc::new(Mutex::new(HashMap::new())),
             "test",
         )
         .await;
-        assert_eq!(result.unwrap(), "sess123");
+        assert_eq!(result.unwrap(), "ses123");
+        mock.verify().await;
     }
 
-    // T20: workspace creation fails → no worktree, no session
+    // T20: location lookup fails → no worktree, no session
     #[tokio::test]
-    async fn start_opencode_session_workspace_failure_stops_flow() {
+    async fn start_opencode_session_location_failure_stops_flow() {
         let mock = MockServer::start().await;
 
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-1",
                 "directory": "/wt/dir1"
             })))
             .expect(0)
@@ -3589,14 +3637,9 @@ mod tests {
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "should-not-happen",
-                "projectID": "p",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": {"created": 1, "updated": 2}
+                "data": {"id": "should-not-happen"}
             })))
             .expect(0)
             .mount(&mock)
@@ -3614,7 +3657,7 @@ mod tests {
             &oc,
             "/dir",
             "title",
-            "system",
+            crate::workflow::AgentName::Triage,
             "message",
             &HashMap::new(),
             &Arc::new(Mutex::new(HashMap::new())),
@@ -3630,38 +3673,27 @@ mod tests {
     async fn start_opencode_session_worktree_failure_stops_flow() {
         let mock = MockServer::start().await;
 
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
+        Mock::given(method("GET"))
+            .and(path("/api/location"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
+                "directory": "/dir",
+                "project": {"id": "p1", "directory": "/dir", "canonical": "/dir"}
             })))
             .expect(1)
             .mount(&mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
+            .and(path("/api/worktree"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&mock)
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "should-not-happen",
-                "projectID": "p",
-                "directory": "/d",
-                "title": "t",
-                "version": "1",
-                "time": {"created": 1, "updated": 2}
+                "data": {"id": "should-not-happen"}
             })))
             .expect(0)
             .mount(&mock)
@@ -3679,7 +3711,7 @@ mod tests {
             &oc,
             "/dir",
             "title",
-            "system",
+            crate::workflow::AgentName::Triage,
             "message",
             &HashMap::new(),
             &Arc::new(Mutex::new(HashMap::new())),
@@ -3723,18 +3755,20 @@ mod tests {
 
         mount_review_github_mocks(&mock, project_items, issues, field_values, status_options).await;
 
-        // GET /session/status → session still active
+        // GET /api/session/active → session still running
         Mock::given(method("GET"))
-            .and(path("/session/status"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "existing-session": {"type": "busy"}
+                "data": {
+                    "existing-session": {"type": "running"}
+                }
             })))
             .mount(&oc_mock)
             .await;
 
         // OpenCode should never be called
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "x", "projectID": "p", "directory": "/d", "title": "t",
                 "version": "1", "time": {"created": 1, "updated": 2}
@@ -3773,7 +3807,7 @@ mod tests {
 
         // OpenCode should never be called — regex fails before any session
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "x", "projectID": "p", "directory": "/d", "title": "t",
                 "version": "1", "time": {"created": 1, "updated": 2}
@@ -3850,7 +3884,7 @@ mod tests {
 
         // OpenCode should never be called
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "x", "projectID": "p", "directory": "/d", "title": "t",
                 "version": "1", "time": {"created": 1, "updated": 2}
@@ -3936,7 +3970,7 @@ mod tests {
 
         // OpenCode should never be called
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "x", "projectID": "p", "directory": "/d", "title": "t",
                 "version": "1", "time": {"created": 1, "updated": 2}
@@ -4024,7 +4058,7 @@ mod tests {
 
         // OpenCode should never be called
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "x", "projectID": "p", "directory": "/d", "title": "t",
                 "version": "1", "time": {"created": 1, "updated": 2}
@@ -4097,56 +4131,24 @@ mod tests {
     }
 
     async fn mount_failed_review_opencode_mocks(server: &MockServer) {
-        // GET /session/status → empty map (no active sessions → review session completed)
+        // GET /api/session/active → empty (the review session has left the active set)
         Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
             .mount(server)
             .await;
 
-        // POST /session → developer session created
-        Mock::given(method("POST"))
-            .and(path("/session"))
+        // GET /api/session/review-session-N → terminal state (succeeded)
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/session/review-session-\d+$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "sess123", "projectID": "p1", "directory": "/d", "title": "t",
-                "version": "1", "time": {"created": 1, "updated": 2}
+                "data": {"id": "review-session", "outcome": "succeeded"}
             })))
             .mount(server)
             .await;
 
-        // POST /session/sess123/prompt_async → 204
-        Mock::given(method("POST"))
-            .and(path("/session/sess123/prompt_async"))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(server)
-            .await;
-
-        // Workspace creation
-        Mock::given(method("POST"))
-            .and(path("/experimental/workspace"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "wrk1",
-                "type": "git",
-                "name": "w1",
-                "branch": null,
-                "directory": null,
-                "extra": null,
-                "projectID": "p1",
-                "timeUsed": 0
-            })))
-            .mount(server)
-            .await;
-
-        // Worktree creation
-        Mock::given(method("POST"))
-            .and(path("/experimental/worktree"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "wt1",
-                "branch": "issue-1",
-                "directory": "/wt/dir1"
-            })))
-            .mount(server)
-            .await;
+        // v2 session flow for the recovery developer session
+        mount_opencode_mocks(server).await;
     }
 
     // T14: Failed Technical review → transitions to Todo, starts dev session, → In Development
@@ -4279,22 +4281,22 @@ mod tests {
         )
         .await;
 
-        // GET /session/status → returns the session as active
+        // GET /api/session/active → returns the session as running
         Mock::given(method("GET"))
-            .and(path("/session/status"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "review-session-1": {"type": "busy"}
+                "data": {
+                    "review-session-1": {"type": "running"}
+                }
             })))
             .mount(&oc_mock)
             .await;
 
-        // POST /session should NOT be called (session is still active)
+        // POST /api/session should NOT be called (session is still active)
         Mock::given(method("POST"))
-            .and(path("/session"))
+            .and(path("/api/session"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "should-not-happen",
-                "projectID": "p", "directory": "/d", "title": "t",
-                "version": "1", "time": {"created": 1, "updated": 2}
+                "data": {"id": "should-not-happen"}
             })))
             .expect(0)
             .mount(&oc_mock)
@@ -4426,23 +4428,29 @@ mod tests {
         mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/session/dev-session-1/message"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {
-                    "info": {"role": "user", "sessionID": "dev-session-1"},
-                    "parts": [{"type": "text", "text": "Here is my work"}]
-                },
-                {
-                    "info": {"role": "assistant", "sessionID": "dev-session-1"},
-                    "parts": [{"type": "text", "text": "### Resolve threads\nTH_123, TH_456"}]
-                }
-            ])))
+            .and(path("/api/session/dev-session-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "dev-session-1", "outcome": "succeeded"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/dev-session-1/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"type": "user", "id": "m0", "text": "Here is my work"},
+                    {"type": "assistant", "id": "m1", "content": [{"type": "text", "text": "### Resolve threads"}]},
+                    {"type": "assistant", "id": "m2", "content": [{"type": "text", "text": "TH_123, TH_456"}]}
+                ],
+                "cursor": null
+            })))
             .mount(&oc_mock)
             .await;
 
@@ -4483,19 +4491,27 @@ mod tests {
         mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/session/dev-session-2/message"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {
-                    "info": {"role": "assistant", "sessionID": "dev-session-2"},
-                    "parts": [{"type": "text", "text": "Done with the fix"}]
-                }
-            ])))
+            .and(path("/api/session/dev-session-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "dev-session-2", "outcome": "succeeded"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/dev-session-2/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"type": "assistant", "id": "m1", "content": [{"type": "text", "text": "Done with the fix"}]}
+                ],
+                "cursor": null
+            })))
             .mount(&oc_mock)
             .await;
 
@@ -4535,16 +4551,21 @@ mod tests {
         mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "dev-session-1": {"type": "busy"}
+                "data": {
+                    "dev-session-1": {"type": "running"}
+                }
             })))
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/session/dev-session-1/message"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .and(path("/api/session/dev-session-1/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "cursor": null
+            })))
             .expect(0)
             .mount(&oc_mock)
             .await;
@@ -4591,13 +4612,258 @@ mod tests {
         mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
             .mount(&oc_mock)
             .await;
 
         let result = run_dev_completion_check(&deps, &ctx, &oc).await;
         assert!(result.is_ok());
+        oc_mock.verify().await;
+    }
+
+    // T30: Active-session poll error → skip the whole check, no GitHub mutations
+    #[tokio::test]
+    async fn dev_completion_poll_error_skips_check_without_github_mutations() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix bug", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = in_dev_field_values("dev-session-err");
+
+        mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
+
+        // GET /api/session/active → 500: the check must skip this cycle entirely.
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        // No GitHub mutation may fire while the active-session set is unknown.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-id" } }
+                }
+            })))
+            .with_priority(1)
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("resolveReviewThread"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "resolveReviewThread": { "thread": { "id": "x" } } }
+            })))
+            .with_priority(1)
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let result = run_dev_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        mock.verify().await;
+        oc_mock.verify().await;
+    }
+
+    // T31: outcome=failed → reset to Todo + clear sessionId, never parse messages
+    #[tokio::test]
+    async fn dev_completion_outcome_failed_resets_without_parsing() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix bug", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = in_dev_field_values("dev-session-fail");
+
+        mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/dev-session-fail"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "dev-session-fail", "outcome": "failed"}
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        // Messages must NOT be fetched for a failed session.
+        Mock::given(method("GET"))
+            .and(path("/api/session/dev-session-fail/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "cursor": null
+            })))
+            .expect(0)
+            .mount(&oc_mock)
+            .await;
+
+        // Status must be reset to Todo …
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .and(body_string_contains("todo-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-42" } }
+                }
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // … and the sessionId must be cleared …
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .and(body_string_contains("session-field-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-42" } }
+                }
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // … but never transitioned to Review Technical.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .and(body_string_contains("review-tech-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-42" } }
+                }
+            })))
+            .with_priority(1)
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let result = run_dev_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        mock.verify().await;
+        oc_mock.verify().await;
+    }
+
+    // T32: no outcome but time.idle present → treat as succeeded and parse output
+    #[tokio::test]
+    async fn dev_completion_idle_only_parses_output() {
+        let mock = MockServer::start().await;
+        let oc_mock = MockServer::start().await;
+        let client = gh_client(&mock);
+        let deps = make_deps(Some(client));
+        let ctx = make_context();
+        let oc = make_oc_config(oc_mock.uri());
+
+        let issues = json!([
+            {"node_id": "issue-node-42", "number": 42, "title": "Fix bug", "body": "body", "state": "open", "pull_request": null},
+        ]);
+        let project_items = json!({
+            "nodes": [
+                {"id": "item-42", "content": {"__typename": "Issue", "id": "issue-node-42", "number": 42}}
+            ]
+        });
+        let field_values = in_dev_field_values("dev-session-idle");
+
+        mount_dev_completion_github_mocks(&mock, project_items, issues, field_values).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
+            .mount(&oc_mock)
+            .await;
+
+        // No `outcome`, only `time.idle` — must be treated as a finished session.
+        Mock::given(method("GET"))
+            .and(path("/api/session/dev-session-idle"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "dev-session-idle", "time": {"created": 1, "updated": 2, "idle": 1790442360282i64}}
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/dev-session-idle/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"type": "user", "id": "m0", "text": "Do the work"},
+                    {"type": "assistant", "id": "m1", "content": [{"type": "text", "text": "### Resolve threads"}]},
+                    {"type": "assistant", "id": "m2", "content": [{"type": "text", "text": "TH_999"}]}
+                ],
+                "cursor": null
+            })))
+            .expect(1)
+            .mount(&oc_mock)
+            .await;
+
+        // The parsed thread must be resolved via the GitHub API.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("resolveReviewThread"))
+            .and(body_string_contains("TH_999"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "resolveReviewThread": { "thread": { "id": "TH_999" } } }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // … and the item transitions to Review Technical (existing success path).
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("updateProjectV2ItemFieldValue"))
+            .and(body_string_contains("review-tech-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "item-42" } }
+                }
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let result = run_dev_completion_check(&deps, &ctx, &oc).await;
+        assert!(result.is_ok());
+        mock.verify().await;
         oc_mock.verify().await;
     }
 
@@ -4740,24 +5006,30 @@ mod tests {
         mount_triage_completion_github_mocks(&mock, project_items, field_values).await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/session/triage-session-1/message"))
-            .and(query_param("directory", "/test-work"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {
-                    "info": {"role": "user", "sessionID": "triage-session-1"},
-                    "parts": [{"type": "text", "text": "Triage prompt"}]
-                },
-                {
-                    "info": {"role": "assistant", "sessionID": "triage-session-1"},
-                    "parts": [{"type": "text", "text": "## Sub-tasks\n1. Implement auth: Add OAuth login\n2. Add tests: Write unit tests"}]
-                }
-            ])))
+            .and(path("/api/session/triage-session-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "triage-session-1", "outcome": "succeeded"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/triage-session-1/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"type": "user", "id": "m0", "text": "Triage prompt"},
+                    {"type": "assistant", "id": "m1", "content": [{"type": "text", "text": "## Sub-tasks"}]},
+                    {"type": "assistant", "id": "m2", "content": [{"type": "text", "text": "1. Implement auth: Add OAuth login"}]},
+                    {"type": "assistant", "id": "m3", "content": [{"type": "text", "text": "2. Add tests: Write unit tests"}]}
+                ],
+                "cursor": null
+            })))
             .mount(&oc_mock)
             .await;
 
@@ -4786,19 +5058,27 @@ mod tests {
         mount_triage_completion_github_mocks(&mock, project_items, field_values).await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/session/triage-session-2/message"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {
-                    "info": {"role": "assistant", "sessionID": "triage-session-2"},
-                    "parts": [{"type": "text", "text": "The issue is simple, no sub-tasks needed."}]
-                }
-            ])))
+            .and(path("/api/session/triage-session-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"id": "triage-session-2", "outcome": "succeeded"}
+            })))
+            .mount(&oc_mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/triage-session-2/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"type": "assistant", "id": "m1", "content": [{"type": "text", "text": "The issue is simple, no sub-tasks needed."}]}
+                ],
+                "cursor": null
+            })))
             .mount(&oc_mock)
             .await;
 
@@ -4835,16 +5115,21 @@ mod tests {
         mount_triage_completion_github_mocks(&mock, project_items, field_values).await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "triage-session-active": {"type": "busy"}
+                "data": {
+                    "triage-session-active": {"type": "running"}
+                }
             })))
             .mount(&oc_mock)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/session/triage-session-active/message"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .and(path("/api/session/triage-session-active/message"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [],
+                "cursor": null
+            })))
             .expect(0)
             .mount(&oc_mock)
             .await;
@@ -4890,8 +5175,8 @@ mod tests {
         mount_triage_completion_github_mocks(&mock, project_items, field_values).await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
             .mount(&oc_mock)
             .await;
 
