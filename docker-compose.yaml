@@ -2,31 +2,39 @@ services:
   init:
     env_file:
       - .env
-    image: smanx/opencode:1.18.23
+    image: alpine/git:latest
     volumes:
       - data:/workspace
     entrypoint: []
     command: sh -c "cd /workspace; [ -d "git-automate-e2e" ] || git clone https://github.com/krampenschiesser/git-automate-e2e"
   opencode:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.opencode
+    image: git-automate-opencode:local
     depends_on:
       init:
         condition: service_completed_successfully
     env_file: .env
-    image: smanx/opencode:1.18.23
     ports:
       - "10082:4096"
     environment:
-      -OPENCODE_LOG_LEVEL: DEBUG
-      -OPENCODE_PRINT_LOGS: true
+      - OPENCODE_LOG_LEVEL=DEBUG
+      - OPENCODE_PRINT_LOGS=true
+      - OPENCODE_SERVER_PASSWORD=${OPENCODE_PW}
+      - OPENCODE_DISABLE_AUTOUPDATE=1
     volumes:
       - "./docker/opencode-cfg.json:/root/.config/opencode/opencode.json"
       - data:/workspace
       - opencode-logs:/root/.local/share/opencode/logs
   opencode-logs:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.opencode
+    image: git-automate-opencode:local
     depends_on:
       opencode:
         condition: service_started
-    image: smanx/opencode:1.18.23
     volumes:
       - opencode-logs:/root/.local/share/opencode/logs
       - data:/workspace
