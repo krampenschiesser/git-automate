@@ -78,7 +78,7 @@ git-automate doctor --config git-automate.yml   # install missing agents
 - **`projectId` is optional.** If it is numeric (a project *number*, not a relay ID) it is **resolved to a GitHub global ID at runtime** via `projectV2(number:)` — the original numeric value is **kept** in `git-automate.yml` (not replaced). Non-numeric values are treated as already-valid global IDs (no network call).
 - **`${env:VAR}`** interpolation runs on every string field (recursing into maps/sequences). Unset vars become empty strings.
 - **`.env`** is loaded via `dotenv()` at startup; vars already in the environment take precedence over the file.
-- `opencode.concurrency` (per-model map) caps active OpenCode sessions per model — when the limit for any model is reached, session creation is skipped with a warning. Model info is discovered via the OpenCode API (`GET /api/session` + `GET /session/status`).
+- `opencode.concurrency` (per-model map) caps active OpenCode sessions per model — when the limit for any model is reached, session creation is skipped with a warning. Model info is discovered via the OpenCode API (`GET /api/session/active` for running session ids, then a per-id `GET /api/session/{id}` for the model).
 
 ## Required environment
 
@@ -102,7 +102,7 @@ git-automate doctor --config git-automate.yml      # one-shot setup; copies miss
 
 ## Test conventions
 
-- **Mocking**: `wiremock` for both GitHub GraphQL (`/graphql`) and OpenCode (`/global/health`, `/agent`, `/session`, …). `tempfile` for on-disk config.
+- **Mocking**: `wiremock` for both GitHub GraphQL (`/graphql`) and OpenCode (`/api/info`, `/api/agent`, `/api/session`, `/api/location`, `/api/worktree`, …). `tempfile` for on-disk config.
 - **`SET_CWD_MUTEX`** (`lib.rs::test_utils`): any test that calls `write_project_id` or `load_config` mutates `cwd` — it **must** acquire this lock and restore the original directory afterward. This is the most common cause of test flakiness.
 - **Mock disambiguation**: GitHub mocks use `body_string_contains` on unique substrings (`user(login:`, `createProjectV2(input`, `field(name:`, `fields(first:`, `updateProjectV2Field`, `createProjectV2Field`) — follow the same pattern for new GraphQL tests.
 - **Shared fixtures**: integration tests live in `tests/` with helpers in `tests/common/mod.rs` (`mount_github_graphql_mocks`, `mount_opencode_mocks`, `make_deps`, `gh_client`, …).

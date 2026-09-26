@@ -1,40 +1,51 @@
 # OpenCode HTTP Client — AGENTS.md
 
 ## OVERVIEW
-Concrete implementation of the `ExternalAgent` trait. Manages OpenCode server sessions via HTTP — health checks, agent listing, session creation, and session status.
+Concrete implementation of the `ExternalAgent` trait against the **OpenCode v2** server API (all routes under `/api/*`). Manages v2 sessions over HTTP — server info/health, location/project resolution, worktree creation, session creation/prompting, and session status/completion.
 
 ## STRUCTURE
 ```
 src/external_agent/opencode/
-├── mod.rs      (15)  Module decls + re-exports
-├── client.rs   (~700)  HTTP client + ExternalAgent impl + workspace/worktree
-├── agent.rs    (1079) Agent definitions + prompt handling
-├── api-spec.json OpenApi specification of opencode
-└── types.rs    (~90)  Serde response types + Workspace/Worktree
+├── mod.rs        Module decls + re-exports
+├── client.rs     HTTP client (`OpenCodeClient`) + v2 endpoint methods
+├── agent.rs      `impl ExternalAgent for OpenCodeClient` (v2)
+├── types.rs      Serde v2 response types
+└── api-spec.json Published OpenCode v2 OpenAPI spec ("opencode HttpApi", 113 paths) — reference only, NOT compiled
 ```
 
 ## WHERE TO LOOK
 | Task | Location | Notes |
 |---|---|---|
-| Add API endpoint call | `client.rs` | HTTP via `reqwest`, JSON serde |
-| Add new agent | `agent.rs` | Agent listing + prompt templates |
-| Modify auth | `client.rs` `encode_basic_auth` | base64(user:pw) |
-| Create workspace/worktree | `client.rs` `create_workspace` / `create_worktree` | POST /experimental/workspace · /experimental/worktree |
-| Session lifecycle | `client.rs` `create_session` / `get_session` | POST /session → GET /session/{id} |
-| Health check | `client.rs` `check_health` | GET /global/health |
-| Agent list | `agent.rs` `list_agents` | GET /agent |
+| Server info / health | `client.rs` `server_info` / `check_health` | `GET /api/info` (bare `ServerInfo`; v2 has no `/api/health`) |
+| Resolve project id | `client.rs` `get_location` | `GET /api/location?location[directory]=<dir>` (deepObject) |
+| Create worktree | `client.rs` `create_worktree` | `POST /api/worktree {projectID}` → `{directory}` |
+| Create session | `client.rs` `create_session` | `POST /api/session {title,agent,model?,location:{directory}}` → `{data: Session}` |
+| Send prompt | `client.rs` `send_prompt` | `POST /api/session/{id}/prompt {text}` → 200 admission receipt |
+| Active sessions | `client.rs` `get_active_sessions` | `GET /api/session/active` → running-only map |
+| Get session / status | `client.rs` `get_session_v2` | `GET /api/session/{id}`; 404 → `None` |
+| Messages | `client.rs` `get_session_messages` | `GET /api/session/{id}/message` → `{data,cursor}` |
+| Agents | `client.rs` `get_agents` | `GET /api/agent?location[directory]=<dir>` → `{location,data}` |
+| Auth | `client.rs` `encode_basic_auth` | base64(user:pw), username `opencode` |
 
 ## CONVENTIONS
-- **Provider-agnostic trait**: `ExternalAgent` defined in `common/mod.rs`; `OpenCodeClient` implements it here. The trait abstracts `create_session`, `get_session`, `list_agents`, `check_health`
-- **Basic auth**: `encode_basic_auth(user, pw)` → `base64` → `Basic <encoded>` header. Uses `base64` crate (not `http` crate)
-- **`agent.rs`** handles agent definitions and prompt mapping (`AgentName` → file/template), separate from HTTP transport in `client.rs`
-- **`types.rs`**: serde structs mirror OpenCode JSON responses (`Agent`, `AgentInfo`, `HealthResponse`, `Session`, `SessionTime`, `Workspace`, `Worktree`, `ModelRef`, `SessionV2Info`, `SessionsResponse`, `Cursor`)
-- **Re-exports** (`mod.rs`): `pub use client::{OpenCodeClient, OpenCodeError, encode_basic_auth}` and `pub use types::{Agent, AgentInfo, Cursor, HealthResponse, ModelRef, Session, SessionMessage, SessionMessageInfo, SessionTime, SessionV2Info, SessionsResponse, Workspace, Worktree}`
-- **Workspace param**: `POST /session` accepts an optional `workspace` query param; `start_session_http`/`start_session_with_system` take `workspace: Option<&str>` (None when the caller doesn't need a workspace, e.g. the `ExternalAgent` trait path)
+- **Provider-agnostic trait**: `ExternalAgent` (in `common/mod.rs`) declares `start_session`, `session_status`, `get_session`. `OpenCodeClient` (here) is the concrete impl.
+- **Basic auth unchanged in v2**: `Basic base64("opencode:<pw>")` on every request.
+- **Envelope rule**: session/agent endpoints wrap payloads in `{ "data": ... }`; `GET /api/info`, `GET /api/location`, and `POST /api/worktree` return BARE objects.
+- **Naming**: `get_session_v2` is deliberately NOT named `get_session` — an inherent method with that name would shadow (and change resolution for) the `ExternalAgent::get_session` trait method.
+- **Named agents**: sessions are created with `agent:"git-automate-<role>"`; the agent must be present in OpenCode (see below). v2 has **no per-session system prompt**.
+- **types.rs**: permissive serde structs — unknown/optional fields are ignored or `Option`, never `deny_unknown_fields`.
+
+## AGENT PRESENCE (operational requirement)
+The daemon sends agent ids `git-automate-{triage,taskmanager,developer,reviewer,product,qa}`. OpenCode v2 derives an agent id from the **filename minus `.md`**, so the definitions must be installed as `<id>.md`:
+- project: `<repo>/.opencode/agents/git-automate-triage.md` (commit it so worktrees inherit it), or
+- global: `~/.config/opencode/agents/git-automate-triage.md`, or
+- the v2 `agents` map in `opencode.json`.
+
+Bodies live at `src/assets/agents/git-automate-<role>.agent.md` (that `.agent.md` name is legacy/editor convention only — installing it verbatim yields the wrong id `git-automate-triage.agent`). A session whose agent is missing is still created (HTTP 200) but ends with `outcome:"failed"`. NOTE: `doctor`/`ensure_agents_installed` currently writes `.agent.md` files into `~/.config/git-automate/agents/`, which v2 does not discover — installing into a v2 discovery path is a follow-up.
 
 ## ANTI-PATTERNS (THIS DIRECTORY)
-- **Agent definitions loaded separately**: `agent.rs` manages agent prompts/templates via `include_str!` from `src/assets/agents/` — editing these requires rebuild
-- **No retry logic**: Unlike `GitHubClient::execute_with_retry`, OpenCode HTTP calls do not retry — add retry in `start_session_http` if needed
-- **Auth is per-client**: `OpenCodeClient` holds the base64-encoded auth header; no token refresh mechanism (OpenCode sessions are ephemeral)
-- **`agent.rs` is 1079 lines but only 66 lines of types**: Most of the file is agent prompt/handler logic, not HTTP transport — see `src/workflow/agents/` AGENTS.md for prompt details
-- **Workspace/worktree creation**: `create_workspace` and `create_worktree` must be called before session creation in `start_opencode_session` (checks.rs); errors map to `WorkflowError::Other`
+- **No v1 routes**: `/global/health`, `/session`, `/session/status`, `/session/{id}/prompt_async`, `/experimental/workspace`, `/experimental/worktree` no longer exist in v2.
+- **No per-session system prompt**: `system` is not a field of v2 session create or prompt; it lives in the agent definition.
+- **`api-spec.json` is reference-only** — not `include_str!`'d; no rebuild needed when it changes. It is the published v2 spec.
+- **No retry logic**: OpenCode HTTP calls do not retry (unlike `GitHubClient::execute_with_retry`).
+- **Completion caveat**: `GET /api/session/active` is running-only — a finished *or idle* session is absent; use `outcome`/`time.idle` from `GET /api/session/{id}` to decide terminal state (see `session_completion` in `workflow/helpers.rs`).

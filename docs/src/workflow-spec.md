@@ -176,9 +176,9 @@ triage, todo, and review steps.
 
 ### What the Check Does
 
-The `check_opencode` function probes the OpenCode server's
-health endpoint. This is the **only** endpoint consulted
-during this step.
+The `check_opencode` function probes the OpenCode server's v2 health
+endpoint (`GET /api/info`; OpenCode v2 removed `/global/health`). This is
+the **only** endpoint consulted during this step.
 
 - If the server responds with a healthy status, the check logs an
   informational message and returns `Ok(Workflow::Continue)`.
@@ -224,8 +224,10 @@ project board.
 
 5. **Start a triage session if needed.** If the project item does not
    yet have a `sessionId` value, the daemon starts a triage OpenCode
-   session. This session creation is code-driven: the daemon loads the
-   triage agent handlebars template as the system prompt and the triage prompt
+   session. This session creation is code-driven: the daemon creates the
+   session with the named OpenCode agent `git-automate-triage` (its system
+   instructions live in the OpenCode agent definition — OpenCode v2 has no
+   per-session system prompt) and the triage prompt
    template as the user message, filling in the following handlebars template
    variables:
    - `ISSUE_TITLE`
@@ -270,8 +272,9 @@ session, and it starts one.
    It then generates a list of comments, their files and the line numbers to pass down to the developer session.
 
 5. **Start a developer session.** The daemon starts a developer OpenCode
-   session (code-driven) using the developer agent template as the
-   system prompt and the developer prompt template as the user message.
+   session (code-driven) with the named OpenCode agent
+   `git-automate-developer` (system instructions come from the agent
+   definition) and the developer prompt template as the user message.
    Template variables filled in are:
    - `ISSUE_TITLE`
    - `ISSUE_NUMBER`
@@ -375,9 +378,12 @@ Each review state uses a specific agent and prompt template:
 | Review Product   | Product  | `product`       |
 | QA               | QA       | `qa`            |
 
-The agent template is loaded as the system prompt and the prompt
-template is filled with variables and used as the user message. Both
-loads are code-driven; no LLM agent decides which template to use.
+Each review state creates the session with its named OpenCode agent
+(`git-automate-reviewer`, `git-automate-product`, `git-automate-qa`); the prompt
+template is filled with variables and used as the user message. Both the
+agent choice and the prompt load are code-driven; no LLM agent decides which
+template to use. OpenCode v2 has no per-session system prompt — the agent's
+instructions come from its OpenCode definition.
 
 ### Agent Decision Outcomes
 
@@ -419,7 +425,7 @@ Then code-driven api calls resolve the comments so that they disappear from futu
 ### Session Creation
 
 For each matching item, the daemon creates an OpenCode session
-(code-driven) with the loaded system prompt and filled user prompt.
+(code-driven) with the named agent for the state and the filled user prompt.
 The session title is formatted as:
 
 ```
@@ -448,7 +454,9 @@ phase.
 #### What Failed Review Recovery Detects
 
 The recovery check identifies review sessions that have completed
-(i.e. they no longer appear in OpenCode's active session list) but
+(i.e. they no longer appear in OpenCode's v2 active-session list
+`/api/session/active`, and report a terminal `outcome`/`time.idle` on
+`/api/session/{id}`) but
 whose project item status has **not** transitioned. This indicates
 that the review agent finished without producing the expected status
 change, leaving the item stranded.
@@ -460,9 +468,9 @@ recovery check performs the following steps in order:
 
 1. **Clear the `sessionId` field.** The existing session ID is removed
    via `updateProjectItemSessionId` with a `None` value.
-2. **Start a new developer session.** The daemon loads the developer
-   agent template as the system prompt and the developer prompt
-   template as the user message, filling in the standard developer
+2. **Start a new developer session.** The daemon creates a session with
+   the named OpenCode agent `git-automate-developer` and the developer
+   prompt template as the user message, filling in the standard developer
    variables (`ISSUE_TITLE`, `ISSUE_NUMBER`, `ISSUE_BODY`,
    `BRANCH_NAME`, `PROJECT_REPOSITORY`). This session creation is
    code-driven.
