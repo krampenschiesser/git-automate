@@ -4,8 +4,9 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::external_agent::opencode::types::{
-    Agent, AgentInfo, Cursor, HealthResponse, Session, SessionMessage, SessionsResponse, Workspace,
-    Worktree,
+    ActiveSessionEntry, Agent, AgentInfo, Cursor, Data, HealthResponse, LocationInfo, ModelRef,
+    PromptReceipt, ServerInfo, Session, SessionMessage, SessionMessageV2, SessionMessagesResponse,
+    SessionV2Info, SessionsResponse, Workspace, Worktree, WorktreeInfo,
 };
 
 const OPENCODE_USERNAME: &str = "opencode";
@@ -29,6 +30,16 @@ pub enum OpenCodeError {
     CreateWorkspace(String),
     #[error("Failed to create worktree: {0}")]
     CreateWorktree(String),
+    #[error("Failed to fetch location: {0}")]
+    FetchLocation(String),
+    #[error("Failed to fetch active sessions: HTTP status {0}")]
+    FetchActiveSessions(u16),
+    #[error("Failed to get session: {0}")]
+    GetSession(String),
+    #[error("Failed to send prompt: {0}")]
+    SendPrompt(String),
+    #[error("Prompt rejected, session busy: {0}")]
+    PromptConflict(String),
 }
 
 impl From<reqwest::Error> for OpenCodeError {
@@ -354,6 +365,226 @@ impl OpenCodeClient {
         }
         let worktree: Worktree = response.json().await?;
         Ok(worktree)
+    }
+
+    /// `GET /api/info` — v2 server information (bare response, no envelope).
+    pub async fn server_info(&self) -> Result<ServerInfo, OpenCodeError> {
+        let response = self
+            .client
+            .get(format!("{}/api/info", self.base_url))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
+        }
+        let info: ServerInfo = response.json().await?;
+        Ok(info)
+    }
+
+    /// `GET /api/location` — v2 working directory + project for *directory*.
+    ///
+    /// The directory is passed as a deepObject query parameter
+    /// (`location[directory]=<dir>`). Bare response, no envelope.
+    pub async fn get_location(&self, directory: &str) -> Result<LocationInfo, OpenCodeError> {
+        let response = self
+            .client
+            .get(format!("{}/api/location", self.base_url))
+            .query(&[("location[directory]", directory)])
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
+        }
+        let info: LocationInfo = response.json().await?;
+        Ok(info)
+    }
+
+    /// `POST /api/worktree` — create a v2 git worktree for *project_id*.
+    ///
+    /// Body is `{"projectID": <id>}` plus an optional `"branch"` key.
+    /// Bare `{"directory": ...}` response, no envelope.
+    pub async fn create_worktree_v2(
+        &self,
+        project_id: &str,
+        branch: Option<&str>,
+    ) -> Result<WorktreeInfo, OpenCodeError> {
+        let mut body = json!({ "projectID": project_id });
+        if let Some(b) = branch {
+            body["branch"] = json!(b);
+        }
+        let response = self
+            .client
+            .post(format!("{}/api/worktree", self.base_url))
+            .header("Authorization", &self.auth_header)
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(OpenCodeError::CreateWorktree(format!("{status}: {body}")));
+        }
+        let worktree: WorktreeInfo = response.json().await?;
+        Ok(worktree)
+    }
+
+    /// `POST /api/session` — create a v2 session.
+    ///
+    /// Flat body `{"title", "agent", "location": {"directory"}}` with an
+    /// optional nested `"model"` object; no query parameters. The response is
+    /// enveloped in `{"data": ...}`.
+    pub async fn create_session(
+        &self,
+        title: &str,
+        agent: &str,
+        model: Option<&ModelRef>,
+        directory: &str,
+    ) -> Result<SessionV2Info, OpenCodeError> {
+        let mut body = json!({
+            "title": title,
+            "agent": agent,
+            "location": { "directory": directory }
+        });
+        if let Some(m) = model {
+            let mut model_json = json!({
+                "id": m.id.as_str(),
+                "providerID": m.provider_id.as_str()
+            });
+            if let Some(variant) = m.variant.as_deref() {
+                model_json["variant"] = json!(variant);
+            }
+            body["model"] = model_json;
+        }
+        let response = self
+            .client
+            .post(format!("{}/api/session", self.base_url))
+            .header("Authorization", &self.auth_header)
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(OpenCodeError::CreateSession(format!("{status}: {body}")));
+        }
+        let session: Data<SessionV2Info> = response.json().await?;
+        if session.data.id.is_empty() {
+            return Err(OpenCodeError::NoSessionData);
+        }
+        Ok(session.data)
+    }
+
+    /// `POST /api/session/{id}/prompt` — send a prompt to a v2 session.
+    ///
+    /// Body is exactly `{"text": <text>}`. The response is enveloped in
+    /// `{"data": ...}`. 404 maps to [`OpenCodeError::HttpStatus`], 409 to
+    /// [`OpenCodeError::PromptConflict`].
+    pub async fn send_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<PromptReceipt, OpenCodeError> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/session/{}/prompt",
+                self.base_url, session_id
+            ))
+            .header("Authorization", &self.auth_header)
+            .json(&json!({ "text": text }))
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Err(OpenCodeError::HttpStatus(404));
+        }
+        if status == 409 {
+            let body = response.text().await.unwrap_or_default();
+            return Err(OpenCodeError::PromptConflict(body));
+        }
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(OpenCodeError::SendPrompt(format!("{status}: {body}")));
+        }
+        let receipt: Data<PromptReceipt> = response.json().await?;
+        Ok(receipt.data)
+    }
+
+    /// `GET /api/session/active` — map of active session IDs to their status
+    /// entries, unwrapped from the `{"data": ...}` envelope.
+    pub async fn get_active_sessions(
+        &self,
+    ) -> Result<std::collections::HashMap<String, ActiveSessionEntry>, OpenCodeError> {
+        let response = self
+            .client
+            .get(format!("{}/api/session/active", self.base_url))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(OpenCodeError::FetchActiveSessions(
+                response.status().as_u16(),
+            ));
+        }
+        let active: Data<std::collections::HashMap<String, ActiveSessionEntry>> =
+            response.json().await?;
+        Ok(active.data)
+    }
+
+    /// `GET /api/session/{id}` — fetch a v2 session, unwrapped from the
+    /// `{"data": ...}` envelope. 404 maps to `Ok(None)`.
+    ///
+    /// Named `get_session_v2` (not `get_session`) because an inherent
+    /// `get_session` would shadow the `ExternalAgent::get_session` trait
+    /// method on `OpenCodeClient` at every method-call site.
+    pub async fn get_session_v2(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionV2Info>, OpenCodeError> {
+        let response = self
+            .client
+            .get(format!("{}/api/session/{}", self.base_url, session_id))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(OpenCodeError::GetSession(format!("{status}: {body}")));
+        }
+        let session: Data<SessionV2Info> = response.json().await?;
+        Ok(Some(session.data))
+    }
+
+    /// `GET /api/session/{id}/message` — list v2 session messages, unwrapped
+    /// from the `{"data": [...], "cursor": ...}` envelope (cursor ignored).
+    pub async fn get_session_messages_v2(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionMessageV2>, OpenCodeError> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/api/session/{}/message",
+                self.base_url, session_id
+            ))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(OpenCodeError::FetchSessionMessages(format!(
+                "{status}: {body}"
+            )));
+        }
+        let messages: SessionMessagesResponse = response.json().await?;
+        Ok(messages.data)
     }
 }
 
@@ -1438,5 +1669,308 @@ mod tests {
         let counts = client.get_session_models().await.unwrap();
         assert_eq!(counts.get("myprovider/fast"), Some(&2));
         assert_eq!(counts.get("myprovider/slow"), Some(&1));
+    }
+
+    // ─── v2 API methods (tests 37-47) ───────────────────────────────
+
+    /// Matches only when the request body is *exactly* the expected JSON.
+    ///
+    /// wiremock's built-in `body_json` matcher is a subset match, so it
+    /// cannot prove the *absence* of extra keys (e.g. `parts`, `system`,
+    /// `agent` on the v2 prompt body).
+    struct ExactJsonBody(serde_json::Value);
+
+    impl wiremock::Match for ExactJsonBody {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            request
+                .body_json::<serde_json::Value>()
+                .is_ok_and(|actual| actual == self.0)
+        }
+    }
+
+    /// Matches only when the request URL carries no query parameters at all.
+    struct NoQueryParams;
+
+    impl wiremock::Match for NoQueryParams {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            request.url.query().is_none_or(|q| q.is_empty())
+        }
+    }
+
+    // T37: GET /api/info returns a bare ServerInfo with auth header.
+    #[tokio::test]
+    async fn server_info_hits_api_info() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/info"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": "2.0.0",
+                "pid": 1234,
+                "urls": ["http://localhost:8081"],
+                "paths": { "tmp": "/tmp/opencode" }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let info = client.server_info().await.unwrap();
+        assert_eq!(info.version, "2.0.0");
+        assert_eq!(info.pid, 1234);
+        assert_eq!(info.urls, vec!["http://localhost:8081".to_string()]);
+        assert_eq!(info.paths.tmp, "/tmp/opencode");
+
+        server.verify().await;
+    }
+
+    // T38: GET /api/location uses the deepObject query `location[directory]`.
+    #[tokio::test]
+    async fn get_location_uses_deepobject_query() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/location"))
+            .and(query_param("location[directory]", "/wt"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "directory": "/wt",
+                "project": { "id": "p1", "directory": "/wt", "canonical": "/wt" }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let info = client.get_location("/wt").await.unwrap();
+        assert_eq!(info.directory, "/wt");
+        assert_eq!(info.project.id, "p1");
+        assert_eq!(info.project.canonical, "/wt");
+
+        server.verify().await;
+    }
+
+    // T39: POST /api/session sends a flat body with NO query params and
+    // unwraps the {"data": ...} envelope.
+    #[tokio::test]
+    async fn create_session_posts_flat_body_and_unwraps_data() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/session"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(ExactJsonBody(json!({
+                "title": "t",
+                "agent": "git-automate-triage",
+                "location": { "directory": "/wt/dir1" }
+            })))
+            .and(NoQueryParams)
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_1" }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let info = client
+            .create_session("t", "git-automate-triage", None, "/wt/dir1")
+            .await
+            .unwrap();
+        assert_eq!(info.id, "ses_1");
+
+        server.verify().await;
+    }
+
+    // T40: POST /api/session serialises the model as a nested object.
+    #[tokio::test]
+    async fn create_session_with_model_includes_model_object() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/session"))
+            .and(ExactJsonBody(json!({
+                "title": "t",
+                "agent": "git-automate-triage",
+                "location": { "directory": "/wt/dir1" },
+                "model": { "id": "fast", "providerID": "myprovider", "variant": "v1" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "ses_2",
+                    "model": { "id": "fast", "providerID": "myprovider", "variant": "v1" }
+                }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let model = ModelRef {
+            id: "fast".into(),
+            provider_id: "myprovider".into(),
+            variant: Some("v1".into()),
+        };
+        let client = client(&server);
+        let info = client
+            .create_session("t", "git-automate-triage", Some(&model), "/wt/dir1")
+            .await
+            .unwrap();
+        assert_eq!(info.id, "ses_2");
+        let returned = info.model.unwrap();
+        assert_eq!(returned.id, "fast");
+        assert_eq!(returned.provider_id, "myprovider");
+        assert_eq!(returned.variant.as_deref(), Some("v1"));
+
+        server.verify().await;
+    }
+
+    // T41: POST /api/session/{id}/prompt sends ONLY {"text": ...} (no
+    // `parts`/`system`/`agent` keys) and unwraps the receipt envelope.
+    #[tokio::test]
+    async fn send_prompt_posts_flat_text_and_returns_receipt() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/session/ses_1/prompt"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(ExactJsonBody(json!({ "text": "hello" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "msg_1" }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let receipt = client.send_prompt("ses_1", "hello").await.unwrap();
+        assert_eq!(receipt.id, "msg_1");
+
+        server.verify().await;
+    }
+
+    // T42: POST /api/session/{id}/prompt 409 maps to PromptConflict.
+    #[tokio::test]
+    async fn send_prompt_409_is_prompt_conflict() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/session/ses_1/prompt"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("session is busy"))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.send_prompt("ses_1", "hello").await;
+        match result {
+            Err(OpenCodeError::PromptConflict(body)) => {
+                assert!(body.contains("session is busy"), "got: {body}");
+            }
+            other => panic!("expected PromptConflict, got {other:?}"),
+        }
+
+        server.verify().await;
+    }
+
+    // T43: GET /api/session/active unwraps the data envelope into a map.
+    #[tokio::test]
+    async fn get_active_sessions_unwraps_data() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "ses_1": { "type": "running" }
+                }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let active = client.get_active_sessions().await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active["ses_1"].kind, "running");
+
+        server.verify().await;
+    }
+
+    // T44: GET /api/session/{id} 404 returns Ok(None).
+    #[tokio::test]
+    async fn get_session_404_returns_none() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/session/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.get_session_v2("missing").await.unwrap();
+        assert!(result.is_none());
+
+        server.verify().await;
+    }
+
+    // T45: GET /api/session/{id} unwraps the data envelope.
+    #[tokio::test]
+    async fn get_session_unwraps_data() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/session/ses_1"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "id": "ses_1",
+                    "title": "T",
+                    "projectID": "p1",
+                    "location": { "directory": "/wt" }
+                }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let info = client.get_session_v2("ses_1").await.unwrap().unwrap();
+        assert_eq!(info.id, "ses_1");
+        assert_eq!(info.title.as_deref(), Some("T"));
+        assert_eq!(info.project_id.as_deref(), Some("p1"));
+
+        server.verify().await;
+    }
+
+    // T46: GET /api/session/{id}/message unwraps the data envelope.
+    #[tokio::test]
+    async fn get_session_messages_v2_unwraps_data() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/session/ses_1/message"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "id": "m1", "type": "user", "text": "hi" }
+                ]
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let messages = client.get_session_messages_v2("ses_1").await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].is_user());
+        assert_eq!(messages[0].text(), "hi");
+
+        server.verify().await;
+    }
+
+    // T47: POST /api/worktree posts the project id and returns a bare
+    // {"directory": ...} response.
+    #[tokio::test]
+    async fn create_worktree_v2_posts_project_id() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/worktree"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(body_json(json!({ "projectID": "p1" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "directory": "/wt/x"
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let wt = client.create_worktree_v2("p1", None).await.unwrap();
+        assert_eq!(wt.directory, "/wt/x");
+
+        server.verify().await;
     }
 }
