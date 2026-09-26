@@ -3276,33 +3276,32 @@ mod tests {
     async fn start_opencode_session_skips_when_at_limit() {
         let mock = MockServer::start().await;
 
-        // GET /api/session returns 4 sessions with myprovider/fast model
+        // GET /api/session/active returns 4 active sessions
         Mock::given(method("GET"))
-            .and(path("/api/session"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [
-                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
-                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
-                    { "id": "sess3", "model": { "id": "fast", "providerID": "myprovider" } },
-                    { "id": "sess4", "model": { "id": "fast", "providerID": "myprovider" } },
-                ],
-                "cursor": null
-            })))
-            .mount(&mock)
-            .await;
-
-        // GET /session/status returns 4 active sessions
-        Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "sess1": {"status": "idle"},
-                "sess2": {"status": "busy"},
-                "sess3": {"status": "idle"},
-                "sess4": {"status": "idle"},
+                "data": {
+                    "sess1": { "type": "running" },
+                    "sess2": { "type": "running" },
+                    "sess3": { "type": "running" },
+                    "sess4": { "type": "running" },
+                }
             })))
             .expect(1)
             .mount(&mock)
             .await;
+
+        // Each active session carries the myprovider/fast model
+        for id in ["sess1", "sess2", "sess3", "sess4"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/session/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "id": id, "model": { "id": "fast", "providerID": "myprovider" } }
+                })))
+                .expect(1)
+                .mount(&mock)
+                .await;
+        }
 
         // Workspace + worktree should NOT be created — limit is 2 and there are 4 active
         Mock::given(method("POST"))
@@ -3379,29 +3378,30 @@ mod tests {
     async fn start_opencode_session_proceeds_below_limit() {
         let mock = MockServer::start().await;
 
-        // GET /api/session returns 2 sessions with myprovider/fast model
+        // GET /api/session/active returns 2 active sessions
         Mock::given(method("GET"))
-            .and(path("/api/session"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [
-                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
-                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
-                ],
-                "cursor": null
-            })))
-            .mount(&mock)
-            .await;
-
-        // GET /session/status returns 2 active sessions
-        Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "sess1": {"status": "idle"},
-                "sess2": {"status": "busy"},
+                "data": {
+                    "sess1": { "type": "running" },
+                    "sess2": { "type": "running" },
+                }
             })))
             .expect(1)
             .mount(&mock)
             .await;
+
+        // Each active session carries the myprovider/fast model
+        for id in ["sess1", "sess2"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/session/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "id": id, "model": { "id": "fast", "providerID": "myprovider" } }
+                })))
+                .expect(1)
+                .mount(&mock)
+                .await;
+        }
 
         // Workspace + worktree creation succeed
         Mock::given(method("POST"))

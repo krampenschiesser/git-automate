@@ -4,10 +4,22 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::external_agent::opencode::types::{
-    ActiveSessionEntry, Agent, AgentInfo, Cursor, Data, HealthResponse, LocationInfo, ModelRef,
-    PromptReceipt, ServerInfo, Session, SessionMessage, SessionMessageV2, SessionMessagesResponse,
-    SessionV2Info, SessionsResponse, Workspace, Worktree, WorktreeInfo,
+    ActiveSessionEntry, AgentV2, Data, LocationInfo, ModelRef, PromptReceipt, ServerInfo, Session,
+    SessionMessage, SessionMessageV2, SessionMessagesResponse, SessionV2Info, Workspace, Worktree,
+    WorktreeInfo,
 };
+
+/// Response wrapper for `GET /api/agent` — `{ "location": ..., "data": [...] }`.
+///
+/// `location` echoes the queried working directory and is not needed by
+/// callers, but it is part of the wire shape so it is modelled here.
+#[derive(serde::Deserialize)]
+struct AgentListResponse {
+    #[serde(default)]
+    #[allow(dead_code)]
+    location: Option<serde_json::Value>,
+    data: Vec<AgentV2>,
+}
 
 const OPENCODE_USERNAME: &str = "opencode";
 
@@ -90,11 +102,11 @@ impl OpenCodeClient {
         client
     }
 
-    /// `GET /global/health` — returns `true` only when the server reports
-    /// `healthy: true`.
+    /// `GET /api/info` — v2 health probe. Returns `true` only when the
+    /// server answers with a 2xx status *and* a body that deserializes into
+    /// [`ServerInfo`]. (v2 has no `/global/health` and no `healthy` flag.)
     ///
-    /// On *any* failure (network error, non-2xx status, malformed JSON, or a
-    /// missing `healthy` field)
+    /// On *any* failure (network error, non-2xx status, or malformed JSON)
     /// the method returns `false` rather than propagating the error.
     pub async fn check_health(&self) -> bool {
         self.check_health_inner().await.unwrap_or_default()
@@ -103,38 +115,36 @@ impl OpenCodeClient {
     async fn check_health_inner(&self) -> Result<bool, OpenCodeError> {
         let response = self
             .client
-            .get(format!("{}/global/health", self.base_url))
+            .get(format!("{}/api/info", self.base_url))
             .header("Authorization", &self.auth_header)
             .send()
             .await?;
         if !response.status().is_success() {
             return Ok(false);
         }
-        let health: HealthResponse = response.json().await?;
-        Ok(health.healthy)
+        let _info: ServerInfo = response.json().await?;
+        Ok(true)
     }
 
-    /// `GET /agent` — list available agents.
+    /// `GET /api/agent` — list available v2 agents.
     ///
-    /// When `directory` is `Some`, it is appended as a `?directory=<dir>` query
-    /// parameter, matching the SDK's `client.app.agents({ directory })`.
-    pub async fn get_agents(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<AgentInfo>, OpenCodeError> {
+    /// When `directory` is `Some`, it is sent as the deepObject query
+    /// parameter `location[directory]=<dir>`. The response wraps the agent
+    /// list in `{ "location": ..., "data": [...] }`; only `data` is returned.
+    pub async fn get_agents(&self, directory: Option<&str>) -> Result<Vec<AgentV2>, OpenCodeError> {
         let mut request = self
             .client
-            .get(format!("{}/agent", self.base_url))
+            .get(format!("{}/api/agent", self.base_url))
             .header("Authorization", &self.auth_header);
         if let Some(dir) = directory {
-            request = request.query(&[("directory", dir)]);
+            request = request.query(&[("location[directory]", dir)]);
         }
         let response = request.send().await?;
         if !response.status().is_success() {
             return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
         }
-        let agents: Vec<Agent> = response.json().await?;
-        Ok(agents.into_iter().map(AgentInfo::from).collect())
+        let agents: AgentListResponse = response.json().await?;
+        Ok(agents.data)
     }
 
     /// Create a session and immediately send it a prompt.
@@ -235,50 +245,24 @@ impl OpenCodeClient {
         Ok(statuses)
     }
 
-    /// GET /api/session + GET /session/status — return per-model active session counts.
+    /// `GET /api/session/active` + `GET /api/session/{id}` — per-model counts
+    /// of *active* v2 sessions.
+    ///
+    /// For every active session id the v2 session is fetched; entries that
+    /// return 404 (finished between the two calls) or carry no `model` are
+    /// skipped. Genuine errors propagate.
     pub async fn get_session_models(
         &self,
     ) -> Result<std::collections::HashMap<String, usize>, OpenCodeError> {
-        // 1. Fetch all sessions via GET /api/session (handle pagination via cursor)
-        let mut all_sessions: Vec<crate::external_agent::opencode::types::SessionV2Info> =
-            Vec::new();
-        let mut cursor: Option<Cursor> = None;
-        loop {
-            let mut request = self
-                .client
-                .get(format!("{}/api/session", self.base_url))
-                .header("Authorization", &self.auth_header);
-            if let Some(ref c) = cursor
-                && let Some(ref next) = c.next
-            {
-                request = request.query(&[("cursor", next)]);
-            }
-            let response = request.send().await?;
-            if !response.status().is_success() {
-                return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
-            }
-            let resp: SessionsResponse = response.json().await?;
-            all_sessions.extend(resp.data);
-            match resp.cursor {
-                Some(c) if c.next.is_some() => cursor = Some(c),
-                _ => break,
-            }
-        }
-
-        // 2. Fetch active statuses
-        let active = self.get_session_statuses().await?;
-
-        // 3. Filter sessions: only those whose id is in active statuses map
-        // 4. For each active session with a model, increment count for model.as_key()
+        let active = self.get_active_sessions().await?;
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for session in &all_sessions {
-            if let Some(ref model) = session.model
-                && active.contains_key(&session.id)
+        for id in active.keys() {
+            if let Some(session) = self.get_session_v2(id).await?
+                && let Some(ref model) = session.model
             {
                 *counts.entry(model.as_key()).or_insert(0) += 1;
             }
         }
-
         Ok(counts)
     }
 
@@ -664,9 +648,7 @@ pub fn encode_basic_auth(username: &str, password: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{
-        body_json, header, method, path, query_param, query_param_is_missing,
-    };
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Build a client pointed at a mock server with a known password.
@@ -691,15 +673,51 @@ mod tests {
 
     // --- check_health (tests 2-6) ---------------------------------------
 
+    /// TDD gate: v2 health check must hit `GET /api/info` and never the v1
+    /// `GET /global/health` endpoint.
     #[tokio::test]
-    async fn test_check_health_healthy() {
-        let mock = Mock::given(method("GET"))
+    async fn check_health_uses_api_info_not_global_health() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": "2.0.18",
+                "pid": 47234,
+                "urls": ["http://127.0.0.1:4096"],
+                "paths": { "tmp": "/tmp/opencode" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
             .and(path("/global/health"))
-            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({ "healthy": true, "version": "1.0.0" })),
             )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        assert!(client.check_health().await);
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_check_health_healthy() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/info"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": "2.0.18",
+                "pid": 47234,
+                "urls": ["http://127.0.0.1:4096"],
+                "paths": { "tmp": "/tmp/opencode" }
+            })))
             .expect(1)
             .named("health");
         let server = MockServer::start().await;
@@ -710,13 +728,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_health_unhealthy() {
+    async fn test_check_health_incomplete_server_info_returns_false() {
+        // v2 has no `healthy` flag; a 2xx body that does not deserialize into
+        // `ServerInfo` (here: missing pid/urls/paths) must yield `false`.
         let mock = Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "healthy": false, "version": "1.0.0" })),
-            )
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "2.0.18" })))
             .expect(1);
         let server = MockServer::start().await;
         mock.mount(&server).await;
@@ -728,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_health_500_returns_false() {
         let mock = Mock::given(method("GET"))
-            .and(path("/global/health"))
+            .and(path("/api/info"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1);
         let server = MockServer::start().await;
@@ -741,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_health_malformed_json_returns_false() {
         let mock = Mock::given(method("GET"))
-            .and(path("/global/health"))
+            .and(path("/api/info"))
             .respond_with(ResponseTemplate::new(200).set_body_raw("not json", "text/plain"))
             .expect(1);
         let server = MockServer::start().await;
@@ -752,10 +769,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_health_missing_healthy_field_returns_false() {
+    async fn test_check_health_missing_paths_field_returns_false() {
         let mock = Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "1.0.0" })))
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": "2.0.18",
+                "pid": 47234,
+                "urls": ["http://127.0.0.1:4096"]
+            })))
             .expect(1);
         let server = MockServer::start().await;
         mock.mount(&server).await;
@@ -777,11 +798,14 @@ mod tests {
     #[tokio::test]
     async fn test_get_agents_no_description() {
         let mock = Mock::given(method("GET"))
-            .and(path("/agent"))
+            .and(path("/api/agent"))
             .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                { "name": "agent1", "mode": "subagent", "native": true }
-            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "location": {},
+                "data": [
+                    { "id": "agent1", "name": "agent1", "mode": "subagent", "hidden": false }
+                ]
+            })))
             .expect(1);
         let server = MockServer::start().await;
         mock.mount(&server).await;
@@ -796,15 +820,19 @@ mod tests {
     #[tokio::test]
     async fn test_get_agents_with_description() {
         let mock = Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {
-                    "name": "a",
-                    "mode": "primary",
-                    "native": false,
-                    "description": "test"
-                }
-            ])))
+            .and(path("/api/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "location": {},
+                "data": [
+                    {
+                        "id": "a",
+                        "name": "a",
+                        "mode": "primary",
+                        "hidden": false,
+                        "description": "test"
+                    }
+                ]
+            })))
             .expect(1);
         let server = MockServer::start().await;
         mock.mount(&server).await;
@@ -817,11 +845,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_agents_unwraps_location_data_envelope() {
+        // The v2 response wraps agents in { "location": ..., "data": [...] };
+        // a populated `location` object must not break parsing.
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "location": {
+                    "directory": "/d",
+                    "project": { "id": "p1", "directory": "/d", "canonical": "/d" }
+                },
+                "data": [
+                    { "id": "build", "name": "build", "mode": "primary", "hidden": false }
+                ]
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let agents = client.get_agents(None).await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "build");
+    }
+
+    #[tokio::test]
     async fn test_get_agents_with_directory_query_param() {
         let mock = Mock::given(method("GET"))
-            .and(path("/agent"))
-            .and(query_param("directory", "/path"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .and(path("/api/agent"))
+            .and(query_param("location[directory]", "/path"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "location": {}, "data": [] })),
+            )
             .expect(1);
         let server = MockServer::start().await;
         mock.mount(&server).await;
@@ -833,25 +888,44 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_agents_no_directory_omits_query_param() {
-        // If a `directory` param is present the request must NOT match this mock
-        // (wiremock returns 404 for unmatched requests, surfacing a real error).
+        // If a `location[directory]` param is present the request must NOT
+        // match this mock (wiremock returns 404 for unmatched requests,
+        // surfacing a real error).
         let mock = Mock::given(method("GET"))
-            .and(path("/agent"))
-            .and(query_param("directory", "/absent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .and(path("/api/agent"))
+            .and(query_param("location[directory]", "/absent"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "location": {}, "data": [] })),
+            )
             .expect(0);
         let server = MockServer::start().await;
         mock.mount(&server).await;
 
         // Mount a fallback that matches the no-query-param request.
         let ok = Mock::given(method("GET"))
-            .and(path("/agent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .and(path("/api/agent"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "location": {}, "data": [] })),
+            )
             .expect(1);
         ok.mount(&server).await;
 
         let client = client(&server);
         client.get_agents(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_agents_500_returns_http_status_error() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/agent"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.get_agents(None).await;
+        assert!(matches!(result, Err(OpenCodeError::HttpStatus(500))));
     }
 
     // --- start_session (tests 11-14) ------------------------------------
@@ -995,19 +1069,23 @@ mod tests {
     async fn test_auth_header_sent_on_all_requests() {
         // health
         let health = Mock::given(method("GET"))
-            .and(path("/global/health"))
+            .and(path("/api/info"))
             .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "healthy": true, "version": "1" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": "2.0.18",
+                "pid": 47234,
+                "urls": ["http://127.0.0.1:4096"],
+                "paths": { "tmp": "/tmp/opencode" }
+            })))
             .expect(1)
             .named("health");
         // agent
         let agent = Mock::given(method("GET"))
-            .and(path("/agent"))
+            .and(path("/api/agent"))
             .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "location": {}, "data": [] })),
+            )
             .expect(1)
             .named("agent");
         // session create
@@ -1535,35 +1613,44 @@ mod tests {
     async fn get_session_models_happy_path() {
         let server = MockServer::start().await;
 
-        // GET /api/session returns 3 sessions with 2 models
+        // GET /api/session/active — ses_1 and ses_2 are running; ses_3 is not.
         Mock::given(method("GET"))
-            .and(path("/api/session"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [
-                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
-                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
-                    { "id": "sess3", "model": { "id": "slow", "providerID": "myprovider" } },
-                ],
-                "cursor": null
+                "data": {
+                    "ses_1": { "type": "running" },
+                    "ses_2": { "type": "running" }
+                }
             })))
+            .expect(1)
             .mount(&server)
             .await;
 
-        // GET /session/status — sess1 and sess2 are active
         Mock::given(method("GET"))
-            .and(path("/session/status"))
+            .and(path("/api/session/ses_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "sess1": { "type": "busy" },
-                "sess2": { "type": "idle" },
+                "data": { "id": "ses_1", "model": { "id": "fast", "providerID": "myprovider" } }
             })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_2", "model": { "id": "fast", "providerID": "myprovider" } }
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
         let client = client(&server);
         let counts = client.get_session_models().await.unwrap();
         assert_eq!(counts.get("myprovider/fast"), Some(&2));
-        // sess3 is not active, so it should not be in the map
-        assert_eq!(counts.get("myprovider/slow"), None);
+        // Only active sessions are fetched, so no other model appears.
+        assert_eq!(counts.len(), 1);
+
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -1571,25 +1658,17 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/session"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [
-                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
-                ],
-                "cursor": null
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/session/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+            .expect(1)
             .mount(&server)
             .await;
 
         let client = client(&server);
         let counts = client.get_session_models().await.unwrap();
         assert!(counts.is_empty());
+
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -1597,78 +1676,102 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/session"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [
-                    { "id": "sess1" },
-                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
-                ],
-                "cursor": null
+                "data": {
+                    "ses_1": { "type": "running" },
+                    "ses_2": { "type": "running" }
+                }
             })))
             .mount(&server)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
+            .and(path("/api/session/ses_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "sess1": { "type": "busy" },
-                "sess2": { "type": "busy" },
+                "data": { "id": "ses_1" }
             })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_2", "model": { "id": "fast", "providerID": "myprovider" } }
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
         let client = client(&server);
         let counts = client.get_session_models().await.unwrap();
-        // sess1 has no model, so it's excluded
+        // ses_1 has no model, so it's excluded
         assert_eq!(counts.len(), 1);
         assert_eq!(counts.get("myprovider/fast"), Some(&1));
+
+        server.verify().await;
     }
 
     #[tokio::test]
-    async fn get_session_models_pagination() {
+    async fn get_session_models_skips_sessions_that_404() {
         let server = MockServer::start().await;
 
-        // First page: no cursor param
         Mock::given(method("GET"))
-            .and(path("/api/session"))
-            .and(query_param_is_missing("cursor"))
+            .and(path("/api/session/active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [
-                    { "id": "sess1", "model": { "id": "fast", "providerID": "myprovider" } },
-                ],
-                "cursor": { "previous": null, "next": "page2" }
+                "data": {
+                    "ses_gone": { "type": "running" },
+                    "ses_2": { "type": "running" }
+                }
             })))
             .mount(&server)
             .await;
 
-        // Second page: cursor=page2
+        // ses_gone finished between the /active listing and the per-id fetch.
         Mock::given(method("GET"))
-            .and(path("/api/session"))
-            .and(query_param("cursor", "page2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [
-                    { "id": "sess2", "model": { "id": "fast", "providerID": "myprovider" } },
-                    { "id": "sess3", "model": { "id": "slow", "providerID": "myprovider" } },
-                ],
-                "cursor": null
-            })))
+            .and(path("/api/session/ses_gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
             .mount(&server)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/session/status"))
+            .and(path("/api/session/ses_2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "sess1": { "type": "busy" },
-                "sess2": { "type": "busy" },
-                "sess3": { "type": "busy" },
+                "data": { "id": "ses_2", "model": { "id": "slow", "providerID": "myprovider" } }
             })))
+            .expect(1)
             .mount(&server)
             .await;
 
         let client = client(&server);
         let counts = client.get_session_models().await.unwrap();
-        assert_eq!(counts.get("myprovider/fast"), Some(&2));
+        assert_eq!(counts.len(), 1);
         assert_eq!(counts.get("myprovider/slow"), Some(&1));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_session_models_propagates_active_sessions_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let result = client.get_session_models().await;
+        assert!(matches!(
+            result,
+            Err(OpenCodeError::FetchActiveSessions(500))
+        ));
+
+        server.verify().await;
     }
 
     // ─── v2 API methods (tests 37-47) ───────────────────────────────

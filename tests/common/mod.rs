@@ -254,12 +254,14 @@ pub async fn mount_github_graphql_mocks(server: &MockServer) {
 /// Mount OpenCode health + agents mocks.
 /// Session/prompt_async are mounted separately when call counts matter.
 pub async fn mount_opencode_mocks(server: &MockServer) {
-    // Health
+    // Health (v2: GET /api/info)
     Mock::given(method("GET"))
-        .and(path("/global/health"))
+        .and(path("/api/info"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "healthy": true,
-            "version": "1.0.0"
+            "version": "2.0.18",
+            "pid": 47234,
+            "urls": ["http://127.0.0.1:4096"],
+            "paths": { "tmp": "/tmp/opencode" }
         })))
         .mount(server)
         .await;

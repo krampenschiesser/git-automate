@@ -1438,10 +1438,12 @@ mod tests {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/global/health"))
+            .and(path("/api/info"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": true,
-                "version": "1.0.0"
+                "version": "2.0.18",
+                "pid": 47234,
+                "urls": ["http://127.0.0.1:4096"],
+                "paths": { "tmp": "/tmp/opencode" }
             })))
             .expect(1)
             .mount(&mock)
@@ -1470,11 +1472,8 @@ mod tests {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": false,
-                "version": "1.0.0"
-            })))
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&mock)
             .await;
@@ -1515,11 +1514,8 @@ mod tests {
 
         // OpenCode health endpoint returns unhealthy
         Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": false,
-                "version": "1.0.0"
-            })))
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&oc_mock)
             .await;

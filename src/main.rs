@@ -420,10 +420,12 @@ mod tests {
     async fn check_health_healthy_server() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/global/health"))
+            .and(path("/api/info"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "healthy": true,
-                "version": "1.0.0"
+                "version": "2.0.18",
+                "pid": 47234,
+                "urls": ["http://127.0.0.1:4096"],
+                "paths": { "tmp": "/tmp/opencode" }
             })))
             .expect(1)
             .mount(&server)
@@ -438,11 +440,8 @@ mod tests {
     async fn check_health_unhealthy_server() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "healthy": false,
-                "version": "1.0.0"
-            })))
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&server)
             .await;
@@ -456,10 +455,12 @@ mod tests {
     async fn check_health_function_healthy_returns_ok() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/global/health"))
+            .and(path("/api/info"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "healthy": true,
-                "version": "1.0.0"
+                "version": "2.0.18",
+                "pid": 47234,
+                "urls": ["http://127.0.0.1:4096"],
+                "paths": { "tmp": "/tmp/opencode" }
             })))
             .expect(1)
             .mount(&server)
@@ -477,11 +478,8 @@ mod tests {
     async fn check_health_function_unhealthy_returns_err() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "healthy": false,
-                "version": "1.0.0"
-            })))
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&server)
             .await;
