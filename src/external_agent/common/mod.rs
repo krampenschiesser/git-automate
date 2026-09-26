@@ -24,14 +24,8 @@ pub enum ExternalAgentError {
     SessionNotFound(String),
     #[error("Failed to start session: {0}")]
     StartSession(String),
-    #[error("Failed to execute shell command: {0}")]
-    ShellCommand(String),
     #[error("Failed to get session status: {0}")]
     SessionStatus(String),
-    #[error("Failed to nudge session: {0}")]
-    Nudge(String),
-    #[error("Failed to list sessions: {0}")]
-    ListSessions(String),
     #[error("Failed to get session: {0}")]
     GetSession(String),
 }
@@ -46,6 +40,11 @@ pub enum AgentSessionStatus {
     /// Session is actively running or awaiting retry.
     Waiting,
     /// Session is idle and available.
+    ///
+    /// Retained for backward compatibility with existing match sites; the
+    /// OpenCode v2 implementation no longer produces this variant (idle
+    /// sessions are reported as [`AgentSessionStatus::Done`]).
+    #[allow(dead_code)]
     Idle,
 }
 
@@ -70,22 +69,18 @@ pub struct SessionInfo {
 /// underlying provider's HTTP API calls. The trait is `Send + Sync` so it can
 /// be held behind an `Arc` in async workflow code.
 pub trait ExternalAgent: Send + Sync {
-    /// Start a session for *project_key* with the given system and user prompts.
+    /// Start a session for *project_key* with the given user prompt.
     ///
     /// *project_key* is typically a working-directory path or project identifier.
     /// Returns the new session's ID.
+    ///
+    /// OpenCode v2 has no per-session system prompt — instructions come from
+    /// the OpenCode agent definition referenced by the implementation's
+    /// configured agent name (see `OpenCodeClient::set_agent`).
     fn start_session(
         &self,
         project_key: &str,
-        system_prompt: &str,
         user_prompt: &str,
-    ) -> impl std::future::Future<Output = Result<String, ExternalAgentError>> + Send;
-
-    /// Execute *command* (e.g. `git commit`, `cargo test`) inside an existing session.
-    fn execute_shell(
-        &self,
-        session_id: &str,
-        command: &str,
     ) -> impl std::future::Future<Output = Result<String, ExternalAgentError>> + Send;
 
     /// Check whether a session is [`AgentSessionStatus::Done`],
@@ -95,20 +90,9 @@ pub trait ExternalAgent: Send + Sync {
         session_id: &str,
     ) -> impl std::future::Future<Output = Result<AgentSessionStatus, ExternalAgentError>> + Send;
 
-    /// Nudge a session to continue processing (e.g. wake a waiting/idle session).
-    fn nudge_session(
-        &self,
-        session_id: &str,
-    ) -> impl std::future::Future<Output = Result<(), ExternalAgentError>> + Send;
-
     /// Retrieve a session by ID. Returns `None` if the session does not exist.
     fn get_session(
         &self,
         session_id: &str,
     ) -> impl std::future::Future<Output = Result<Option<SessionInfo>, ExternalAgentError>> + Send;
-
-    /// List all sessions known to the agent server.
-    fn list_sessions(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<SessionInfo>, ExternalAgentError>> + Send;
 }
