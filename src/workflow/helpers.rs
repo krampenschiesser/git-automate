@@ -185,30 +185,6 @@ pub fn load_prompt_template(name: &str, repo_dir: Option<&Path>) -> Result<Strin
     embedded_prompt(name).map(String::from)
 }
 
-/// Load an agent definition with 3-level priority:
-/// 1. Repo-local: `{repo_dir}/.agents/git-automate/agents/{name}.agent.md`
-/// 2. Config dir: `$HOME/.config/git-automate/agents/{name}.agent.md`
-/// 3. Embedded (compile-time `include_str!`)
-///
-/// Mirrors [`load_prompt_template`] but reads from `src/assets/agents/`.
-///
-/// # Errors
-/// Returns `WorkflowError::TemplateNotFound` for unknown names.
-pub fn load_agent_template(name: &str, repo_dir: Option<&Path>) -> Result<String, WorkflowError> {
-    if let Some(repo) = repo_dir {
-        let path = repo
-            .join(REPO_AGENT_SUBDIR)
-            .join(format!("{name}.agent.md"));
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            return Ok(content);
-        }
-    }
-    if let Ok(content) = read_from_config_dir(CONFIG_AGENT_SUBDIR, name, "agent.md") {
-        return Ok(content);
-    }
-    embedded_agent(name).map(String::from)
-}
-
 /// Read a file from `$HOME/.config/git-automate/{dir}/{name}.{ext}`.
 fn read_from_config_dir(dir: &str, name: &str, ext: &str) -> Result<String, WorkflowError> {
     let home = env::var("HOME").unwrap_or_default();
@@ -827,6 +803,10 @@ mod tests {
     use super::*;
     use std::env;
 
+    /// Serializes tests that mutate $HOME to avoid interference with other tests.
+    static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
     // ── resolve_option_id tests ────────────────────────────────
 
     // Test 1: resolve_option_id with matching name → Some(id)
@@ -862,6 +842,7 @@ mod tests {
     // Test 3: load_prompt_template("triage") → returns content containing {{ISSUE_TITLE}}
     #[test]
     fn load_prompt_template_triage() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let content = load_prompt_template("triage", None).expect("triage template should load");
         assert!(
             content.contains("{{ISSUE_TITLE}}"),
@@ -872,33 +853,8 @@ mod tests {
     // Test 4: load_prompt_template("nonexistent") → Err(TemplateNotFound)
     #[test]
     fn load_prompt_template_nonexistent() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let result = load_prompt_template("nonexistent", None);
-        assert!(matches!(
-            result,
-            Err(WorkflowError::TemplateNotFound(name)) if name == "nonexistent"
-        ));
-    }
-
-    // ── load_agent_template tests ──────────────────────────────
-
-    // Test 5: load_agent_template("triage") → returns content containing YAML frontmatter
-    #[test]
-    fn load_agent_template_triage() {
-        let content = load_agent_template("triage", None).expect("triage agent should load");
-        assert!(
-            content.contains("git-automate-triage"),
-            "triage agent should contain its name"
-        );
-        assert!(
-            content.contains("subagent"),
-            "triage agent should contain mode: subagent"
-        );
-    }
-
-    // Test 6: load_agent_template("nonexistent") → Err(TemplateNotFound)
-    #[test]
-    fn load_agent_template_nonexistent() {
-        let result = load_agent_template("nonexistent", None);
         assert!(matches!(
             result,
             Err(WorkflowError::TemplateNotFound(name)) if name == "nonexistent"
@@ -1111,6 +1067,7 @@ mod tests {
 
     #[test]
     fn load_prompt_template_all_templates() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         for name in &[
             "triage",
             "taskmanager",
@@ -1124,15 +1081,12 @@ mod tests {
         }
     }
 
-    // ── Priority resolution tests for load_prompt_template / load_agent_template ──
-
-    /// Serializes tests that mutate $HOME to avoid interference with other tests.
-    static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    // ── Priority resolution tests for load_prompt_template ─────
 
     // Test: load_prompt_template with repo-local file → returns repo-local content
     #[test]
     fn load_prompt_template_repo_local_priority() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp
             .path()
@@ -1144,22 +1098,6 @@ mod tests {
 
         let result = load_prompt_template("triage", Some(tmp.path())).unwrap();
         assert_eq!(result, "REPO-LOCAL-PROMPT");
-    }
-
-    // Test: load_agent_template with repo-local file → returns repo-local content
-    #[test]
-    fn load_agent_template_repo_local_priority() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp
-            .path()
-            .join(".agents")
-            .join("git-automate")
-            .join("agents");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("triage.agent.md"), "REPO-LOCAL-AGENT").unwrap();
-
-        let result = load_agent_template("triage", Some(tmp.path())).unwrap();
-        assert_eq!(result, "REPO-LOCAL-AGENT");
     }
 
     // Test: load_prompt_template with config dir file (no repo-local) → returns config content
@@ -1182,38 +1120,6 @@ mod tests {
 
         let result = load_prompt_template("triage", None).unwrap();
         assert_eq!(result, "CONFIG-PROMPT");
-
-        if let Some(h) = original_home {
-            unsafe {
-                env::set_var("HOME", h);
-            }
-        } else {
-            unsafe {
-                env::remove_var("HOME");
-            }
-        }
-    }
-
-    // Test: load_agent_template with config dir file (no repo-local) → returns config content
-    #[test]
-    fn load_agent_template_config_dir_fallback() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let original_home = env::var("HOME").ok();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
-
-        let config_dir = tmp
-            .path()
-            .join(".config")
-            .join("git-automate")
-            .join("agents");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(config_dir.join("triage.agent.md"), "CONFIG-AGENT").unwrap();
-
-        let result = load_agent_template("triage", None).unwrap();
-        assert_eq!(result, "CONFIG-AGENT");
 
         if let Some(h) = original_home {
             unsafe {
@@ -1254,36 +1160,10 @@ mod tests {
         }
     }
 
-    // Test: load_agent_template with no files on disk → returns embedded content
-    #[test]
-    fn load_agent_template_embedded_fallback() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let original_home = env::var("HOME").ok();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
-
-        let result = load_agent_template("triage", None).unwrap();
-        assert!(
-            result.contains("git-automate-triage"),
-            "embedded triage agent should contain its name"
-        );
-
-        if let Some(h) = original_home {
-            unsafe {
-                env::set_var("HOME", h);
-            }
-        } else {
-            unsafe {
-                env::remove_var("HOME");
-            }
-        }
-    }
-
     // Test: load_prompt_template nonexistent with repo_dir → errors even if files exist elsewhere
     #[test]
     fn load_prompt_template_nonexistent_with_repo_dir() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let result = load_prompt_template("nonexistent", Some(tmp.path()));
         assert!(matches!(
