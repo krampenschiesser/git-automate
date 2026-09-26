@@ -10,8 +10,8 @@
 //!    - The issue appears in the project board
 //!    - The issue's Status field is "Triage"
 //!    - The issue has a non-empty `sessionId` field
-//!    - An OpenCode session exists (`GET /session/status` reports active sessions)
-//!    - The session's initial prompt contains the issue body (`GET /session/{id}/message`)
+//!    - An OpenCode session exists (`GET /api/session/active` reports active sessions)
+//!    - The session's initial prompt contains the issue body (`GET /api/session/{id}/message`)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -261,8 +261,9 @@ async fn e2e_triage_flow_creates_session() {
 
     // ── 11. Verify: OpenCode session exists ───────────────────────
     let active_count = opencode
-        .count_active_sessions()
+        .get_active_sessions()
         .await
+        .map(|sessions| sessions.len())
         .expect("Failed to count active OpenCode sessions");
     assert!(
         active_count > 0,
@@ -274,7 +275,7 @@ async fn e2e_triage_flow_creates_session() {
 
     // ── 12. Verify: initial prompt contains issue content ───────────
     let messages = opencode
-        .get_session_messages(session_id, None)
+        .get_session_messages_v2(session_id)
         .await
         .expect("Failed to fetch session messages");
 
@@ -582,8 +583,9 @@ async fn e2e_full_workflow_state_flow() {
 
     // ── 16. Run review check — should NOT start a new session ─────
     let active_before = opencode
-        .count_active_sessions()
+        .get_active_sessions()
         .await
+        .map(|sessions| sessions.len())
         .expect("Failed to count active sessions");
 
     workflow
@@ -592,8 +594,9 @@ async fn e2e_full_workflow_state_flow() {
         .expect("review check failed");
 
     let active_after = opencode
-        .count_active_sessions()
+        .get_active_sessions()
         .await
+        .map(|sessions| sessions.len())
         .expect("Failed to count active sessions");
 
     assert_eq!(
@@ -842,8 +845,9 @@ async fn e2e_failed_review_recovery_flow() {
 
     // Verify the reviewer session is active.
     let active_count = opencode
-        .count_active_sessions()
+        .get_active_sessions()
         .await
+        .map(|sessions| sessions.len())
         .expect("Failed to count active sessions");
     assert!(active_count > 0, "Expected active reviewer session");
     eprintln!("Active sessions: {}", active_count);

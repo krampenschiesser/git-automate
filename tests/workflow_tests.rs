@@ -22,7 +22,6 @@ use git_automate::workflow::helpers::{ProjectContext, WorkflowContext, write_pro
 // ─── Test 1: Full triage flow with mocks ──────────────────────
 
 #[tokio::test]
-#[ignore = "v2 migration: re-enabled in W5"]
 async fn test_full_triage_flow_with_mocks() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -42,33 +41,33 @@ async fn test_full_triage_flow_with_mocks() {
         .await;
 
     mount_opencode_mocks(&oc_mock).await;
-    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
+    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
 
-    // Track that the session creation POST was actually called.
-    // Session is created in the worktree directory with the workspace param.
+    // Track that the v2 session creation POST was actually called.
     Mock::given(method("POST"))
-        .and(path("/session"))
-        .and(query_param("directory", "/wt/dir1"))
-        .and(query_param("workspace", "wrk1"))
+        .and(path("/api/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "sess123",
-            "projectID": "p1",
-            "directory": "/wt/dir1",
-            "title": "t",
-            "version": "1",
-            "time": {"created": 1, "updated": 2}
+            "data": {
+                "id": "sess123",
+                "projectID": "p1",
+                "title": "t",
+                "time": {"created": 1, "updated": 2},
+                "location": {"directory": "/test-work/.worktrees/wt1"}
+            }
         })))
         .expect(1)
         .named("session_creation")
         .mount(&oc_mock)
         .await;
 
-    // Track that prompt_async was called.
+    // Track that the v2 prompt endpoint was called (200 receipt, no 204).
     Mock::given(method("POST"))
-        .and(path("/session/sess123/prompt_async"))
-        .respond_with(ResponseTemplate::new(204))
+        .and(path("/api/session/sess123/prompt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"id": "msg_1"}
+        })))
         .expect(1)
-        .named("prompt_async")
+        .named("prompt")
         .mount(&oc_mock)
         .await;
 
@@ -1139,38 +1138,38 @@ fn failed_review_test_ctx(
 }
 
 #[tokio::test]
-#[ignore = "v2 migration: re-enabled in W5"]
 async fn test_failed_review_technical_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
 
     mount_failed_review_github_mocks(&gh_mock, "Review Technical", "old-review-session").await;
 
-    Mock::given(method("GET"))
-        .and(path("/session/status"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&oc_mock)
+    // Old review session is finished: absent from the active map, outcome succeeded.
+    mount_opencode_v2_active_sessions_mock(&oc_mock, &[]).await;
+    mount_opencode_v2_get_session_mock(&oc_mock, "old-review-session", Some("succeeded"), None)
         .await;
-
-    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
+    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
 
     Mock::given(method("POST"))
-        .and(path("/session"))
+        .and(path("/api/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "dev-sess-999",
-            "projectID": "p1",
-            "directory": "/d",
-            "title": "Review Technical: Fix login",
-            "version": "1",
-            "time": {"created": 1, "updated": 2}
+            "data": {
+                "id": "dev-sess-999",
+                "projectID": "p1",
+                "title": "Review Technical: Fix login",
+                "time": {"created": 1, "updated": 2},
+                "location": {"directory": "/test-work/.worktrees/wt1"}
+            }
         })))
         .expect(1)
         .mount(&oc_mock)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/session/dev-sess-999/prompt_async"))
-        .respond_with(ResponseTemplate::new(204))
+        .and(path("/api/session/dev-sess-999/prompt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"id": "msg_1"}
+        })))
         .expect(1)
         .mount(&oc_mock)
         .await;
@@ -1189,38 +1188,38 @@ async fn test_failed_review_technical_transitions_to_in_dev() {
 }
 
 #[tokio::test]
-#[ignore = "v2 migration: re-enabled in W5"]
 async fn test_failed_review_product_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
 
     mount_failed_review_github_mocks(&gh_mock, "Review Product", "old-review-session").await;
 
-    Mock::given(method("GET"))
-        .and(path("/session/status"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&oc_mock)
+    // Old review session is finished: absent from the active map, outcome succeeded.
+    mount_opencode_v2_active_sessions_mock(&oc_mock, &[]).await;
+    mount_opencode_v2_get_session_mock(&oc_mock, "old-review-session", Some("succeeded"), None)
         .await;
-
-    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
+    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
 
     Mock::given(method("POST"))
-        .and(path("/session"))
+        .and(path("/api/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "dev-sess-999",
-            "projectID": "p1",
-            "directory": "/d",
-            "title": "Review Product: Fix",
-            "version": "1",
-            "time": {"created": 1, "updated": 2}
+            "data": {
+                "id": "dev-sess-999",
+                "projectID": "p1",
+                "title": "Review Product: Fix",
+                "time": {"created": 1, "updated": 2},
+                "location": {"directory": "/test-work/.worktrees/wt1"}
+            }
         })))
         .expect(1)
         .mount(&oc_mock)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/session/dev-sess-999/prompt_async"))
-        .respond_with(ResponseTemplate::new(204))
+        .and(path("/api/session/dev-sess-999/prompt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"id": "msg_1"}
+        })))
         .expect(1)
         .mount(&oc_mock)
         .await;
@@ -1239,38 +1238,38 @@ async fn test_failed_review_product_transitions_to_in_dev() {
 }
 
 #[tokio::test]
-#[ignore = "v2 migration: re-enabled in W5"]
 async fn test_failed_review_qa_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
 
     mount_failed_review_github_mocks(&gh_mock, "QA", "old-review-session").await;
 
-    Mock::given(method("GET"))
-        .and(path("/session/status"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&oc_mock)
+    // Old review session is finished: absent from the active map, outcome succeeded.
+    mount_opencode_v2_active_sessions_mock(&oc_mock, &[]).await;
+    mount_opencode_v2_get_session_mock(&oc_mock, "old-review-session", Some("succeeded"), None)
         .await;
-
-    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
+    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
 
     Mock::given(method("POST"))
-        .and(path("/session"))
+        .and(path("/api/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "dev-sess-999",
-            "projectID": "p1",
-            "directory": "/d",
-            "title": "QA: Test integration",
-            "version": "1",
-            "time": {"created": 1, "updated": 2}
+            "data": {
+                "id": "dev-sess-999",
+                "projectID": "p1",
+                "title": "QA: Test integration",
+                "time": {"created": 1, "updated": 2},
+                "location": {"directory": "/test-work/.worktrees/wt1"}
+            }
         })))
         .expect(1)
         .mount(&oc_mock)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/session/dev-sess-999/prompt_async"))
-        .respond_with(ResponseTemplate::new(204))
+        .and(path("/api/session/dev-sess-999/prompt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"id": "msg_1"}
+        })))
         .expect(1)
         .mount(&oc_mock)
         .await;
@@ -1295,20 +1294,13 @@ async fn test_active_review_session_not_recovered() {
 
     mount_failed_review_github_mocks(&gh_mock, "Review Technical", "active-session").await;
 
-    Mock::given(method("GET"))
-        .and(path("/session/status"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "active-session": {"type": "busy"}
-        })))
-        .mount(&oc_mock)
-        .await;
+    // Session is still running: present in the v2 active-sessions map.
+    mount_opencode_v2_active_sessions_mock(&oc_mock, &["active-session"]).await;
 
     Mock::given(method("POST"))
-        .and(path("/session"))
+        .and(path("/api/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "should-not-happen",
-            "projectID": "p", "directory": "/d", "title": "t",
-            "version": "1", "time": {"created": 1, "updated": 2}
+            "data": {"id": "should-not-happen"}
         })))
         .expect(0)
         .mount(&oc_mock)
@@ -1336,7 +1328,6 @@ async fn test_active_review_session_not_recovered() {
 /// branch, and that the filled prompt contains PR_URL, PR_CHANGES, and
 /// PR_COMMENTS.
 #[tokio::test]
-#[ignore = "v2 migration: re-enabled in W5"]
 async fn todo_check_gathers_pr_context_when_pr_exists() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -1584,54 +1575,34 @@ async fn todo_check_gathers_pr_context_when_pr_exists() {
         .mount(&gh_mock)
         .await;
 
-    // OpenCode mocks
+    // OpenCode v2 mocks
+    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
+
     Mock::given(method("POST"))
-        .and(path("/experimental/workspace"))
+        .and(path("/api/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "wrk1",
-            "type": "git",
-            "name": "w1",
-            "branch": null,
-            "directory": null,
-            "extra": null,
-            "projectID": "p1",
-            "timeUsed": 0
+            "data": {
+                "id": "sess123",
+                "projectID": "p1",
+                "title": "t",
+                "time": {"created": 1, "updated": 2},
+                "location": {"directory": "/test-work/.worktrees/wt1"}
+            }
         })))
         .mount(&oc_mock)
         .await;
 
+    // Verify the v2 prompt body contains PR context
     Mock::given(method("POST"))
-        .and(path("/experimental/worktree"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "name": "wt1",
-            "branch": "issue-42",
-            "directory": "/wt/dir1"
-        })))
-        .mount(&oc_mock)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/session"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "sess123",
-            "projectID": "p1",
-            "directory": "/d",
-            "title": "t",
-            "version": "1",
-            "time": {"created": 1, "updated": 2}
-        })))
-        .mount(&oc_mock)
-        .await;
-
-    // Verify prompt_async body contains PR context
-    Mock::given(method("POST"))
-        .and(path("/session/sess123/prompt_async"))
+        .and(path("/api/session/sess123/prompt"))
         .and(body_string_contains(
             "https://github.com/owner/repo/pull/10",
         ))
         .and(body_string_contains("diff --git"))
         .and(body_string_contains("Please fix this"))
-        .respond_with(ResponseTemplate::new(204))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"id": "msg_1"}
+        })))
         .expect(1)
         .mount(&oc_mock)
         .await;
@@ -1646,7 +1617,6 @@ async fn todo_check_gathers_pr_context_when_pr_exists() {
 /// When `get_pull_request_for_branch` returns `None`, the check should
 /// continue normally with empty PR_URL, PR_CHANGES, and PR_COMMENTS.
 #[tokio::test]
-#[ignore = "v2 migration: re-enabled in W5"]
 async fn todo_check_no_pr_for_branch_continues_normally() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -1823,48 +1793,28 @@ async fn todo_check_no_pr_for_branch_continues_normally() {
         .mount(&gh_mock)
         .await;
 
-    // OpenCode mocks
+    // OpenCode v2 mocks
+    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
+
     Mock::given(method("POST"))
-        .and(path("/experimental/workspace"))
+        .and(path("/api/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "wrk1",
-            "type": "git",
-            "name": "w1",
-            "branch": null,
-            "directory": null,
-            "extra": null,
-            "projectID": "p1",
-            "timeUsed": 0
+            "data": {
+                "id": "sess123",
+                "projectID": "p1",
+                "title": "t",
+                "time": {"created": 1, "updated": 2},
+                "location": {"directory": "/test-work/.worktrees/wt1"}
+            }
         })))
         .mount(&oc_mock)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/experimental/worktree"))
+        .and(path("/api/session/sess123/prompt"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "name": "wt1",
-            "branch": "issue-42",
-            "directory": "/wt/dir1"
+            "data": {"id": "msg_1"}
         })))
-        .mount(&oc_mock)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/session"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "sess123",
-            "projectID": "p1",
-            "directory": "/d",
-            "title": "t",
-            "version": "1",
-            "time": {"created": 1, "updated": 2}
-        })))
-        .mount(&oc_mock)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/session/sess123/prompt_async"))
-        .respond_with(ResponseTemplate::new(204))
         .mount(&oc_mock)
         .await;
 
@@ -1880,7 +1830,6 @@ async fn todo_check_no_pr_for_branch_continues_normally() {
 /// branch, and that the filled prompt contains PR_URL, PR_CHANGES, and
 /// PR_COMMENTS.
 #[tokio::test]
-#[ignore = "v2 migration: re-enabled in W5"]
 async fn review_check_gathers_pr_comments() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
@@ -2099,30 +2048,35 @@ async fn review_check_gathers_pr_comments() {
         .mount(&gh_mock)
         .await;
 
-    // OpenCode mocks
-    mount_opencode_workspace_worktree_mocks(&oc_mock).await;
+    // OpenCode v2 mocks
+    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
+    // run_review_check tails into run_failed_review_check, which lists active sessions.
+    mount_opencode_v2_active_sessions_mock(&oc_mock, &[]).await;
 
     Mock::given(method("POST"))
-        .and(path("/session"))
+        .and(path("/api/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "sess123",
-            "projectID": "p1",
-            "directory": "/d",
-            "title": "Review Technical: Implement feature",
-            "version": "1",
-            "time": {"created": 1, "updated": 2}
+            "data": {
+                "id": "sess123",
+                "projectID": "p1",
+                "title": "Review Technical: Implement feature",
+                "time": {"created": 1, "updated": 2},
+                "location": {"directory": "/test-work/.worktrees/wt1"}
+            }
         })))
         .mount(&oc_mock)
         .await;
 
-    // Verify prompt_async body contains PR context
+    // Verify the v2 prompt body contains PR context
     Mock::given(method("POST"))
-        .and(path("/session/sess123/prompt_async"))
+        .and(path("/api/session/sess123/prompt"))
         .and(body_string_contains(
             "https://github.com/owner/repo/pull/10",
         ))
         .and(body_string_contains("diff --git"))
-        .respond_with(ResponseTemplate::new(204))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"id": "msg_1"}
+        })))
         .expect(1)
         .mount(&oc_mock)
         .await;
