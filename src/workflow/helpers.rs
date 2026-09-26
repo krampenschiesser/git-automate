@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use super::WorkflowStatus;
 use crate::config::{GitAutomateConfig, GitSection};
+use crate::external_agent::opencode::types::{SessionOutcome, SessionV2Info};
 use crate::external_issues::github::client::{GitHubClient, GitHubError};
 use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::{IssueInfo, ParsedRepo, StatusOption};
@@ -330,6 +331,48 @@ pub fn parse_resolve_threads(messages: &[String]) -> Vec<String> {
     }
 
     Vec::new()
+}
+
+// ─── Session completion ───────────────────────────────────────
+
+/// Terminal-state decision for a tracked OpenCode session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCompletion {
+    /// Session finished successfully — safe to parse its output.
+    Succeeded,
+    /// Session terminated abnormally (reason: "failed" | "interrupted" | "not-found").
+    /// Callers MUST NOT parse output; they reset/retry instead.
+    Failed(&'static str),
+    /// Still running, or finished-without-terminal-marker yet — do nothing this cycle.
+    Waiting,
+}
+
+/// Decide a session's state from the active-session set and its (optional) info.
+///
+/// Rules:
+/// - `is_active` -> `Waiting`
+/// - not active + `None` (404) -> `Failed("not-found")`
+/// - outcome `succeeded` -> `Succeeded`; `failed` -> `Failed("failed")`; `interrupted` -> `Failed("interrupted")`
+/// - no outcome but `time.idle` present -> `Succeeded`
+/// - no outcome and no idle -> `Waiting`
+pub fn session_completion(is_active: bool, session: Option<&SessionV2Info>) -> SessionCompletion {
+    if is_active {
+        return SessionCompletion::Waiting;
+    }
+
+    let Some(session) = session else {
+        return SessionCompletion::Failed("not-found");
+    };
+
+    match session.outcome {
+        Some(SessionOutcome::Succeeded) => SessionCompletion::Succeeded,
+        Some(SessionOutcome::Failed) => SessionCompletion::Failed("failed"),
+        Some(SessionOutcome::Interrupted) => SessionCompletion::Failed("interrupted"),
+        None => match session.time.as_ref().and_then(|t| t.idle) {
+            Some(_) => SessionCompletion::Succeeded,
+            None => SessionCompletion::Waiting,
+        },
+    }
 }
 
 // ─── Branch naming ─────────────────────────────────────────────
@@ -2734,5 +2777,148 @@ mod tests {
         };
         let result = branch_name_for_issue(123, &git, None);
         assert_eq!(result, "issue-123");
+    }
+
+    // ── session_completion tests ─────────────────────────────────
+
+    /// Build a `SessionV2Info` from a JSON value, as returned by the API.
+    fn session_info(value: Value) -> SessionV2Info {
+        serde_json::from_value(value).expect("test session JSON should deserialize")
+    }
+
+    #[test]
+    fn session_completion_table() {
+        let active = session_info(json!({ "id": "s1" }));
+        let succeeded = session_info(json!({ "id": "s1", "outcome": "succeeded" }));
+        let failed = session_info(json!({ "id": "s1", "outcome": "failed" }));
+        let interrupted = session_info(json!({ "id": "s1", "outcome": "interrupted" }));
+        let idle = session_info(json!({ "id": "s1", "time": { "idle": 1.5 } }));
+        let time_empty = session_info(json!({ "id": "s1", "time": {} }));
+        let no_time = session_info(json!({ "id": "s1" }));
+
+        let cases: Vec<(&str, bool, Option<&SessionV2Info>, SessionCompletion)> = vec![
+            (
+                "active session",
+                true,
+                Some(&active),
+                SessionCompletion::Waiting,
+            ),
+            (
+                "404 (None)",
+                false,
+                None,
+                SessionCompletion::Failed("not-found"),
+            ),
+            (
+                "outcome succeeded",
+                false,
+                Some(&succeeded),
+                SessionCompletion::Succeeded,
+            ),
+            (
+                "outcome failed",
+                false,
+                Some(&failed),
+                SessionCompletion::Failed("failed"),
+            ),
+            (
+                "outcome interrupted",
+                false,
+                Some(&interrupted),
+                SessionCompletion::Failed("interrupted"),
+            ),
+            (
+                "idle marker",
+                false,
+                Some(&idle),
+                SessionCompletion::Succeeded,
+            ),
+            (
+                "time present but no marker",
+                false,
+                Some(&time_empty),
+                SessionCompletion::Waiting,
+            ),
+            ("no time", false, Some(&no_time), SessionCompletion::Waiting),
+        ];
+
+        for (name, is_active, session, expected) in cases {
+            assert_eq!(
+                session_completion(is_active, session),
+                expected,
+                "case: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_completion_active_is_waiting() {
+        let session = session_info(json!({ "id": "s1" }));
+        assert_eq!(
+            session_completion(true, Some(&session)),
+            SessionCompletion::Waiting
+        );
+    }
+
+    #[test]
+    fn session_completion_none_is_not_found() {
+        assert_eq!(
+            session_completion(false, None),
+            SessionCompletion::Failed("not-found")
+        );
+    }
+
+    #[test]
+    fn session_completion_outcome_succeeded() {
+        let session = session_info(json!({ "id": "s1", "outcome": "succeeded" }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Succeeded
+        );
+    }
+
+    #[test]
+    fn session_completion_outcome_failed() {
+        let session = session_info(json!({ "id": "s1", "outcome": "failed" }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Failed("failed")
+        );
+    }
+
+    #[test]
+    fn session_completion_outcome_interrupted() {
+        let session = session_info(json!({ "id": "s1", "outcome": "interrupted" }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Failed("interrupted")
+        );
+    }
+
+    #[test]
+    fn session_completion_idle_is_succeeded() {
+        let session = session_info(json!({ "id": "s1", "time": { "idle": 1.5 } }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Succeeded
+        );
+    }
+
+    #[test]
+    fn session_completion_time_without_idle_is_waiting() {
+        let session = session_info(json!({ "id": "s1", "time": {} }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Waiting
+        );
+    }
+
+    #[test]
+    fn session_completion_no_time_is_waiting() {
+        let session = session_info(json!({ "id": "s1" }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Waiting
+        );
     }
 }
