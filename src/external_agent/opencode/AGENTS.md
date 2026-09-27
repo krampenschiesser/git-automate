@@ -41,7 +41,7 @@ The daemon sends agent ids `git-automate-{triage,taskmanager,developer,reviewer,
 - global: `~/.config/opencode/agents/git-automate-triage.md`, or
 - the v2 `agents` map in `opencode.json`.
 
-Bodies live at `src/assets/agents/git-automate-<role>.agent.md` (that `.agent.md` name is legacy/editor convention only — installing it verbatim yields the wrong id `git-automate-triage.agent`). A session whose agent is missing is still created (HTTP 200) but ends with `outcome:"failed"`. NOTE: `doctor`/`ensure_agents_installed` currently writes `.agent.md` files into `~/.config/git-automate/agents/`, which v2 does not discover — installing into a v2 discovery path is a follow-up.
+Bodies live at `src/assets/agents/git-automate-<role>.agent.md` (that `.agent.md` name is legacy/editor convention only — installing it verbatim yields the wrong id `git-automate-triage.agent`). The shipped agents are `mode: primary` so they can be selected as the session's agent. `doctor`/`ensure_agents_installed` installs them as `<id>.md` under `$XDG_CONFIG_HOME/opencode/agents` (default `~/.config/opencode/agents`). A session whose agent is missing is still created (HTTP 200) but ends with `outcome:"failed"`.
 
 ## ANTI-PATTERNS (THIS DIRECTORY)
 - **No v1 routes**: `/global/health`, `/session`, `/session/status`, `/session/{id}/prompt_async`, `/experimental/workspace`, `/experimental/worktree` no longer exist in v2.

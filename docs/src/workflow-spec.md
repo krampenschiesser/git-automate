@@ -507,17 +507,20 @@ However, when the workflow continues processing a new info message needs to be l
 
 ## Agent Catalog
 
-The git-automate workflow defines six agents. Each agent has
-an embedded definition file that is copied to `~/.config/git-automate/agents`
-by the initial setup.
+The git-automate workflow defines six agents. Each has an embedded definition
+file (`src/assets/agents/git-automate-<role>.agent.md`) that `doctor` installs
+as `<id>.md` into the OpenCode v2 global agents directory
+(`$XDG_CONFIG_HOME/opencode/agents`, default `~/.config/opencode/agents`).
+The daemon selects an agent by its id when creating a session.
 
-| Agent | File | Role | Invoked By |
+| Agent | OpenCode agent id | Role | Invoked By |
 |---|---|---|---|
-| Triage | `git-automate-triage.agent.md` | Analyze issues, break into sub-tasks, and transition items to "Todo" | Step 3 (Triage) |
-| Developer | `git-automate-developer.agent.md` | Implement code changes for triaged issues | Step 4 (Todo), Failed Review Recovery |
-| Reviewer | `git-automate-reviewer.agent.md` | Technical code review for pull requests | Step 5 (Review Technical) |
-| Product | `git-automate-product.agent.md` | Product and UX review for implemented features | Step 5 (Review Product) |
-| QA | `git-automate-qa.agent.md` | Testing and QA verification before final approval | Step 5 (QA) |
+| Triage | `git-automate-triage` | Analyze issues, break into sub-tasks, and transition items to "Todo" | Step 3 (Triage) |
+| Task Manager | `git-automate-taskmanager` | Manage issues and tasks across the workflow | Not currently started by the daemon |
+| Developer | `git-automate-developer` | Implement code changes for triaged issues | Step 4 (Todo), Failed Review Recovery |
+| Reviewer | `git-automate-reviewer` | Technical code review for pull requests | Step 5 (Review Technical) |
+| Product | `git-automate-product` | Product and UX review for implemented features | Step 5 (Review Product) |
+| QA | `git-automate-qa` | Testing and QA verification before final approval | Step 5 (QA) |
 
 ## Prompt Variable Catalog
 

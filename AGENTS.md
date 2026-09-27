@@ -39,7 +39,7 @@ Single-crate Rust daemon (`edition = "2024"`, req. Rust 1.85+). Polls GitHub for
 | Add OpenCode API call | `src/external_agent/opencode/client.rs` | HTTP client, `include_str!` queries |
 | Add GitHub GraphQL query | `src/external_issues/github/queries/` + `client.rs` + `types.rs` | 4-step pattern: .graphql → struct → method → test |
 | Edit agent prompts | `src/assets/prompts/*.md` | Requires `cargo build` (include_str!) |
-| Edit agent definitions | `src/assets/agents/*.agent.md` | Copied to `~/.opencode/agents/` by `doctor` |
+| Edit agent definitions | `src/assets/agents/*.agent.md` | Installed as `<id>.md` under `~/.config/opencode/agents/` by `doctor` |
 | Add integration test | `tests/` | Helpers in `tests/common/mod.rs`, use `SET_CWD_MUTEX` |
 | Debug test flakiness | `src/lib.rs` | `SET_CWD_MUTEX` guards cwd mutations |
 | Update CI pipeline | `.github/workflows/rust.yml` | fmt → check → clippy → test |
@@ -90,7 +90,7 @@ git-automate doctor --config git-automate.yml   # install missing agents
 ```
 git-automate serve --config git-automate.yml      # daemon, polls every 30s
 git-automate health --url <url> --pw <pw>          # probe OpenCode server health
-git-automate doctor --config git-automate.yml      # one-shot setup; copies missing agents to ~/.opencode/agents/
+git-automate doctor --config git-automate.yml      # one-shot setup; copies missing agents to ~/.config/opencode/agents/
 ```
 
 ## Agent & workflow model
