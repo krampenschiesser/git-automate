@@ -1,7 +1,7 @@
 ---
 name: git-automate-product
 description: "Product review for git-automate issues"
-mode: subagent
+mode: primary
 ---
 
 # Product Review Agent

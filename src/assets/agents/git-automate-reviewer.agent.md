@@ -1,7 +1,7 @@
 ---
 name: git-automate-reviewer
 description: "Provide technical code review for git-automate issues"
-mode: subagent
+mode: primary
 ---
 
 # Technical Reviewer Agent

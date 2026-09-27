@@ -1,7 +1,7 @@
 ---
 name: git-automate-developer
 description: "Develop code changes for GitHub issues"
-mode: subagent
+mode: primary
 ---
 
 # Developer Agent

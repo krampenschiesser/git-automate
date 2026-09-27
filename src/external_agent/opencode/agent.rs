@@ -10,7 +10,7 @@ use crate::external_agent::common::{
     AgentSessionStatus, ExternalAgent, ExternalAgentError, SessionInfo,
 };
 use crate::external_agent::opencode::client::OpenCodeClient;
-use crate::external_agent::opencode::types::Session;
+use crate::external_agent::opencode::types::{Session, SessionOutcome};
 
 // ─── From<Session> for SessionInfo ───────────────────────
 
@@ -66,14 +66,20 @@ impl ExternalAgent for OpenCodeClient {
             .await
             .map_err(|e| ExternalAgentError::SessionStatus(e.to_string()))?
         {
-            None => Ok(AgentSessionStatus::Done),
-            Some(s) => {
-                if s.outcome.is_some() || s.time.as_ref().and_then(|t| t.idle).is_some() {
-                    Ok(AgentSessionStatus::Done)
-                } else {
-                    Ok(AgentSessionStatus::Waiting)
+            None => Ok(AgentSessionStatus::Failed),
+            Some(s) => match s.outcome {
+                Some(SessionOutcome::Succeeded) => Ok(AgentSessionStatus::Done),
+                Some(SessionOutcome::Failed | SessionOutcome::Interrupted) => {
+                    Ok(AgentSessionStatus::Failed)
                 }
-            }
+                None => {
+                    if s.time.as_ref().and_then(|t| t.idle).is_some() {
+                        Ok(AgentSessionStatus::Done)
+                    } else {
+                        Ok(AgentSessionStatus::Waiting)
+                    }
+                }
+            },
         }
     }
 
@@ -372,9 +378,9 @@ mod tests {
         assert_eq!(status, AgentSessionStatus::Waiting);
     }
 
-    // Test 10: not active + 404 on v2 fetch → Done.
+    // Test 10: not active + 404 on v2 fetch → Failed (a missing session is not success).
     #[tokio::test]
-    async fn session_status_404_returns_done() {
+    async fn session_status_404_returns_failed() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/session/active"))
@@ -391,7 +397,31 @@ mod tests {
 
         let c = client(&server);
         let status = c.session_status("missing").await.unwrap();
-        assert_eq!(status, AgentSessionStatus::Done);
+        assert_eq!(status, AgentSessionStatus::Failed);
+    }
+
+    // Test 10b: not active + outcome=failed → Failed (not Done).
+    #[tokio::test]
+    async fn session_status_outcome_failed_returns_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses1", "outcome": "failed" }
+            })))
+            .mount(&server)
+            .await;
+
+        let c = client(&server);
+        let status = c.session_status("ses1").await.unwrap();
+        assert_eq!(status, AgentSessionStatus::Failed);
     }
 
     // Test 11: session_status 500 on active fetch returns SessionStatus error.

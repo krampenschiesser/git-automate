@@ -152,7 +152,9 @@ impl OpenCodeClient {
         let active = self.get_active_sessions().await?;
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for id in active.keys() {
-            if let Some(session) = self.get_session_v2(id).await?
+            // A 404 (session finished between the two calls) or a transient
+            // per-session error must not fail the whole concurrency gate.
+            if let Ok(Some(session)) = self.get_session_v2(id).await
                 && let Some(ref model) = session.model
             {
                 *counts.entry(model.as_key()).or_insert(0) += 1;
@@ -814,6 +816,42 @@ mod tests {
         let counts = client.get_session_models().await.unwrap();
         assert_eq!(counts.len(), 1);
         assert_eq!(counts.get("myprovider/slow"), Some(&1));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_session_models_skips_per_session_fetch_errors() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "ses_ok": { "type": "running" }, "ses_err": { "type": "running" } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_ok", "model": { "id": "fast", "providerID": "myprovider" } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_err"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let counts = client.get_session_models().await.unwrap();
+        assert_eq!(counts.get("myprovider/fast"), Some(&1));
 
         server.verify().await;
     }

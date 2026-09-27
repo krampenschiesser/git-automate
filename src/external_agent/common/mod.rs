@@ -35,15 +35,18 @@ pub enum ExternalAgentError {
 /// Status of an agent session from the daemon's perspective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSessionStatus {
-    /// Session has completed its work (or was removed).
+    /// Session completed successfully.
     Done,
+    /// Session terminated abnormally — `failed`/`interrupted`, or the session
+    /// could not be found. Callers must NOT treat this as success.
+    Failed,
     /// Session is actively running or awaiting retry.
     Waiting,
     /// Session is idle and available.
     ///
-    /// Retained for backward compatibility with existing match sites; the
-    /// OpenCode v2 implementation no longer produces this variant (idle
-    /// sessions are reported as [`AgentSessionStatus::Done`]).
+    /// Retained for backward compatibility; the OpenCode v2 implementation
+    /// never produces this variant (idle sessions report as
+    /// [`AgentSessionStatus::Done`]).
     #[allow(dead_code)]
     Idle,
 }

@@ -37,6 +37,10 @@ const REPO_AGENT_SUBDIR: &str = ".agents/git-automate/agents";
 /// Subdirectory under $HOME for global agent/prompt overrides.
 const CONFIG_AGENT_SUBDIR: &str = ".config/git-automate/agents";
 
+/// Subdirectory (under the config home) where OpenCode v2 discovers global
+/// agent definitions.
+const OPENCODE_AGENTS_SUBDIR: &str = "opencode/agents";
+
 // ─── Error type ───────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -228,18 +232,23 @@ fn embedded_prompt(name: &str) -> Result<&'static str, WorkflowError> {
     }
 }
 
-/// Ensure all required agent files are installed under `$HOME/.config/git-automate/agents/`.
+/// Ensure all required agent definitions are installed for OpenCode v2.
 ///
-/// Creates the directory if missing and writes each embedded agent file only
-/// when it does not already exist (never overwrites user overrides).
+/// OpenCode v2 derives an agent id from the filename minus `.md`, so each agent
+/// is written as `<id>.md` (e.g. `git-automate-triage.md`) under the global
+/// agents directory `$XDG_CONFIG_HOME/opencode/agents` (default
+/// `~/.config/opencode/agents`). Existing files are never overwritten.
 pub fn ensure_agents_installed() -> Result<(), WorkflowError> {
-    let home = env::var("HOME").unwrap_or_default();
-    let agents_dir = PathBuf::from(home).join(CONFIG_AGENT_SUBDIR);
+    let config_home = env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".config"));
+    let agents_dir = config_home.join(OPENCODE_AGENTS_SUBDIR);
     std::fs::create_dir_all(&agents_dir)?;
 
     for agent in &crate::workflow::REQUIRED_AGENTS {
-        let file_name = agent.as_file_name();
-        let path = agents_dir.join(file_name);
+        let path = agents_dir.join(format!("{}.md", agent.as_str()));
         if path.exists() {
             continue;
         }
@@ -1172,28 +1181,26 @@ mod tests {
         ));
     }
 
-    // Test: ensure_agents_installed creates dir and writes all missing agent files
+    // Test: ensure_agents_installed creates the v2 agents dir and writes all missing agent files
     #[test]
     fn ensure_agents_installed_creates_dir_and_writes_missing() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let original_home = env::var("HOME").ok();
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
             env::set_var("HOME", tmp.path());
+            env::remove_var("XDG_CONFIG_HOME");
         }
 
         let result = ensure_agents_installed();
         assert!(result.is_ok(), "ensure_agents_installed should succeed");
 
-        let agents_dir = tmp
-            .path()
-            .join(".config")
-            .join("git-automate")
-            .join("agents");
+        let agents_dir = tmp.path().join(".config").join("opencode").join("agents");
         assert!(agents_dir.exists(), "agents dir should exist");
 
         for agent in &crate::workflow::REQUIRED_AGENTS {
-            let path = agents_dir.join(agent.as_file_name());
+            let path = agents_dir.join(format!("{}.md", agent.as_str()));
             assert!(path.exists(), "agent file {} should exist", path.display());
         }
 
@@ -1206,6 +1213,15 @@ mod tests {
                 env::remove_var("HOME");
             }
         }
+        if let Some(x) = original_xdg {
+            unsafe {
+                env::set_var("XDG_CONFIG_HOME", x);
+            }
+        } else {
+            unsafe {
+                env::remove_var("XDG_CONFIG_HOME");
+            }
+        }
     }
 
     // Test: ensure_agents_installed does NOT overwrite existing files
@@ -1213,28 +1229,21 @@ mod tests {
     fn ensure_agents_installed_does_not_overwrite_existing() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let original_home = env::var("HOME").ok();
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
             env::set_var("HOME", tmp.path());
+            env::remove_var("XDG_CONFIG_HOME");
         }
 
-        let agents_dir = tmp
-            .path()
-            .join(".config")
-            .join("git-automate")
-            .join("agents");
+        let agents_dir = tmp.path().join(".config").join("opencode").join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(
-            agents_dir.join("git-automate-triage.agent.md"),
-            "CUSTOM-CONTENT",
-        )
-        .unwrap();
+        std::fs::write(agents_dir.join("git-automate-triage.md"), "CUSTOM-CONTENT").unwrap();
 
         let result = ensure_agents_installed();
         assert!(result.is_ok());
 
-        let content =
-            std::fs::read_to_string(agents_dir.join("git-automate-triage.agent.md")).unwrap();
+        let content = std::fs::read_to_string(agents_dir.join("git-automate-triage.md")).unwrap();
         assert_eq!(
             content, "CUSTOM-CONTENT",
             "existing file should not be overwritten"
@@ -1247,6 +1256,15 @@ mod tests {
         } else {
             unsafe {
                 env::remove_var("HOME");
+            }
+        }
+        if let Some(x) = original_xdg {
+            unsafe {
+                env::set_var("XDG_CONFIG_HOME", x);
+            }
+        } else {
+            unsafe {
+                env::remove_var("XDG_CONFIG_HOME");
             }
         }
     }

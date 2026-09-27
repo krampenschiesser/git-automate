@@ -1,7 +1,7 @@
 ---
 name: git-automate-triage
 description: "Triage GitHub issues for the git-automate workflow"
-mode: subagent
+mode: primary
 ---
 
 # Triage Agent

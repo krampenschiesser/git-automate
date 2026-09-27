@@ -1,7 +1,7 @@
 ---
 name: git-automate-taskmanager
 description: "Manage GitHub issues and tasks in the git-automate workflow"
-mode: subagent
+mode: primary
 ---
 
 # Task Manager Agent
