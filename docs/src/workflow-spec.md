@@ -484,24 +484,30 @@ to produce a correct implementation.
 
 ## Concurrency
 
-The daemon limits the total number of concurrently active OpenCode
-agent sessions by a map of model to concurrency in `git-automate.yml`:
+The daemon limits the number of concurrently active OpenCode agent sessions
+by a map keyed on the OpenCode agent name (with a `default` fallback) in
+`git-automate.yml`:
 ```
 opencode:
   concurrency:
-    myprovider/slow: 2
-    myprovider/fast: 4
+    git-automate-developer: 2
+    default: 4
 ```
+
+Keys containing `/` are treated as legacy model keys and are checked against
+the per-model active session count (e.g. `myprovider/slow: 2`).
 
 
 ### Behavior When Set
 
 When `concurrency` is configured, it acts as a **hard cap**. Before
-creating any new OpenCode session, the daemon queries the OpenCode
-server for the current active sessions. For each session it resolves the model
-handling the session. 
-If the sum of active sessions for any model is greater than the limit set, session creation is skipped completely and therefore
-ending the current loop.
+creating a new OpenCode session, the daemon queries the OpenCode server for
+the current active sessions and counts them by agent (and, for legacy keys,
+by model). The limit for the session's own agent is `concurrency[<agent>]`,
+falling back to `concurrency["default"]`.
+If the active count for that agent meets or exceeds the limit, session
+creation is skipped completely and the poll cycle is short-circuited — the
+remaining workflow steps are skipped for this cycle.
 An information message is logged once for this. Subsequent skips of the workflow loop will not be logged.
 However, when the workflow continues processing a new info message needs to be logged informing the user about capacity being available again.
 

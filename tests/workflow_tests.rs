@@ -15,9 +15,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::*;
 use git_automate::config::{GitAutomateConfig, GitSection, OpencodeConfig, parse_config};
+use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::workflow::Workflow;
 use git_automate::workflow::checks::{OpencodeSessionConfig, run_review_check, run_todo_check};
-use git_automate::workflow::helpers::{ProjectContext, WorkflowContext, write_project_id};
+use git_automate::workflow::helpers::{
+    ProjectContext, SessionBinding, WorkflowContext, WorkflowError, serialize_binding,
+    write_project_id,
+};
 
 // ─── Test 1: Full triage flow with mocks ──────────────────────
 
@@ -1031,7 +1035,15 @@ async fn mount_failed_review_github_mocks(
     server: &MockServer,
     review_state: &str,
     session_id: &str,
+    resume: &str,
 ) {
+    let binding = serialize_binding(&SessionBinding {
+        step: Some(review_state.to_string()),
+        id: session_id.to_string(),
+        resume: resume.to_string(),
+        attempts: 1,
+    });
+
     mount_status_field_mock(server).await;
     mount_project_fields_mock(server).await;
     mount_add_item_mock(server).await;
@@ -1076,7 +1088,7 @@ async fn mount_failed_review_github_mocks(
                     "fieldValues": {
                         "nodes": [
                             {"__typename": "ProjectV2ItemFieldSingleSelectValue", "name": review_state, "field": {"name": "Status"}},
-                            {"__typename": "ProjectV2ItemFieldTextValue", "text": session_id, "field": {"name": "sessionId"}}
+                            {"__typename": "ProjectV2ItemFieldTextValue", "text": binding, "field": {"name": "sessionId"}}
                         ]
                     }
                 }
@@ -1111,6 +1123,9 @@ fn failed_review_test_ctx(
                 cwd: "/test-work".to_string(),
                 project: "test-project".to_string(),
                 concurrency: HashMap::new(),
+                session_timeout_secs: 1800,
+                session_max_secs: 86400,
+                max_session_attempts: 3,
             }),
         },
         github: None,
@@ -1132,6 +1147,9 @@ fn failed_review_test_ctx(
         directory: "/test-work".to_string(),
         project: Some("test-project".to_string()),
         concurrency: HashMap::new(),
+        session_timeout_secs: 1800,
+        session_max_secs: 86400,
+        max_session_attempts: 3,
     };
 
     (deps, ctx, oc)
@@ -1142,31 +1160,23 @@ async fn test_failed_review_technical_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
 
-    mount_failed_review_github_mocks(&gh_mock, "Review Technical", "old-review-session").await;
+    mount_failed_review_github_mocks(
+        &gh_mock,
+        "Review Technical",
+        "old-review-session",
+        "dev-session-resume",
+    )
+    .await;
 
-    // Old review session is finished: absent from the active map, outcome succeeded.
+    // The review session finished without a verdict → fail safe to changes,
+    // which resumes the recorded developer session.
     mount_opencode_v2_active_sessions_mock(&oc_mock, &[]).await;
     mount_opencode_v2_get_session_mock(&oc_mock, "old-review-session", Some("succeeded"), None)
         .await;
-    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
+    mount_opencode_v2_get_session_mock(&oc_mock, "dev-session-resume", None, None).await;
 
     Mock::given(method("POST"))
-        .and(path("/api/session"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": {
-                "id": "dev-sess-999",
-                "projectID": "p1",
-                "title": "Review Technical: Fix login",
-                "time": {"created": 1, "updated": 2},
-                "location": {"directory": "/test-work/.worktrees/wt1"}
-            }
-        })))
-        .expect(1)
-        .mount(&oc_mock)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/session/dev-sess-999/prompt"))
+        .and(path("/api/session/dev-session-resume/prompt"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {"id": "msg_1"}
         })))
@@ -1192,31 +1202,21 @@ async fn test_failed_review_product_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
 
-    mount_failed_review_github_mocks(&gh_mock, "Review Product", "old-review-session").await;
+    mount_failed_review_github_mocks(
+        &gh_mock,
+        "Review Product",
+        "old-review-session",
+        "dev-session-resume",
+    )
+    .await;
 
-    // Old review session is finished: absent from the active map, outcome succeeded.
     mount_opencode_v2_active_sessions_mock(&oc_mock, &[]).await;
     mount_opencode_v2_get_session_mock(&oc_mock, "old-review-session", Some("succeeded"), None)
         .await;
-    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
+    mount_opencode_v2_get_session_mock(&oc_mock, "dev-session-resume", None, None).await;
 
     Mock::given(method("POST"))
-        .and(path("/api/session"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": {
-                "id": "dev-sess-999",
-                "projectID": "p1",
-                "title": "Review Product: Fix",
-                "time": {"created": 1, "updated": 2},
-                "location": {"directory": "/test-work/.worktrees/wt1"}
-            }
-        })))
-        .expect(1)
-        .mount(&oc_mock)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/session/dev-sess-999/prompt"))
+        .and(path("/api/session/dev-session-resume/prompt"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {"id": "msg_1"}
         })))
@@ -1242,31 +1242,16 @@ async fn test_failed_review_qa_transitions_to_in_dev() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
 
-    mount_failed_review_github_mocks(&gh_mock, "QA", "old-review-session").await;
+    mount_failed_review_github_mocks(&gh_mock, "QA", "old-review-session", "dev-session-resume")
+        .await;
 
-    // Old review session is finished: absent from the active map, outcome succeeded.
     mount_opencode_v2_active_sessions_mock(&oc_mock, &[]).await;
     mount_opencode_v2_get_session_mock(&oc_mock, "old-review-session", Some("succeeded"), None)
         .await;
-    mount_opencode_v2_location_worktree_mocks(&oc_mock).await;
+    mount_opencode_v2_get_session_mock(&oc_mock, "dev-session-resume", None, None).await;
 
     Mock::given(method("POST"))
-        .and(path("/api/session"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": {
-                "id": "dev-sess-999",
-                "projectID": "p1",
-                "title": "QA: Test integration",
-                "time": {"created": 1, "updated": 2},
-                "location": {"directory": "/test-work/.worktrees/wt1"}
-            }
-        })))
-        .expect(1)
-        .mount(&oc_mock)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/api/session/dev-sess-999/prompt"))
+        .and(path("/api/session/dev-session-resume/prompt"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {"id": "msg_1"}
         })))
@@ -1292,7 +1277,13 @@ async fn test_active_review_session_not_recovered() {
     let gh_mock = MockServer::start().await;
     let oc_mock = MockServer::start().await;
 
-    mount_failed_review_github_mocks(&gh_mock, "Review Technical", "active-session").await;
+    mount_failed_review_github_mocks(
+        &gh_mock,
+        "Review Technical",
+        "active-session",
+        "dev-session-resume",
+    )
+    .await;
 
     // Session is still running: present in the v2 active-sessions map.
     mount_opencode_v2_active_sessions_mock(&oc_mock, &["active-session"]).await;
@@ -1353,6 +1344,9 @@ async fn todo_check_gathers_pr_context_when_pr_exists() {
                 cwd: "/test-work".to_string(),
                 project: "test-project".to_string(),
                 concurrency: HashMap::new(),
+                session_timeout_secs: 1800,
+                session_max_secs: 86400,
+                max_session_attempts: 3,
             }),
         },
         github: Some(client),
@@ -1372,6 +1366,9 @@ async fn todo_check_gathers_pr_context_when_pr_exists() {
         directory: "/test-work".to_string(),
         project: Some("test-project".to_string()),
         concurrency: HashMap::new(),
+        session_timeout_secs: 1800,
+        session_max_secs: 86400,
+        max_session_attempts: 3,
     };
 
     let issues = json!([
@@ -1642,6 +1639,9 @@ async fn todo_check_no_pr_for_branch_continues_normally() {
                 cwd: "/test-work".to_string(),
                 project: "test-project".to_string(),
                 concurrency: HashMap::new(),
+                session_timeout_secs: 1800,
+                session_max_secs: 86400,
+                max_session_attempts: 3,
             }),
         },
         github: Some(client),
@@ -1661,6 +1661,9 @@ async fn todo_check_no_pr_for_branch_continues_normally() {
         directory: "/test-work".to_string(),
         project: Some("test-project".to_string()),
         concurrency: HashMap::new(),
+        session_timeout_secs: 1800,
+        session_max_secs: 86400,
+        max_session_attempts: 3,
     };
 
     let issues = json!([
@@ -1855,6 +1858,9 @@ async fn review_check_gathers_pr_comments() {
                 cwd: "/test-work".to_string(),
                 project: "test-project".to_string(),
                 concurrency: HashMap::new(),
+                session_timeout_secs: 1800,
+                session_max_secs: 86400,
+                max_session_attempts: 3,
             }),
         },
         github: Some(client),
@@ -1874,6 +1880,9 @@ async fn review_check_gathers_pr_comments() {
         directory: "/test-work".to_string(),
         project: Some("test-project".to_string()),
         concurrency: HashMap::new(),
+        session_timeout_secs: 1800,
+        session_max_secs: 86400,
+        max_session_attempts: 3,
     };
 
     let issues = json!([
@@ -2087,5 +2096,157 @@ async fn review_check_gathers_pr_comments() {
         "run_review_check failed: {:?}",
         result.err()
     );
+    oc_mock.verify().await;
+}
+
+// ─── Concurrency gate short-circuiting ─────────────────────────
+
+/// Mount GitHub + OpenCode mocks so that the triage step starts a triage
+/// session whose agent is already at its configured concurrency limit.
+async fn mount_concurrency_trip_mocks(gh_mock: &MockServer, oc_mock: &MockServer) {
+    mount_status_field_mock(gh_mock).await;
+
+    // Project fields include sessionId + waveId so resolve_context does not
+    // create any fields.
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("fields(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "node": {
+                    "fields": {
+                        "nodes": [
+                            {"id": "f1", "name": "Status", "dataType": "SINGLE_SELECT"},
+                            {"id": "f2", "name": "sessionId", "dataType": "TEXT"},
+                            {"id": "f3", "name": "waveId", "dataType": "NUMBER"},
+                        ]
+                    }
+                }
+            }
+        })))
+        .mount(gh_mock)
+        .await;
+
+    // One project item (content #2) so the post-triage steps are not empty and
+    // would call `/api/session/active` again if run_all did not break.
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("items(first:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "node": { "items": { "nodes": [
+                {"id": "item-2", "content": {"__typename": "Issue", "id": "issue-node-2", "number": 2}}
+            ] } } }
+        })))
+        .mount(gh_mock)
+        .await;
+
+    mount_ai_issue_mock(gh_mock).await;
+    mount_add_item_mock(gh_mock).await;
+    mount_update_field_mock(gh_mock).await;
+    mount_empty_field_values_mock(gh_mock).await;
+
+    mount_opencode_mocks(oc_mock).await;
+
+    // Exactly one active triage session; the gate (limit 1) must trip.
+    Mock::given(method("GET"))
+        .and(path("/api/session/active"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "sess_triage": { "type": "running" } }
+        })))
+        .expect(1)
+        .named("active_sessions")
+        .mount(oc_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/session/sess_triage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "id": "sess_triage", "agent": "git-automate-triage" }
+        })))
+        .expect(1)
+        .mount(oc_mock)
+        .await;
+
+    // No session may be created.
+    Mock::given(method("GET"))
+        .and(path("/api/location"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(oc_mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(oc_mock)
+        .await;
+}
+
+/// Build a `WorkflowContext` whose triage agent concurrency limit is 1.
+fn concurrency_deps(gh: GitHubClient, oc_url: String) -> WorkflowContext {
+    WorkflowContext {
+        config: GitAutomateConfig {
+            git: GitSection {
+                repository: "https://github.com/owner/repo".to_string(),
+                project_id: Some("PID-123".to_string()),
+                directory: "/test-work".to_string(),
+                title_pattern: "@ai.*".to_string(),
+                trello_api_key: None,
+                trello_token: None,
+                trello_board_id: None,
+                token: None,
+                branch_name: None,
+            },
+            opencode: Some(OpencodeConfig {
+                url: oc_url,
+                pw: "pw".to_string(),
+                cwd: "/test-work".to_string(),
+                project: "test-project".to_string(),
+                concurrency: HashMap::from([("git-automate-triage".to_string(), 1usize)]),
+                session_timeout_secs: 1800,
+                session_max_secs: 86400,
+                max_session_attempts: 3,
+            }),
+        },
+        github: Some(gh),
+        project_id_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_dedup: Arc::new(Mutex::new(HashMap::new())),
+    }
+}
+
+// T23: the triage wrapper re-raises ConcurrencyExceeded instead of swallowing it.
+#[tokio::test]
+async fn run_triage_check_returns_concurrency_exceeded() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+    mount_concurrency_trip_mocks(&gh_mock, &oc_mock).await;
+
+    let deps = concurrency_deps(gh_client(&gh_mock), oc_mock.uri());
+    let workflow = Workflow::new(deps);
+
+    let result = workflow.run_triage_check().await;
+    assert!(matches!(result, Err(WorkflowError::ConcurrencyExceeded)));
+    oc_mock.verify().await;
+}
+
+// T24: run_all breaks the cycle on ConcurrencyExceeded, skipping later steps.
+#[tokio::test]
+async fn run_all_breaks_on_concurrency_exceeded() {
+    let gh_mock = MockServer::start().await;
+    let oc_mock = MockServer::start().await;
+    mount_concurrency_trip_mocks(&gh_mock, &oc_mock).await;
+
+    let deps = concurrency_deps(gh_client(&gh_mock), oc_mock.uri());
+    let workflow = Workflow::new(deps);
+
+    workflow
+        .run_all()
+        .await
+        .expect("run_all should still return Ok");
+
+    // A break does not count as an error.
+    assert_eq!(workflow.error_count(), 0);
+    // `/api/session/active` was hit exactly once (the triage gate). If run_all
+    // had continued, triage_completion/review would hit it again.
     oc_mock.verify().await;
 }

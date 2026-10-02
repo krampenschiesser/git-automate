@@ -86,6 +86,9 @@ pub fn make_deps(
             cwd: "/test-work".to_string(),
             project: "test-project".to_string(),
             concurrency: HashMap::new(),
+            session_timeout_secs: 1800,
+            session_max_secs: 86400,
+            max_session_attempts: 3,
         })
     } else {
         None

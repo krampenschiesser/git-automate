@@ -289,6 +289,89 @@ pub fn extract_session_id(field_values: &BTreeMap<String, Option<String>>) -> Op
         .map(String::from)
 }
 
+// ─── Session binding ──────────────────────────────────────────
+
+/// Ownership record persisted in the project's `sessionId` text field.
+///
+/// Encodes which workflow step owns a tracked OpenCode session so that a
+/// completed or failed session can only be acted upon by the step that started
+/// it. Persisted as `;`-separated `k=v` pairs:
+/// `step=<Status>;id=<session_id>;resume=<session_id_or_empty>;attempts=<u32>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBinding {
+    /// Owning workflow status (e.g. `"Triage"`, `"In Development"`). `None` for
+    /// legacy bare-id values written before bindings existed.
+    pub step: Option<String>,
+    /// OpenCode session id. May be empty when no session is recorded.
+    pub id: String,
+    /// Session id to resume from (reserved for a later phase; always empty now).
+    pub resume: String,
+    /// Number of sessions started for this step.
+    pub attempts: u32,
+}
+
+impl SessionBinding {
+    /// True when a tracked OpenCode session id is associated with this binding.
+    /// A binding that only names a step (e.g. the `Todo` degrade state) counts
+    /// as having no session.
+    pub fn has_session(&self) -> bool {
+        !self.id.is_empty()
+    }
+}
+
+/// Parse a raw `sessionId` cell into a [`SessionBinding`], tolerating any input.
+///
+/// A value with no `=` at all is treated as a legacy bare session id. Unknown
+/// keys and tokens without `=` are ignored; a non-numeric `attempts` value
+/// becomes `0`. This function never panics.
+pub fn parse_session_binding(raw: &str) -> SessionBinding {
+    let raw = raw.trim();
+    let mut binding = SessionBinding {
+        step: None,
+        id: String::new(),
+        resume: String::new(),
+        attempts: 0,
+    };
+
+    if raw.is_empty() {
+        return binding;
+    }
+
+    // Legacy bare session id: no `k=v` structure anywhere.
+    if !raw.contains('=') {
+        binding.id = raw.to_string();
+        return binding;
+    }
+
+    for pair in raw.split(';') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "step" if !value.is_empty() => binding.step = Some(value.to_string()),
+            "id" => binding.id = value.to_string(),
+            "resume" => binding.resume = value.to_string(),
+            "attempts" => binding.attempts = value.parse::<u32>().unwrap_or(0),
+            _ => {}
+        }
+    }
+
+    binding
+}
+
+/// Serialize a [`SessionBinding`] back into the `sessionId` field format.
+pub fn serialize_binding(binding: &SessionBinding) -> String {
+    format!(
+        "step={};id={};resume={};attempts={}",
+        binding.step.as_deref().unwrap_or(""),
+        binding.id,
+        binding.resume,
+        binding.attempts
+    )
+}
+
 /// Extract thread IDs from the `### Resolve threads` section in session messages.
 ///
 /// Looks for a markdown heading `### Resolve threads` followed by a line
@@ -332,17 +415,48 @@ pub enum SessionCompletion {
     Waiting,
 }
 
-/// Decide a session's state from the active-session set and its (optional) info.
+/// Wall-clock unix time in seconds (fractional), or `0.0` if the system clock
+/// is before the epoch.
+pub fn now_unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Most recent activity timestamp for a session:
+/// `max(time.created, time.updated)`. `None` when neither timestamp exists.
+fn last_activity(session: Option<&Session>) -> Option<f64> {
+    let time = session?.time.as_ref()?;
+    match (time.created, time.updated) {
+        (Some(created), Some(updated)) => Some(created.max(updated)),
+        (Some(created), None) => Some(created),
+        (None, Some(updated)) => Some(updated),
+        (None, None) => None,
+    }
+}
+
+/// Decide a session's state with wall-clock aging.
 ///
-/// Rules:
-/// - `is_active` -> `Waiting`
-/// - not active + `None` (404) -> `Failed("not-found")`
-/// - outcome `succeeded` -> `Succeeded`; `failed` -> `Failed("failed")`; `interrupted` -> `Failed("interrupted")`
-/// - no outcome but `time.idle` present -> `Succeeded`
-/// - no outcome and no idle -> `Waiting`
-pub fn session_completion(is_active: bool, session: Option<&Session>) -> SessionCompletion {
+/// - `is_active`: `Failed("timeout")` once `now_unix - last_activity > max_secs`,
+///   otherwise `Waiting` (also `Waiting` when no activity timestamp exists).
+/// - not active + `None` (404) -> `Failed("not-found")`.
+/// - outcome `succeeded` -> `Succeeded`; `failed`/`interrupted` -> `Failed(..)`.
+/// - no outcome but `time.idle` present -> `Succeeded`.
+/// - no outcome and no idle: `Failed("timeout")` once
+///   `now_unix - last_activity > timeout_secs`, otherwise `Waiting`.
+pub fn classify_session(
+    is_active: bool,
+    session: Option<&Session>,
+    now_unix: f64,
+    timeout_secs: u64,
+    max_secs: u64,
+) -> SessionCompletion {
     if is_active {
-        return SessionCompletion::Waiting;
+        return match last_activity(session) {
+            Some(last) if now_unix - last > max_secs as f64 => SessionCompletion::Failed("timeout"),
+            _ => SessionCompletion::Waiting,
+        };
     }
 
     let Some(session) = session else {
@@ -355,9 +469,20 @@ pub fn session_completion(is_active: bool, session: Option<&Session>) -> Session
         Some(SessionOutcome::Interrupted) => SessionCompletion::Failed("interrupted"),
         None => match session.time.as_ref().and_then(|t| t.idle) {
             Some(_) => SessionCompletion::Succeeded,
-            None => SessionCompletion::Waiting,
+            None => match last_activity(Some(session)) {
+                Some(last) if now_unix - last > timeout_secs as f64 => {
+                    SessionCompletion::Failed("timeout")
+                }
+                _ => SessionCompletion::Waiting,
+            },
         },
     }
+}
+
+/// Decide a session's state without aging — thin wrapper over
+/// [`classify_session`] with `u64::MAX` timeouts so a session never expires.
+pub fn session_completion(is_active: bool, session: Option<&Session>) -> SessionCompletion {
+    classify_session(is_active, session, 0.0, u64::MAX, u64::MAX)
 }
 
 // ─── Branch naming ─────────────────────────────────────────────
@@ -815,6 +940,60 @@ mod tests {
     /// Serializes tests that mutate $HOME to avoid interference with other tests.
     static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    // ── SessionBinding tests ───────────────────────────────────
+
+    // T1: serialize → parse roundtrip preserves all fields
+    #[test]
+    fn session_binding_roundtrip() {
+        let binding = SessionBinding {
+            step: Some("In Development".to_string()),
+            id: "ses_123".to_string(),
+            resume: String::new(),
+            attempts: 3,
+        };
+        let raw = serialize_binding(&binding);
+        assert_eq!(parse_session_binding(&raw), binding);
+    }
+
+    // T2: legacy bare session id parses with step None
+    #[test]
+    fn session_binding_legacy_bare_id() {
+        let binding = parse_session_binding("ses_abc");
+        assert_eq!(binding.step, None);
+        assert_eq!(binding.id, "ses_abc");
+        assert_eq!(binding.resume, "");
+        assert_eq!(binding.attempts, 0);
+        assert!(binding.has_session());
+    }
+
+    // T3: malformed / partial input is tolerated without panicking
+    #[test]
+    fn session_binding_malformed_is_tolerated() {
+        let empty = parse_session_binding("");
+        assert_eq!(empty.step, None);
+        assert_eq!(empty.id, "");
+        assert_eq!(empty.attempts, 0);
+        assert!(!empty.has_session());
+
+        let weird = parse_session_binding("step=Triage;id;attempts=abc;=x;foo=bar");
+        assert_eq!(weird.step.as_deref(), Some("Triage"));
+        assert_eq!(weird.id, "");
+        assert_eq!(weird.attempts, 0);
+
+        let no_eq = parse_session_binding("garbage");
+        assert_eq!(no_eq.id, "garbage");
+        assert_eq!(no_eq.attempts, 0);
+    }
+
+    // T4: unknown keys ignored and any key order accepted
+    #[test]
+    fn session_binding_unknown_keys_and_order() {
+        let binding = parse_session_binding("attempts=7;zzz=1;id=ses_9;step=Todo;resume=");
+        assert_eq!(binding.step.as_deref(), Some("Todo"));
+        assert_eq!(binding.id, "ses_9");
+        assert_eq!(binding.attempts, 7);
+    }
 
     // ── resolve_option_id tests ────────────────────────────────
 
@@ -2817,6 +2996,84 @@ mod tests {
         assert_eq!(
             session_completion(false, Some(&session)),
             SessionCompletion::Waiting
+        );
+    }
+
+    // T50: aging fires only strictly past timeout_secs.
+    #[test]
+    fn classify_session_inactive_timeout_boundary() {
+        let session =
+            session_info(json!({ "id": "s1", "time": { "created": 100, "updated": 1000 } }));
+
+        assert_eq!(
+            classify_session(false, Some(&session), 1005.0, 5, u64::MAX),
+            SessionCompletion::Waiting
+        );
+        assert_eq!(
+            classify_session(false, Some(&session), 1006.0, 5, u64::MAX),
+            SessionCompletion::Failed("timeout")
+        );
+    }
+
+    // T51: last_activity uses max(created, updated), not the older value.
+    #[test]
+    fn classify_session_inactive_uses_max_of_created_and_updated() {
+        let session =
+            session_info(json!({ "id": "s1", "time": { "created": 1000, "updated": 100 } }));
+        assert_eq!(
+            classify_session(false, Some(&session), 1005.0, 50, u64::MAX),
+            SessionCompletion::Waiting
+        );
+    }
+
+    // T52: an active session ages out against max_secs.
+    #[test]
+    fn classify_session_active_max_secs_aging() {
+        let session =
+            session_info(json!({ "id": "s1", "time": { "created": 1000, "updated": 2000 } }));
+        assert_eq!(
+            classify_session(true, Some(&session), 32001.0, 1800, 30000),
+            SessionCompletion::Failed("timeout")
+        );
+        assert_eq!(
+            classify_session(true, Some(&session), 32000.0, 1800, 30000),
+            SessionCompletion::Waiting
+        );
+    }
+
+    // T53: missing timestamps never age out.
+    #[test]
+    fn classify_session_missing_timestamps_is_waiting() {
+        let no_time = session_info(json!({ "id": "s1" }));
+        assert_eq!(
+            classify_session(true, Some(&no_time), 1.0e12, 1, 0),
+            SessionCompletion::Waiting
+        );
+        assert_eq!(
+            classify_session(false, Some(&no_time), 1.0e12, 1, 0),
+            SessionCompletion::Waiting
+        );
+    }
+
+    // T54: terminal markers win regardless of age and 404 stays not-found.
+    #[test]
+    fn classify_session_outcome_and_idle_take_precedence() {
+        let succeeded =
+            session_info(json!({ "id": "s1", "outcome": "succeeded", "time": { "created": 1 } }));
+        assert_eq!(
+            classify_session(false, Some(&succeeded), 1.0e12, 1, 1),
+            SessionCompletion::Succeeded
+        );
+
+        let idle = session_info(json!({ "id": "s1", "time": { "idle": 1, "created": 1 } }));
+        assert_eq!(
+            classify_session(false, Some(&idle), 1.0e12, 1, 1),
+            SessionCompletion::Succeeded
+        );
+
+        assert_eq!(
+            classify_session(false, None, 0.0, 1, 1),
+            SessionCompletion::Failed("not-found")
         );
     }
 }

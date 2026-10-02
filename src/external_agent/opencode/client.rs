@@ -20,7 +20,34 @@ struct AgentListResponse {
     data: Vec<Agent>,
 }
 
+/// Response wrapper for `POST /api/session/{id}/interrupt` — a bare
+/// `{ "interrupted": <bool> }` object (not enveloped in `data`).
+#[derive(serde::Deserialize)]
+struct SessionInterruptResponse {
+    #[serde(rename = "interrupted")]
+    _interrupted: bool,
+}
+
 const OPENCODE_USERNAME: &str = "opencode";
+
+/// Delivery semantics for a prompt sent to a session's inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// Interrupt the current turn and deliver the prompt immediately.
+    Steer,
+    /// Queue the prompt behind the session's current turn.
+    Queue,
+}
+
+impl Delivery {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Delivery::Steer => "steer",
+            Delivery::Queue => "queue",
+        }
+    }
+}
 
 /// Errors that can occur while communicating with the OpenCode HTTP API.
 #[derive(Debug, Clone, Error)]
@@ -163,6 +190,28 @@ impl OpenCodeClient {
         Ok(counts)
     }
 
+    /// `GET /api/session/active` + `GET /api/session/{id}` — per-agent counts
+    /// of *active* v2 sessions.
+    ///
+    /// For every active session id the v2 session is fetched; entries that
+    /// return 404 (finished between the two calls), carry no `agent`, or hit a
+    /// transient per-session error are skipped, consistent with
+    /// [`get_session_models`](Self::get_session_models).
+    pub async fn get_active_by_agent(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, OpenCodeError> {
+        let active = self.get_active_sessions().await?;
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for id in active.keys() {
+            if let Ok(Some(session)) = self.get_session_v2(id).await
+                && let Some(ref agent) = session.agent
+            {
+                *counts.entry(agent.clone()).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+
     /// `GET /api/info` — v2 server information (bare response, no envelope).
     pub async fn server_info(&self) -> Result<ServerInfo, OpenCodeError> {
         let response = self
@@ -272,16 +321,40 @@ impl OpenCodeClient {
         Ok(session.data)
     }
 
-    /// `POST /api/session/{id}/prompt` — send a prompt to a v2 session.
+    /// `POST /api/session/{id}/prompt` — send a plain prompt to a v2 session.
     ///
-    /// Body is exactly `{"text": <text>}`. The response is enveloped in
-    /// `{"data": ...}`. 404 maps to [`OpenCodeError::HttpStatus`], 409 to
-    /// [`OpenCodeError::PromptConflict`].
+    /// Thin wrapper over [`send_prompt_with`](Self::send_prompt_with) that keeps
+    /// the legacy request body (no `resume`/`delivery` keys) and preserves the
+    /// existing 404/409 handling.
     pub async fn send_prompt(
         &self,
         session_id: &str,
         text: &str,
     ) -> Result<PromptReceipt, OpenCodeError> {
+        self.send_prompt_with(session_id, text, true, None).await
+    }
+
+    /// `POST /api/session/{id}/prompt` — send a prompt with resume/delivery
+    /// control. The response is enveloped in `{"data": ...}`.
+    ///
+    /// `resume: false` and an explicit `delivery` are serialized into the
+    /// request body; `resume: true` with no delivery reproduces the legacy
+    /// `{"text": <text>}` body. 404 maps to [`OpenCodeError::HttpStatus`], 409
+    /// to [`OpenCodeError::PromptConflict`].
+    pub async fn send_prompt_with(
+        &self,
+        session_id: &str,
+        text: &str,
+        resume: bool,
+        delivery: Option<Delivery>,
+    ) -> Result<PromptReceipt, OpenCodeError> {
+        let mut body = json!({ "text": text });
+        if !resume || delivery.is_some() {
+            body["resume"] = json!(resume);
+        }
+        if let Some(delivery) = delivery {
+            body["delivery"] = json!(delivery.as_str());
+        }
         let response = self
             .client
             .post(format!(
@@ -289,7 +362,7 @@ impl OpenCodeClient {
                 self.base_url, session_id
             ))
             .header("Authorization", &self.auth_header)
-            .json(&json!({ "text": text }))
+            .json(&body)
             .send()
             .await?;
         let status = response.status().as_u16();
@@ -332,9 +405,8 @@ impl OpenCodeClient {
     /// `GET /api/session/{id}` — fetch a v2 session, unwrapped from the
     /// `{"data": ...}` envelope. 404 maps to `Ok(None)`.
     ///
-    /// Named `get_session_v2` (not `get_session`) because an inherent
-    /// `get_session` would shadow the `ExternalAgent::get_session` trait
-    /// method on `OpenCodeClient` at every method-call site.
+    /// The name (`_v2` suffix) is historical: it was introduced to avoid
+    /// shadowing the now-removed `ExternalAgent::get_session` trait method.
     pub async fn get_session_v2(&self, session_id: &str) -> Result<Option<Session>, OpenCodeError> {
         let response = self
             .client
@@ -378,6 +450,52 @@ impl OpenCodeClient {
         }
         let messages: SessionMessagesResponse = response.json().await?;
         Ok(messages.data)
+    }
+
+    /// `POST /api/session/{id}/interrupt` — interrupt active execution owned by
+    /// this OpenCode process.
+    ///
+    /// Sends the documented `resume=false` query parameter so pending steering
+    /// input is not resumed. A 404 (session already gone) maps to `Ok(())`; the
+    /// documented `{ "interrupted": <bool> }` response is parsed.
+    pub async fn interrupt_session(&self, session_id: &str) -> Result<(), OpenCodeError> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/session/{}/interrupt",
+                self.base_url, session_id
+            ))
+            .header("Authorization", &self.auth_header)
+            .query(&[("resume", "false")])
+            .send()
+            .await?;
+        if response.status().as_u16() == 404 {
+            return Ok(());
+        }
+        if !response.status().is_success() {
+            return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
+        }
+        let _: SessionInterruptResponse = response.json().await?;
+        Ok(())
+    }
+
+    /// `DELETE /api/session/{id}` — delete a session and its child sessions.
+    ///
+    /// A 404 (session already gone) maps to `Ok(())`.
+    pub async fn delete_session(&self, session_id: &str) -> Result<(), OpenCodeError> {
+        let response = self
+            .client
+            .delete(format!("{}/api/session/{}", self.base_url, session_id))
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await?;
+        if response.status().as_u16() == 404 {
+            return Ok(());
+        }
+        if !response.status().is_success() {
+            return Err(OpenCodeError::HttpStatus(response.status().as_u16()));
+        }
+        Ok(())
     }
 }
 
@@ -877,6 +995,189 @@ mod tests {
         server.verify().await;
     }
 
+    // ─── get_active_by_agent ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_active_by_agent_counts_per_agent() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "ses_1": { "type": "running" },
+                    "ses_2": { "type": "running" },
+                    "ses_3": { "type": "running" }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_1", "agent": "git-automate-developer" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_2", "agent": "git-automate-developer" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_3", "agent": "git-automate-triage" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let counts = client.get_active_by_agent().await.unwrap();
+        assert_eq!(counts.get("git-automate-developer"), Some(&2));
+        assert_eq!(counts.get("git-automate-triage"), Some(&1));
+        assert_eq!(counts.len(), 2);
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_active_by_agent_skips_sessions_without_agent() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "ses_1": { "type": "running" },
+                    "ses_2": { "type": "running" }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_1" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_2", "agent": "git-automate-reviewer" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let counts = client.get_active_by_agent().await.unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("git-automate-reviewer"), Some(&1));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_active_by_agent_skips_per_session_fetch_errors() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "ses_ok": { "type": "running" },
+                    "ses_gone": { "type": "running" },
+                    "ses_err": { "type": "running" }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "ses_ok", "agent": "git-automate-qa" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/ses_err"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let counts = client.get_active_by_agent().await.unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("git-automate-qa"), Some(&1));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_active_by_agent_propagates_active_sessions_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/session/active"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let result = client.get_active_by_agent().await;
+        assert!(matches!(
+            result,
+            Err(OpenCodeError::FetchActiveSessions(500))
+        ));
+
+        server.verify().await;
+    }
+
+    // T54: GET /api/session/{id} 500 maps to GetSession error (migrated from
+    // the removed ExternalAgent::get_session test).
+    #[tokio::test]
+    async fn get_session_v2_500_returns_get_session_error() {
+        let mock = Mock::given(method("GET"))
+            .and(path("/api/session/ses_1"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.get_session_v2("ses_1").await;
+        assert!(matches!(result, Err(OpenCodeError::GetSession(_))));
+
+        server.verify().await;
+    }
+
     // ─── v2 API methods (tests 37-47) ───────────────────────────────
 
     /// Matches only when the request body is *exactly* the expected JSON.
@@ -1176,6 +1477,131 @@ mod tests {
         let client = client(&server);
         let wt = client.create_worktree("p1", None).await.unwrap();
         assert_eq!(wt.directory, "/wt/x");
+
+        server.verify().await;
+    }
+
+    // T48: send_prompt_with serializes resume + the steer delivery and
+    // unwraps the receipt envelope.
+    #[tokio::test]
+    async fn send_prompt_with_posts_resume_and_delivery() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/session/ses_1/prompt"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(ExactJsonBody(json!({
+                "text": "fix it",
+                "resume": true,
+                "delivery": "steer"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "msg_2" }
+            })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let receipt = client
+            .send_prompt_with("ses_1", "fix it", true, Some(Delivery::Steer))
+            .await
+            .unwrap();
+        assert_eq!(receipt.id, "msg_2");
+
+        server.verify().await;
+    }
+
+    // T49: send_prompt_with preserves 404 handling and serializes the queue
+    // delivery (with `resume: false`).
+    #[tokio::test]
+    async fn send_prompt_with_404_and_queue_delivery() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/session/gone/prompt"))
+            .and(ExactJsonBody(json!({
+                "text": "hi",
+                "resume": false,
+                "delivery": "queue"
+            })))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client
+            .send_prompt_with("gone", "hi", false, Some(Delivery::Queue))
+            .await;
+        assert!(matches!(result, Err(OpenCodeError::HttpStatus(404))));
+
+        server.verify().await;
+    }
+
+    // T50: interrupt_session sends resume=false and parses the bare response.
+    #[tokio::test]
+    async fn interrupt_session_posts_resume_false_and_parses_response() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/session/ses_1/interrupt"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .and(query_param("resume", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "interrupted": true })))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.interrupt_session("ses_1").await;
+        assert!(result.is_ok());
+
+        server.verify().await;
+    }
+
+    // T51: interrupt_session maps 404 (already gone) to Ok.
+    #[tokio::test]
+    async fn interrupt_session_404_is_ok() {
+        let mock = Mock::given(method("POST"))
+            .and(path("/api/session/gone/interrupt"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.interrupt_session("gone").await;
+        assert!(result.is_ok());
+
+        server.verify().await;
+    }
+
+    // T52: delete_session sends DELETE and treats 204 as Ok.
+    #[tokio::test]
+    async fn delete_session_204_is_ok() {
+        let mock = Mock::given(method("DELETE"))
+            .and(path("/api/session/ses_1"))
+            .and(header("Authorization", "Basic b3BlbmNvZGU6cHc="))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.delete_session("ses_1").await;
+        assert!(result.is_ok());
+
+        server.verify().await;
+    }
+
+    // T53: delete_session maps 404 (already gone) to Ok.
+    #[tokio::test]
+    async fn delete_session_404_is_ok() {
+        let mock = Mock::given(method("DELETE"))
+            .and(path("/api/session/gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1);
+        let server = MockServer::start().await;
+        mock.mount(&server).await;
+
+        let client = client(&server);
+        let result = client.delete_session("gone").await;
+        assert!(result.is_ok());
 
         server.verify().await;
     }

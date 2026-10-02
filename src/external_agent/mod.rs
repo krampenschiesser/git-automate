@@ -1,11 +1,6 @@
-//! External agent module — provider-agnostic abstractions + OpenCode implementation.
+//! External agent module.
 //!
-//! The `common` submodule defines the [`ExternalAgent`] trait, its error type,
-//! and canonical session-info shape — everything provider-agnostic. The
-//! `opencode` submodule provides the concrete `OpenCodeClient` implementation.
+//! The `opencode` submodule provides the [`OpenCodeClient`](opencode::OpenCodeClient)
+//! HTTP client for the OpenCode v2 agent server.
 
-pub mod common;
 pub mod opencode;
-
-// Convenience re-exports for the provider-agnostic abstractions.
-pub use common::{AgentSessionStatus, ExternalAgent, ExternalAgentError, SessionInfo};

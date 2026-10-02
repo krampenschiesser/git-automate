@@ -34,8 +34,12 @@ opencode:
   cwd: /path/to/repo
   project: my-repo
   concurrency:
-    myprovider/slow: 2
-    myprovider/fast: 4
+    git-automate-developer: 2
+    default: 4
+    # Legacy model keys (containing "/") still work, e.g. myprovider/slow: 2
+  sessionTimeoutSecs: 1800
+  sessionMaxSecs: 86400
+  maxSessionAttempts: 3
 git:
   repository: https://github.com/owner/repo
   projectId: 1
@@ -61,7 +65,10 @@ set in the environment take precedence.
 | `opencode.pw`    | yes      | OpenCode server password (use `${env:VAR}`)      |
 | `opencode.cwd`   | yes      | Working directory (existing checkout) for OpenCode agent sessions — **required** |
 | `opencode.project` | yes    | OpenCode project name — **required**             |
-| `opencode.concurrency` | no | Map of model name → max active sessions. When a limit is configured for a model, session creation is skipped if active session count for that model >= limit (default: no limit) |
+| `opencode.concurrency` | no | Map of agent name (e.g. `git-automate-developer`) → max active sessions. A session's own agent key wins, otherwise the `default` key applies; creation is skipped when the active session count for that agent >= the limit. Keys containing `/` are treated as legacy model keys, checked against per-model active counts. (default: no limit) |
+| `opencode.sessionTimeoutSecs` | no | Seconds of inactivity after which a non-active session with no outcome is treated as timed out (default `1800`) |
+| `opencode.sessionMaxSecs` | no | Maximum age of an **active** session before it is interrupted and treated as failed (default `86400`) |
+| `opencode.maxSessionAttempts` | no | Maximum sessions started per workflow step before the item is parked; no new session is created once reached (default `3`) |
 | `repository`     | yes      | GitHub repo URL or `owner/repo` shorthand        |
 | `projectId`      | no       | GitHub Project V2 ID (created automatically if absent) |
 | `directory`      | yes      | Working directory (existing checkout) — **required** |

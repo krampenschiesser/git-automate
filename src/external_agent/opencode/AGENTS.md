@@ -1,14 +1,13 @@
 # OpenCode HTTP Client — AGENTS.md
 
 ## OVERVIEW
-Concrete implementation of the `ExternalAgent` trait against the **OpenCode v2** server API (all routes under `/api/*`). Manages v2 sessions over HTTP — server info/health, location/project resolution, worktree creation, session creation/prompting, and session status/completion.
+Concrete HTTP client (`OpenCodeClient`) for the **OpenCode v2** server API (all routes under `/api/*`). Manages v2 sessions over HTTP — server info/health, location/project resolution, worktree creation, session creation/prompting, and session status/completion.
 
 ## STRUCTURE
 ```
 src/external_agent/opencode/
 ├── mod.rs        Module decls + re-exports
 ├── client.rs     HTTP client (`OpenCodeClient`) + v2 endpoint methods
-├── agent.rs      `impl ExternalAgent for OpenCodeClient` (v2)
 ├── types.rs      Serde v2 response types
 └── api-spec.json Published OpenCode v2 OpenAPI spec ("opencode HttpApi", 113 paths) — reference only, NOT compiled
 ```
@@ -22,16 +21,18 @@ src/external_agent/opencode/
 | Create session | `client.rs` `create_session` | `POST /api/session {title,agent,model?,location:{directory}}` → `{data: Session}` |
 | Send prompt | `client.rs` `send_prompt` | `POST /api/session/{id}/prompt {text}` → 200 admission receipt |
 | Active sessions | `client.rs` `get_active_sessions` | `GET /api/session/active` → running-only map |
+| Per-agent counts | `client.rs` `get_active_by_agent` | active ids → per-id `GET /api/session/{id}` → count by `Session.agent` |
+| Per-model counts | `client.rs` `get_session_models` | active ids → per-id fetch → count by `Session.model` (legacy) |
 | Get session / status | `client.rs` `get_session_v2` | `GET /api/session/{id}`; 404 → `None` |
 | Messages | `client.rs` `get_session_messages` | `GET /api/session/{id}/message` → `{data,cursor}` |
 | Agents | `client.rs` `get_agents` | `GET /api/agent?location[directory]=<dir>` → `{location,data}` |
 | Auth | `client.rs` `encode_basic_auth` | base64(user:pw), username `opencode` |
 
 ## CONVENTIONS
-- **Provider-agnostic trait**: `ExternalAgent` (in `common/mod.rs`) declares `start_session`, `session_status`, `get_session`. `OpenCodeClient` (here) is the concrete impl.
+- **Canonical client**: `OpenCodeClient` (inherent methods) is the single API for production code; the old provider-agnostic `ExternalAgent` trait was removed.
 - **Basic auth unchanged in v2**: `Basic base64("opencode:<pw>")` on every request.
 - **Envelope rule**: session/agent endpoints wrap payloads in `{ "data": ... }`; `GET /api/info`, `GET /api/location`, and `POST /api/worktree` return BARE objects.
-- **Naming**: `get_session_v2` is deliberately NOT named `get_session` — an inherent method with that name would shadow (and change resolution for) the `ExternalAgent::get_session` trait method.
+- **Naming**: the method is `get_session_v2` (kept for historical reasons) — it fetches a single session via `GET /api/session/{id}`.
 - **Named agents**: sessions are created with `agent:"git-automate-<role>"`; the agent must be present in OpenCode (see below). v2 has **no per-session system prompt**.
 - **types.rs**: permissive serde structs — unknown/optional fields are ignored or `Option`, never `deny_unknown_fields`.
 
