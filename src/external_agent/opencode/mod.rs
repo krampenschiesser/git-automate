@@ -1,16 +1,15 @@
-//! OpenCode-specific implementation of the [`ExternalAgent`] trait.
+//! OpenCode v2 HTTP client.
 //!
-//! Provides the `OpenCodeClient` HTTP client, serde response types, and the
-//! `impl ExternalAgent for OpenCodeClient` block. The provider-agnostic trait
-//! and canonical types live in [`crate::external_agent::common`].
+//! Provides [`OpenCodeClient`], serde response types, and the endpoint methods
+//! for the OpenCode v2 server API (all routes under `/api/*`).
 
-pub mod agent;
 pub mod client;
 pub mod types;
 
 // Convenience re-exports
-pub use client::{OpenCodeClient, OpenCodeError, encode_basic_auth};
+pub use client::{Delivery, OpenCodeClient, OpenCodeError, encode_basic_auth};
 pub use types::{
-    Agent, AgentInfo, Cursor, HealthResponse, ModelRef, Session, SessionMessage,
-    SessionMessageInfo, SessionTime, SessionV2Info, SessionsResponse, Workspace, Worktree,
+    ActiveSessionEntry, Agent, AgentMode, AssistantContent, Cursor, Data, LocationInfo,
+    LocationProject, LocationRef, ModelRef, PromptReceipt, ServerInfo, ServerInfoPaths, Session,
+    SessionMessage, SessionMessagesResponse, SessionOutcome, SessionTime, WorktreeInfo,
 };

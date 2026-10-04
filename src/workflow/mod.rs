@@ -2,11 +2,13 @@
 //!
 //! The [`Workflow`] struct ties together all workflow checks in sequence:
 //! setup → opencode → triage → todo → review. Each public `run_*_check`
-//! method wraps per-project work in error isolation (errors are logged,
-//! never propagated).
+//! method wraps per-project work in error isolation (errors are logged and
+//! swallowed), except [`WorkflowError::ConcurrencyExceeded`], which is
+//! re-raised so [`Workflow::run_all`] can break out of the cycle.
 
 pub mod checks;
 pub mod helpers;
+pub mod verdict;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -16,8 +18,9 @@ use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::ParsedRepo;
 
 use self::checks::{
-    OPENCODE_HEALTHY_LOGGED, OPENCODE_UNHEALTHY_LOGGED, OpencodeSessionConfig, run_review_check,
-    run_todo_check, run_triage_check, run_triage_completion_check,
+    OPENCODE_HEALTHY_LOGGED, OPENCODE_UNHEALTHY_LOGGED, OpencodeSessionConfig,
+    run_dev_completion_check, run_review_check, run_todo_check, run_triage_check,
+    run_triage_completion_check,
 };
 use self::helpers::{
     LogLevel, WorkflowContext, WorkflowError, log_deduped, resolve_context,
@@ -137,18 +140,20 @@ pub enum WorkflowStep {
     Triage,
     TriageCompletion,
     Todo,
+    DevCompletion,
     Review,
 }
 
 impl WorkflowStep {
     /// All workflow steps in execution order.
-    pub fn all() -> [WorkflowStep; 6] {
+    pub fn all() -> [WorkflowStep; 7] {
         [
             WorkflowStep::Setup,
             WorkflowStep::OpencodeCheck,
             WorkflowStep::Triage,
             WorkflowStep::TriageCompletion,
             WorkflowStep::Todo,
+            WorkflowStep::DevCompletion,
             WorkflowStep::Review,
         ]
     }
@@ -159,6 +164,7 @@ impl WorkflowStep {
             WorkflowStep::OpencodeCheck => "opencode",
             WorkflowStep::Triage => "triage",
             WorkflowStep::Todo => "todo",
+            WorkflowStep::DevCompletion => "dev_completion",
             WorkflowStep::Review => "review",
             WorkflowStep::TriageCompletion => "triage_completion",
         }
@@ -172,6 +178,7 @@ impl WorkflowStep {
             WorkflowStep::Triage => workflow.run_triage_check().await,
             WorkflowStep::TriageCompletion => workflow.run_triage_completion_check().await,
             WorkflowStep::Todo => workflow.run_todo_check().await,
+            WorkflowStep::DevCompletion => workflow.run_dev_completion_check().await,
             WorkflowStep::Review => workflow.run_review_check().await,
         }
     }
@@ -195,7 +202,9 @@ impl Workflow {
     /// Run all checks in order: setup → opencode → triage → todo → review.
     ///
     /// Each sub-check catches and logs its own errors internally, so this
-    /// method always returns `Ok(())`.
+    /// method always returns `Ok(())`. When a sub-check re-raises
+    /// [`WorkflowError::ConcurrencyExceeded`], the remaining steps are skipped
+    /// for this cycle (the next poll retries).
     pub async fn run_all(&self) -> Result<(), WorkflowError> {
         for step in WorkflowStep::all() {
             match step.run(self).await {
@@ -308,6 +317,9 @@ impl Workflow {
                 format!("Triage check failed for {}: {}", project_name, e),
             )
             .await;
+            if matches!(&e, WorkflowError::ConcurrencyExceeded) {
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -334,6 +346,9 @@ impl Workflow {
         .await;
         if let Err(e) = result {
             tracing::error!("Triage completion check failed for {}: {}", project_name, e);
+            if matches!(&e, WorkflowError::ConcurrencyExceeded) {
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -372,6 +387,50 @@ impl Workflow {
                 format!("Todo check failed for {}: {}", project_name, e),
             )
             .await;
+            if matches!(&e, WorkflowError::ConcurrencyExceeded) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// For each project with an OpenCode config: resolve context, then run
+    /// the dev completion check (completed developer sessions → Review Technical).
+    pub async fn run_dev_completion_check(&self) -> Result<(), WorkflowError> {
+        let Some(_github) = self.deps.github.as_ref() else {
+            log_deduped(
+                &self.deps.log_dedup,
+                "dev_completion",
+                LogLevel::Warn,
+                "GitHub client not available — skipping dev completion check".to_string(),
+            )
+            .await;
+            return Ok(());
+        };
+
+        if self.deps.config.opencode.is_none() {
+            return Ok(());
+        }
+
+        let git = &self.deps.config.git;
+        let project_name = Self::derive_project_name(git);
+        let result = async {
+            let ctx = resolve_context(&self.deps.context_deps(), &project_name, git).await?;
+            let oc = self.opencode_config(git);
+            run_dev_completion_check(&self.deps, &ctx, &oc).await
+        }
+        .await;
+        if let Err(e) = result {
+            log_deduped(
+                &self.deps.log_dedup,
+                "dev_completion",
+                LogLevel::Error,
+                format!("Dev completion check failed for {}: {}", project_name, e),
+            )
+            .await;
+            if matches!(&e, WorkflowError::ConcurrencyExceeded) {
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -410,6 +469,9 @@ impl Workflow {
                 format!("Review check failed for {}: {}", project_name, e),
             )
             .await;
+            if matches!(&e, WorkflowError::ConcurrencyExceeded) {
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -463,6 +525,9 @@ impl Workflow {
             directory: opencode.cwd.clone(),
             project: Some(opencode.project.clone()),
             concurrency: opencode.concurrency.clone(),
+            session_timeout_secs: opencode.session_timeout_secs,
+            session_max_secs: opencode.session_max_secs,
+            max_session_attempts: opencode.max_session_attempts,
         }
     }
 
@@ -617,6 +682,31 @@ mod tests {
     }
 
     // ── Constants tests ───────────────────────────────────────
+
+    // ── WorkflowStep ordering / dispatch (C1) ─────────────────
+
+    #[test]
+    fn workflow_step_order_includes_dev_completion() {
+        assert_eq!(
+            WorkflowStep::all().map(|s| s.name()),
+            [
+                "setup",
+                "opencode",
+                "triage",
+                "triage_completion",
+                "todo",
+                "dev_completion",
+                "review",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_completion_step_dispatches() {
+        let workflow = Workflow::new(make_deps(None));
+        let result = WorkflowStep::DevCompletion.run(&workflow).await;
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn required_agents_matches_ts() {
@@ -1438,10 +1528,12 @@ mod tests {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/global/health"))
+            .and(path("/api/info"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": true,
-                "version": "1.0.0"
+                "version": "2.0.18",
+                "pid": 47234,
+                "urls": ["http://127.0.0.1:4096"],
+                "paths": { "tmp": "/tmp/opencode" }
             })))
             .expect(1)
             .mount(&mock)
@@ -1453,6 +1545,9 @@ mod tests {
             directory: "/test-work".to_string(),
             project: None,
             concurrency: HashMap::new(),
+            session_timeout_secs: 1800,
+            session_max_secs: 86400,
+            max_session_attempts: 3,
         };
 
         let deps = make_deps(None);
@@ -1470,11 +1565,8 @@ mod tests {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": false,
-                "version": "1.0.0"
-            })))
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&mock)
             .await;
@@ -1485,6 +1577,9 @@ mod tests {
             directory: "/test-work".to_string(),
             project: None,
             concurrency: HashMap::new(),
+            session_timeout_secs: 1800,
+            session_max_secs: 86400,
+            max_session_attempts: 3,
         };
 
         let deps = make_deps(None);
@@ -1515,11 +1610,8 @@ mod tests {
 
         // OpenCode health endpoint returns unhealthy
         Mock::given(method("GET"))
-            .and(path("/global/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "healthy": false,
-                "version": "1.0.0"
-            })))
+            .and(path("/api/info"))
+            .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&oc_mock)
             .await;
@@ -1597,6 +1689,9 @@ mod tests {
                     cwd: "/test-work".to_string(),
                     project: "test-project".to_string(),
                     concurrency: HashMap::new(),
+                    session_timeout_secs: 1800,
+                    session_max_secs: 86400,
+                    max_session_attempts: 3,
                 }),
             },
             github: Some(client),

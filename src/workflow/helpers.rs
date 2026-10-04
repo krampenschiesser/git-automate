@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use super::WorkflowStatus;
 use crate::config::{GitAutomateConfig, GitSection};
+use crate::external_agent::opencode::types::{Session, SessionOutcome};
 use crate::external_issues::github::client::{GitHubClient, GitHubError};
 use crate::external_issues::github::repo::parse_repository_url;
 use crate::external_issues::github::types::{IssueInfo, ParsedRepo, StatusOption};
@@ -35,6 +36,10 @@ const REPO_AGENT_SUBDIR: &str = ".agents/git-automate/agents";
 
 /// Subdirectory under $HOME for global agent/prompt overrides.
 const CONFIG_AGENT_SUBDIR: &str = ".config/git-automate/agents";
+
+/// Subdirectory (under the config home) where OpenCode v2 discovers global
+/// agent definitions.
+const OPENCODE_AGENTS_SUBDIR: &str = "opencode/agents";
 
 // ─── Error type ───────────────────────────────────────────────
 
@@ -184,30 +189,6 @@ pub fn load_prompt_template(name: &str, repo_dir: Option<&Path>) -> Result<Strin
     embedded_prompt(name).map(String::from)
 }
 
-/// Load an agent definition with 3-level priority:
-/// 1. Repo-local: `{repo_dir}/.agents/git-automate/agents/{name}.agent.md`
-/// 2. Config dir: `$HOME/.config/git-automate/agents/{name}.agent.md`
-/// 3. Embedded (compile-time `include_str!`)
-///
-/// Mirrors [`load_prompt_template`] but reads from `src/assets/agents/`.
-///
-/// # Errors
-/// Returns `WorkflowError::TemplateNotFound` for unknown names.
-pub fn load_agent_template(name: &str, repo_dir: Option<&Path>) -> Result<String, WorkflowError> {
-    if let Some(repo) = repo_dir {
-        let path = repo
-            .join(REPO_AGENT_SUBDIR)
-            .join(format!("{name}.agent.md"));
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            return Ok(content);
-        }
-    }
-    if let Ok(content) = read_from_config_dir(CONFIG_AGENT_SUBDIR, name, "agent.md") {
-        return Ok(content);
-    }
-    embedded_agent(name).map(String::from)
-}
-
 /// Read a file from `$HOME/.config/git-automate/{dir}/{name}.{ext}`.
 fn read_from_config_dir(dir: &str, name: &str, ext: &str) -> Result<String, WorkflowError> {
     let home = env::var("HOME").unwrap_or_default();
@@ -251,18 +232,23 @@ fn embedded_prompt(name: &str) -> Result<&'static str, WorkflowError> {
     }
 }
 
-/// Ensure all required agent files are installed under `$HOME/.config/git-automate/agents/`.
+/// Ensure all required agent definitions are installed for OpenCode v2.
 ///
-/// Creates the directory if missing and writes each embedded agent file only
-/// when it does not already exist (never overwrites user overrides).
+/// OpenCode v2 derives an agent id from the filename minus `.md`, so each agent
+/// is written as `<id>.md` (e.g. `git-automate-triage.md`) under the global
+/// agents directory `$XDG_CONFIG_HOME/opencode/agents` (default
+/// `~/.config/opencode/agents`). Existing files are never overwritten.
 pub fn ensure_agents_installed() -> Result<(), WorkflowError> {
-    let home = env::var("HOME").unwrap_or_default();
-    let agents_dir = PathBuf::from(home).join(CONFIG_AGENT_SUBDIR);
+    let config_home = env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".config"));
+    let agents_dir = config_home.join(OPENCODE_AGENTS_SUBDIR);
     std::fs::create_dir_all(&agents_dir)?;
 
     for agent in &crate::workflow::REQUIRED_AGENTS {
-        let file_name = agent.as_file_name();
-        let path = agents_dir.join(file_name);
+        let path = agents_dir.join(format!("{}.md", agent.as_str()));
         if path.exists() {
             continue;
         }
@@ -303,6 +289,89 @@ pub fn extract_session_id(field_values: &BTreeMap<String, Option<String>>) -> Op
         .map(String::from)
 }
 
+// ─── Session binding ──────────────────────────────────────────
+
+/// Ownership record persisted in the project's `sessionId` text field.
+///
+/// Encodes which workflow step owns a tracked OpenCode session so that a
+/// completed or failed session can only be acted upon by the step that started
+/// it. Persisted as `;`-separated `k=v` pairs:
+/// `step=<Status>;id=<session_id>;resume=<session_id_or_empty>;attempts=<u32>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBinding {
+    /// Owning workflow status (e.g. `"Triage"`, `"In Development"`). `None` for
+    /// legacy bare-id values written before bindings existed.
+    pub step: Option<String>,
+    /// OpenCode session id. May be empty when no session is recorded.
+    pub id: String,
+    /// Session id to resume from (reserved for a later phase; always empty now).
+    pub resume: String,
+    /// Number of sessions started for this step.
+    pub attempts: u32,
+}
+
+impl SessionBinding {
+    /// True when a tracked OpenCode session id is associated with this binding.
+    /// A binding that only names a step (e.g. the `Todo` degrade state) counts
+    /// as having no session.
+    pub fn has_session(&self) -> bool {
+        !self.id.is_empty()
+    }
+}
+
+/// Parse a raw `sessionId` cell into a [`SessionBinding`], tolerating any input.
+///
+/// A value with no `=` at all is treated as a legacy bare session id. Unknown
+/// keys and tokens without `=` are ignored; a non-numeric `attempts` value
+/// becomes `0`. This function never panics.
+pub fn parse_session_binding(raw: &str) -> SessionBinding {
+    let raw = raw.trim();
+    let mut binding = SessionBinding {
+        step: None,
+        id: String::new(),
+        resume: String::new(),
+        attempts: 0,
+    };
+
+    if raw.is_empty() {
+        return binding;
+    }
+
+    // Legacy bare session id: no `k=v` structure anywhere.
+    if !raw.contains('=') {
+        binding.id = raw.to_string();
+        return binding;
+    }
+
+    for pair in raw.split(';') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "step" if !value.is_empty() => binding.step = Some(value.to_string()),
+            "id" => binding.id = value.to_string(),
+            "resume" => binding.resume = value.to_string(),
+            "attempts" => binding.attempts = value.parse::<u32>().unwrap_or(0),
+            _ => {}
+        }
+    }
+
+    binding
+}
+
+/// Serialize a [`SessionBinding`] back into the `sessionId` field format.
+pub fn serialize_binding(binding: &SessionBinding) -> String {
+    format!(
+        "step={};id={};resume={};attempts={}",
+        binding.step.as_deref().unwrap_or(""),
+        binding.id,
+        binding.resume,
+        binding.attempts
+    )
+}
+
 /// Extract thread IDs from the `### Resolve threads` section in session messages.
 ///
 /// Looks for a markdown heading `### Resolve threads` followed by a line
@@ -330,6 +399,90 @@ pub fn parse_resolve_threads(messages: &[String]) -> Vec<String> {
     }
 
     Vec::new()
+}
+
+// ─── Session completion ───────────────────────────────────────
+
+/// Terminal-state decision for a tracked OpenCode session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCompletion {
+    /// Session finished successfully — safe to parse its output.
+    Succeeded,
+    /// Session terminated abnormally (reason: "failed" | "interrupted" | "not-found").
+    /// Callers MUST NOT parse output; they reset/retry instead.
+    Failed(&'static str),
+    /// Still running, or finished-without-terminal-marker yet — do nothing this cycle.
+    Waiting,
+}
+
+/// Wall-clock unix time in seconds (fractional), or `0.0` if the system clock
+/// is before the epoch.
+pub fn now_unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Most recent activity timestamp for a session:
+/// `max(time.created, time.updated)`. `None` when neither timestamp exists.
+fn last_activity(session: Option<&Session>) -> Option<f64> {
+    let time = session?.time.as_ref()?;
+    match (time.created, time.updated) {
+        (Some(created), Some(updated)) => Some(created.max(updated)),
+        (Some(created), None) => Some(created),
+        (None, Some(updated)) => Some(updated),
+        (None, None) => None,
+    }
+}
+
+/// Decide a session's state with wall-clock aging.
+///
+/// - `is_active`: `Failed("timeout")` once `now_unix - last_activity > max_secs`,
+///   otherwise `Waiting` (also `Waiting` when no activity timestamp exists).
+/// - not active + `None` (404) -> `Failed("not-found")`.
+/// - outcome `succeeded` -> `Succeeded`; `failed`/`interrupted` -> `Failed(..)`.
+/// - no outcome but `time.idle` present -> `Succeeded`.
+/// - no outcome and no idle: `Failed("timeout")` once
+///   `now_unix - last_activity > timeout_secs`, otherwise `Waiting`.
+pub fn classify_session(
+    is_active: bool,
+    session: Option<&Session>,
+    now_unix: f64,
+    timeout_secs: u64,
+    max_secs: u64,
+) -> SessionCompletion {
+    if is_active {
+        return match last_activity(session) {
+            Some(last) if now_unix - last > max_secs as f64 => SessionCompletion::Failed("timeout"),
+            _ => SessionCompletion::Waiting,
+        };
+    }
+
+    let Some(session) = session else {
+        return SessionCompletion::Failed("not-found");
+    };
+
+    match session.outcome {
+        Some(SessionOutcome::Succeeded) => SessionCompletion::Succeeded,
+        Some(SessionOutcome::Failed) => SessionCompletion::Failed("failed"),
+        Some(SessionOutcome::Interrupted) => SessionCompletion::Failed("interrupted"),
+        None => match session.time.as_ref().and_then(|t| t.idle) {
+            Some(_) => SessionCompletion::Succeeded,
+            None => match last_activity(Some(session)) {
+                Some(last) if now_unix - last > timeout_secs as f64 => {
+                    SessionCompletion::Failed("timeout")
+                }
+                _ => SessionCompletion::Waiting,
+            },
+        },
+    }
+}
+
+/// Decide a session's state without aging — thin wrapper over
+/// [`classify_session`] with `u64::MAX` timeouts so a session never expires.
+pub fn session_completion(is_active: bool, session: Option<&Session>) -> SessionCompletion {
+    classify_session(is_active, session, 0.0, u64::MAX, u64::MAX)
 }
 
 // ─── Branch naming ─────────────────────────────────────────────
@@ -784,6 +937,64 @@ mod tests {
     use super::*;
     use std::env;
 
+    /// Serializes tests that mutate $HOME to avoid interference with other tests.
+    static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    // ── SessionBinding tests ───────────────────────────────────
+
+    // T1: serialize → parse roundtrip preserves all fields
+    #[test]
+    fn session_binding_roundtrip() {
+        let binding = SessionBinding {
+            step: Some("In Development".to_string()),
+            id: "ses_123".to_string(),
+            resume: String::new(),
+            attempts: 3,
+        };
+        let raw = serialize_binding(&binding);
+        assert_eq!(parse_session_binding(&raw), binding);
+    }
+
+    // T2: legacy bare session id parses with step None
+    #[test]
+    fn session_binding_legacy_bare_id() {
+        let binding = parse_session_binding("ses_abc");
+        assert_eq!(binding.step, None);
+        assert_eq!(binding.id, "ses_abc");
+        assert_eq!(binding.resume, "");
+        assert_eq!(binding.attempts, 0);
+        assert!(binding.has_session());
+    }
+
+    // T3: malformed / partial input is tolerated without panicking
+    #[test]
+    fn session_binding_malformed_is_tolerated() {
+        let empty = parse_session_binding("");
+        assert_eq!(empty.step, None);
+        assert_eq!(empty.id, "");
+        assert_eq!(empty.attempts, 0);
+        assert!(!empty.has_session());
+
+        let weird = parse_session_binding("step=Triage;id;attempts=abc;=x;foo=bar");
+        assert_eq!(weird.step.as_deref(), Some("Triage"));
+        assert_eq!(weird.id, "");
+        assert_eq!(weird.attempts, 0);
+
+        let no_eq = parse_session_binding("garbage");
+        assert_eq!(no_eq.id, "garbage");
+        assert_eq!(no_eq.attempts, 0);
+    }
+
+    // T4: unknown keys ignored and any key order accepted
+    #[test]
+    fn session_binding_unknown_keys_and_order() {
+        let binding = parse_session_binding("attempts=7;zzz=1;id=ses_9;step=Todo;resume=");
+        assert_eq!(binding.step.as_deref(), Some("Todo"));
+        assert_eq!(binding.id, "ses_9");
+        assert_eq!(binding.attempts, 7);
+    }
+
     // ── resolve_option_id tests ────────────────────────────────
 
     // Test 1: resolve_option_id with matching name → Some(id)
@@ -819,6 +1030,7 @@ mod tests {
     // Test 3: load_prompt_template("triage") → returns content containing {{ISSUE_TITLE}}
     #[test]
     fn load_prompt_template_triage() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let content = load_prompt_template("triage", None).expect("triage template should load");
         assert!(
             content.contains("{{ISSUE_TITLE}}"),
@@ -829,33 +1041,8 @@ mod tests {
     // Test 4: load_prompt_template("nonexistent") → Err(TemplateNotFound)
     #[test]
     fn load_prompt_template_nonexistent() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let result = load_prompt_template("nonexistent", None);
-        assert!(matches!(
-            result,
-            Err(WorkflowError::TemplateNotFound(name)) if name == "nonexistent"
-        ));
-    }
-
-    // ── load_agent_template tests ──────────────────────────────
-
-    // Test 5: load_agent_template("triage") → returns content containing YAML frontmatter
-    #[test]
-    fn load_agent_template_triage() {
-        let content = load_agent_template("triage", None).expect("triage agent should load");
-        assert!(
-            content.contains("git-automate-triage"),
-            "triage agent should contain its name"
-        );
-        assert!(
-            content.contains("subagent"),
-            "triage agent should contain mode: subagent"
-        );
-    }
-
-    // Test 6: load_agent_template("nonexistent") → Err(TemplateNotFound)
-    #[test]
-    fn load_agent_template_nonexistent() {
-        let result = load_agent_template("nonexistent", None);
         assert!(matches!(
             result,
             Err(WorkflowError::TemplateNotFound(name)) if name == "nonexistent"
@@ -1068,6 +1255,7 @@ mod tests {
 
     #[test]
     fn load_prompt_template_all_templates() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         for name in &[
             "triage",
             "taskmanager",
@@ -1081,15 +1269,12 @@ mod tests {
         }
     }
 
-    // ── Priority resolution tests for load_prompt_template / load_agent_template ──
-
-    /// Serializes tests that mutate $HOME to avoid interference with other tests.
-    static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    // ── Priority resolution tests for load_prompt_template ─────
 
     // Test: load_prompt_template with repo-local file → returns repo-local content
     #[test]
     fn load_prompt_template_repo_local_priority() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp
             .path()
@@ -1101,22 +1286,6 @@ mod tests {
 
         let result = load_prompt_template("triage", Some(tmp.path())).unwrap();
         assert_eq!(result, "REPO-LOCAL-PROMPT");
-    }
-
-    // Test: load_agent_template with repo-local file → returns repo-local content
-    #[test]
-    fn load_agent_template_repo_local_priority() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp
-            .path()
-            .join(".agents")
-            .join("git-automate")
-            .join("agents");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("triage.agent.md"), "REPO-LOCAL-AGENT").unwrap();
-
-        let result = load_agent_template("triage", Some(tmp.path())).unwrap();
-        assert_eq!(result, "REPO-LOCAL-AGENT");
     }
 
     // Test: load_prompt_template with config dir file (no repo-local) → returns config content
@@ -1139,38 +1308,6 @@ mod tests {
 
         let result = load_prompt_template("triage", None).unwrap();
         assert_eq!(result, "CONFIG-PROMPT");
-
-        if let Some(h) = original_home {
-            unsafe {
-                env::set_var("HOME", h);
-            }
-        } else {
-            unsafe {
-                env::remove_var("HOME");
-            }
-        }
-    }
-
-    // Test: load_agent_template with config dir file (no repo-local) → returns config content
-    #[test]
-    fn load_agent_template_config_dir_fallback() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let original_home = env::var("HOME").ok();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
-
-        let config_dir = tmp
-            .path()
-            .join(".config")
-            .join("git-automate")
-            .join("agents");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(config_dir.join("triage.agent.md"), "CONFIG-AGENT").unwrap();
-
-        let result = load_agent_template("triage", None).unwrap();
-        assert_eq!(result, "CONFIG-AGENT");
 
         if let Some(h) = original_home {
             unsafe {
@@ -1211,36 +1348,10 @@ mod tests {
         }
     }
 
-    // Test: load_agent_template with no files on disk → returns embedded content
-    #[test]
-    fn load_agent_template_embedded_fallback() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let original_home = env::var("HOME").ok();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
-
-        let result = load_agent_template("triage", None).unwrap();
-        assert!(
-            result.contains("git-automate-triage"),
-            "embedded triage agent should contain its name"
-        );
-
-        if let Some(h) = original_home {
-            unsafe {
-                env::set_var("HOME", h);
-            }
-        } else {
-            unsafe {
-                env::remove_var("HOME");
-            }
-        }
-    }
-
     // Test: load_prompt_template nonexistent with repo_dir → errors even if files exist elsewhere
     #[test]
     fn load_prompt_template_nonexistent_with_repo_dir() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let result = load_prompt_template("nonexistent", Some(tmp.path()));
         assert!(matches!(
@@ -1249,28 +1360,26 @@ mod tests {
         ));
     }
 
-    // Test: ensure_agents_installed creates dir and writes all missing agent files
+    // Test: ensure_agents_installed creates the v2 agents dir and writes all missing agent files
     #[test]
     fn ensure_agents_installed_creates_dir_and_writes_missing() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let original_home = env::var("HOME").ok();
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
             env::set_var("HOME", tmp.path());
+            env::remove_var("XDG_CONFIG_HOME");
         }
 
         let result = ensure_agents_installed();
         assert!(result.is_ok(), "ensure_agents_installed should succeed");
 
-        let agents_dir = tmp
-            .path()
-            .join(".config")
-            .join("git-automate")
-            .join("agents");
+        let agents_dir = tmp.path().join(".config").join("opencode").join("agents");
         assert!(agents_dir.exists(), "agents dir should exist");
 
         for agent in &crate::workflow::REQUIRED_AGENTS {
-            let path = agents_dir.join(agent.as_file_name());
+            let path = agents_dir.join(format!("{}.md", agent.as_str()));
             assert!(path.exists(), "agent file {} should exist", path.display());
         }
 
@@ -1283,6 +1392,15 @@ mod tests {
                 env::remove_var("HOME");
             }
         }
+        if let Some(x) = original_xdg {
+            unsafe {
+                env::set_var("XDG_CONFIG_HOME", x);
+            }
+        } else {
+            unsafe {
+                env::remove_var("XDG_CONFIG_HOME");
+            }
+        }
     }
 
     // Test: ensure_agents_installed does NOT overwrite existing files
@@ -1290,28 +1408,21 @@ mod tests {
     fn ensure_agents_installed_does_not_overwrite_existing() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let original_home = env::var("HOME").ok();
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
             env::set_var("HOME", tmp.path());
+            env::remove_var("XDG_CONFIG_HOME");
         }
 
-        let agents_dir = tmp
-            .path()
-            .join(".config")
-            .join("git-automate")
-            .join("agents");
+        let agents_dir = tmp.path().join(".config").join("opencode").join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(
-            agents_dir.join("git-automate-triage.agent.md"),
-            "CUSTOM-CONTENT",
-        )
-        .unwrap();
+        std::fs::write(agents_dir.join("git-automate-triage.md"), "CUSTOM-CONTENT").unwrap();
 
         let result = ensure_agents_installed();
         assert!(result.is_ok());
 
-        let content =
-            std::fs::read_to_string(agents_dir.join("git-automate-triage.agent.md")).unwrap();
+        let content = std::fs::read_to_string(agents_dir.join("git-automate-triage.md")).unwrap();
         assert_eq!(
             content, "CUSTOM-CONTENT",
             "existing file should not be overwritten"
@@ -1324,6 +1435,15 @@ mod tests {
         } else {
             unsafe {
                 env::remove_var("HOME");
+            }
+        }
+        if let Some(x) = original_xdg {
+            unsafe {
+                env::set_var("XDG_CONFIG_HOME", x);
+            }
+        } else {
+            unsafe {
+                env::remove_var("XDG_CONFIG_HOME");
             }
         }
     }
@@ -2734,5 +2854,226 @@ mod tests {
         };
         let result = branch_name_for_issue(123, &git, None);
         assert_eq!(result, "issue-123");
+    }
+
+    // ── session_completion tests ─────────────────────────────────
+
+    /// Build a `Session` from a JSON value, as returned by the API.
+    fn session_info(value: Value) -> Session {
+        serde_json::from_value(value).expect("test session JSON should deserialize")
+    }
+
+    #[test]
+    fn session_completion_table() {
+        let active = session_info(json!({ "id": "s1" }));
+        let succeeded = session_info(json!({ "id": "s1", "outcome": "succeeded" }));
+        let failed = session_info(json!({ "id": "s1", "outcome": "failed" }));
+        let interrupted = session_info(json!({ "id": "s1", "outcome": "interrupted" }));
+        let idle = session_info(json!({ "id": "s1", "time": { "idle": 1.5 } }));
+        let time_empty = session_info(json!({ "id": "s1", "time": {} }));
+        let no_time = session_info(json!({ "id": "s1" }));
+
+        let cases: Vec<(&str, bool, Option<&Session>, SessionCompletion)> = vec![
+            (
+                "active session",
+                true,
+                Some(&active),
+                SessionCompletion::Waiting,
+            ),
+            (
+                "404 (None)",
+                false,
+                None,
+                SessionCompletion::Failed("not-found"),
+            ),
+            (
+                "outcome succeeded",
+                false,
+                Some(&succeeded),
+                SessionCompletion::Succeeded,
+            ),
+            (
+                "outcome failed",
+                false,
+                Some(&failed),
+                SessionCompletion::Failed("failed"),
+            ),
+            (
+                "outcome interrupted",
+                false,
+                Some(&interrupted),
+                SessionCompletion::Failed("interrupted"),
+            ),
+            (
+                "idle marker",
+                false,
+                Some(&idle),
+                SessionCompletion::Succeeded,
+            ),
+            (
+                "time present but no marker",
+                false,
+                Some(&time_empty),
+                SessionCompletion::Waiting,
+            ),
+            ("no time", false, Some(&no_time), SessionCompletion::Waiting),
+        ];
+
+        for (name, is_active, session, expected) in cases {
+            assert_eq!(
+                session_completion(is_active, session),
+                expected,
+                "case: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_completion_active_is_waiting() {
+        let session = session_info(json!({ "id": "s1" }));
+        assert_eq!(
+            session_completion(true, Some(&session)),
+            SessionCompletion::Waiting
+        );
+    }
+
+    #[test]
+    fn session_completion_none_is_not_found() {
+        assert_eq!(
+            session_completion(false, None),
+            SessionCompletion::Failed("not-found")
+        );
+    }
+
+    #[test]
+    fn session_completion_outcome_succeeded() {
+        let session = session_info(json!({ "id": "s1", "outcome": "succeeded" }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Succeeded
+        );
+    }
+
+    #[test]
+    fn session_completion_outcome_failed() {
+        let session = session_info(json!({ "id": "s1", "outcome": "failed" }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Failed("failed")
+        );
+    }
+
+    #[test]
+    fn session_completion_outcome_interrupted() {
+        let session = session_info(json!({ "id": "s1", "outcome": "interrupted" }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Failed("interrupted")
+        );
+    }
+
+    #[test]
+    fn session_completion_idle_is_succeeded() {
+        let session = session_info(json!({ "id": "s1", "time": { "idle": 1.5 } }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Succeeded
+        );
+    }
+
+    #[test]
+    fn session_completion_time_without_idle_is_waiting() {
+        let session = session_info(json!({ "id": "s1", "time": {} }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Waiting
+        );
+    }
+
+    #[test]
+    fn session_completion_no_time_is_waiting() {
+        let session = session_info(json!({ "id": "s1" }));
+        assert_eq!(
+            session_completion(false, Some(&session)),
+            SessionCompletion::Waiting
+        );
+    }
+
+    // T50: aging fires only strictly past timeout_secs.
+    #[test]
+    fn classify_session_inactive_timeout_boundary() {
+        let session =
+            session_info(json!({ "id": "s1", "time": { "created": 100, "updated": 1000 } }));
+
+        assert_eq!(
+            classify_session(false, Some(&session), 1005.0, 5, u64::MAX),
+            SessionCompletion::Waiting
+        );
+        assert_eq!(
+            classify_session(false, Some(&session), 1006.0, 5, u64::MAX),
+            SessionCompletion::Failed("timeout")
+        );
+    }
+
+    // T51: last_activity uses max(created, updated), not the older value.
+    #[test]
+    fn classify_session_inactive_uses_max_of_created_and_updated() {
+        let session =
+            session_info(json!({ "id": "s1", "time": { "created": 1000, "updated": 100 } }));
+        assert_eq!(
+            classify_session(false, Some(&session), 1005.0, 50, u64::MAX),
+            SessionCompletion::Waiting
+        );
+    }
+
+    // T52: an active session ages out against max_secs.
+    #[test]
+    fn classify_session_active_max_secs_aging() {
+        let session =
+            session_info(json!({ "id": "s1", "time": { "created": 1000, "updated": 2000 } }));
+        assert_eq!(
+            classify_session(true, Some(&session), 32001.0, 1800, 30000),
+            SessionCompletion::Failed("timeout")
+        );
+        assert_eq!(
+            classify_session(true, Some(&session), 32000.0, 1800, 30000),
+            SessionCompletion::Waiting
+        );
+    }
+
+    // T53: missing timestamps never age out.
+    #[test]
+    fn classify_session_missing_timestamps_is_waiting() {
+        let no_time = session_info(json!({ "id": "s1" }));
+        assert_eq!(
+            classify_session(true, Some(&no_time), 1.0e12, 1, 0),
+            SessionCompletion::Waiting
+        );
+        assert_eq!(
+            classify_session(false, Some(&no_time), 1.0e12, 1, 0),
+            SessionCompletion::Waiting
+        );
+    }
+
+    // T54: terminal markers win regardless of age and 404 stays not-found.
+    #[test]
+    fn classify_session_outcome_and_idle_take_precedence() {
+        let succeeded =
+            session_info(json!({ "id": "s1", "outcome": "succeeded", "time": { "created": 1 } }));
+        assert_eq!(
+            classify_session(false, Some(&succeeded), 1.0e12, 1, 1),
+            SessionCompletion::Succeeded
+        );
+
+        let idle = session_info(json!({ "id": "s1", "time": { "idle": 1, "created": 1 } }));
+        assert_eq!(
+            classify_session(false, Some(&idle), 1.0e12, 1, 1),
+            SessionCompletion::Succeeded
+        );
+
+        assert_eq!(
+            classify_session(false, None, 0.0, 1, 1),
+            SessionCompletion::Failed("not-found")
+        );
     }
 }

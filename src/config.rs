@@ -26,6 +26,36 @@ pub struct OpencodeConfig {
     pub project: String,
     #[serde(default)]
     pub concurrency: HashMap<String, usize>,
+    #[serde(
+        rename = "sessionTimeoutSecs",
+        alias = "session_timeout_secs",
+        default = "default_session_timeout_secs"
+    )]
+    pub session_timeout_secs: u64,
+    #[serde(
+        rename = "sessionMaxSecs",
+        alias = "session_max_secs",
+        default = "default_session_max_secs"
+    )]
+    pub session_max_secs: u64,
+    #[serde(
+        rename = "maxSessionAttempts",
+        alias = "max_session_attempts",
+        default = "default_max_session_attempts"
+    )]
+    pub max_session_attempts: u32,
+}
+
+fn default_session_timeout_secs() -> u64 {
+    1800
+}
+
+fn default_session_max_secs() -> u64 {
+    86400
+}
+
+fn default_max_session_attempts() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -482,6 +512,36 @@ git:
         assert_eq!(oc.concurrency.get("myprovider/fast"), Some(&4));
     }
 
+    // Test: parse_config with agent-keyed concurrency (plus `default` and a
+    // legacy model key) → hashmap with all entries preserved.
+    #[test]
+    fn parse_config_opencode_concurrency_agent_keys() {
+        let yaml = r#"
+opencode:
+  url: http://localhost:8081
+  pw: secret
+  cwd: /test-work
+  project: test-project
+  concurrency:
+    git-automate-developer: 2
+    default: 4
+    myprovider/slow: 1
+git:
+  repository: https://github.com/user/repo
+  directory: /test-dir
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let oc = config.opencode.as_ref().unwrap();
+        assert_eq!(oc.concurrency.get("git-automate-developer"), Some(&2));
+        assert_eq!(oc.concurrency.get("default"), Some(&4));
+        assert_eq!(oc.concurrency.get("myprovider/slow"), Some(&1));
+        assert_eq!(oc.concurrency.len(), 3);
+    }
+
     // Test: parse_config without opencode.concurrency → empty HashMap
     #[test]
     fn parse_config_opencode_concurrency_defaults_empty() {
@@ -502,6 +562,84 @@ git:
         let config = parse_config(tmp.path()).unwrap();
         let oc = config.opencode.as_ref().unwrap();
         assert!(oc.concurrency.is_empty());
+    }
+
+    // Test: parse_config without session hardening keys → serde defaults
+    #[test]
+    fn parse_config_opencode_session_hardening_defaults() {
+        let yaml = r#"
+opencode:
+  url: http://localhost:8081
+  pw: secret
+  cwd: /test-work
+  project: test-project
+git:
+  repository: https://github.com/user/repo
+  directory: /test-dir
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let oc = config.opencode.as_ref().unwrap();
+        assert_eq!(oc.session_timeout_secs, 1800);
+        assert_eq!(oc.session_max_secs, 86400);
+        assert_eq!(oc.max_session_attempts, 3);
+    }
+
+    // Test: parse_config with camelCase session hardening keys → parsed
+    #[test]
+    fn parse_config_opencode_session_hardening_camel_case() {
+        let yaml = r#"
+opencode:
+  url: http://localhost:8081
+  pw: secret
+  cwd: /test-work
+  project: test-project
+  sessionTimeoutSecs: 60
+  sessionMaxSecs: 120
+  maxSessionAttempts: 5
+git:
+  repository: https://github.com/user/repo
+  directory: /test-dir
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let oc = config.opencode.as_ref().unwrap();
+        assert_eq!(oc.session_timeout_secs, 60);
+        assert_eq!(oc.session_max_secs, 120);
+        assert_eq!(oc.max_session_attempts, 5);
+    }
+
+    // Test: parse_config with snake_case session hardening keys → parsed via alias
+    #[test]
+    fn parse_config_opencode_session_hardening_snake_case_alias() {
+        let yaml = r#"
+opencode:
+  url: http://localhost:8081
+  pw: secret
+  cwd: /test-work
+  project: test-project
+  session_timeout_secs: 90
+  session_max_secs: 150
+  max_session_attempts: 7
+git:
+  repository: https://github.com/user/repo
+  directory: /test-dir
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let config = parse_config(tmp.path()).unwrap();
+        let oc = config.opencode.as_ref().unwrap();
+        assert_eq!(oc.session_timeout_secs, 90);
+        assert_eq!(oc.session_max_secs, 150);
+        assert_eq!(oc.max_session_attempts, 7);
     }
 
     // Test: git_automate_config_serde_round_trip_with_opencode_concurrency
@@ -527,6 +665,9 @@ git:
                 cwd: "/test-work".to_string(),
                 project: "test-project".to_string(),
                 concurrency,
+                session_timeout_secs: default_session_timeout_secs(),
+                session_max_secs: default_session_max_secs(),
+                max_session_attempts: default_max_session_attempts(),
             }),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();

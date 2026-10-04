@@ -10,8 +10,8 @@
 //!    - The issue appears in the project board
 //!    - The issue's Status field is "Triage"
 //!    - The issue has a non-empty `sessionId` field
-//!    - An OpenCode session exists (`GET /session/status` reports active sessions)
-//!    - The session's initial prompt contains the issue body (`GET /session/{id}/message`)
+//!    - An OpenCode session exists (`GET /api/session/active` reports active sessions)
+//!    - The session's initial prompt contains the issue body (`GET /api/session/{id}/message`)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,7 +25,9 @@ use git_automate::external_agent::opencode::client::OpenCodeClient;
 use git_automate::external_issues::github::client::GitHubClient;
 use git_automate::external_issues::github::repo::parse_repository_url;
 use git_automate::workflow::Workflow;
-use git_automate::workflow::helpers::{WorkflowContext, resolve_project_id};
+use git_automate::workflow::helpers::{
+    SessionBinding, WorkflowContext, resolve_project_id, serialize_binding,
+};
 
 use git_automate::test_utils::SET_CWD_MUTEX;
 
@@ -261,8 +263,9 @@ async fn e2e_triage_flow_creates_session() {
 
     // ── 11. Verify: OpenCode session exists ───────────────────────
     let active_count = opencode
-        .count_active_sessions()
+        .get_active_sessions()
         .await
+        .map(|sessions| sessions.len())
         .expect("Failed to count active OpenCode sessions");
     assert!(
         active_count > 0,
@@ -274,7 +277,7 @@ async fn e2e_triage_flow_creates_session() {
 
     // ── 12. Verify: initial prompt contains issue content ───────────
     let messages = opencode
-        .get_session_messages(session_id, None)
+        .get_session_messages(session_id)
         .await
         .expect("Failed to fetch session messages");
 
@@ -582,8 +585,9 @@ async fn e2e_full_workflow_state_flow() {
 
     // ── 16. Run review check — should NOT start a new session ─────
     let active_before = opencode
-        .count_active_sessions()
+        .get_active_sessions()
         .await
+        .map(|sessions| sessions.len())
         .expect("Failed to count active sessions");
 
     workflow
@@ -592,8 +596,9 @@ async fn e2e_full_workflow_state_flow() {
         .expect("review check failed");
 
     let active_after = opencode
-        .count_active_sessions()
+        .get_active_sessions()
         .await
+        .map(|sessions| sessions.len())
         .expect("Failed to count active sessions");
 
     assert_eq!(
@@ -630,21 +635,21 @@ async fn e2e_full_workflow_state_flow() {
     );
 }
 
-/// End-to-end test: failed review recovery flow.
+/// End-to-end test: stale review recovery flow.
 ///
-/// Verifies that when a review session ends without a status transition,
-/// `run_failed_review_check` detects the stale session, transitions the item
-/// back to Todo, clears the session, and starts a new developer session.
+/// Verifies that when a review session is gone (404 / not-found),
+/// `run_review_completion_check` detects the stale session, transitions the
+/// item back to Todo, and clears the binding so a fresh developer session
+/// starts on the next cycle.
 ///
 /// Flow:
 ///   1. Create @ai issue, run triage → Status=Triage, sessionId set
 ///   2. Simulate triage completion → Todo, run todo check → dev session
 ///   3. Simulate dev completion → Review Technical, run review check → reviewer session
 ///   4. Simulate reviewer session ending (set stale session ID)
-///   5. Run review check again → run_failed_review_check recovers:
+///   5. Run review check again → run_review_completion_check recovers:
 ///      - Status transitions to Todo
 ///      - Old session ID cleared
-///      - New developer session started
 #[tokio::test]
 async fn e2e_failed_review_recovery_flow() {
     dotenv().ok();
@@ -842,19 +847,26 @@ async fn e2e_failed_review_recovery_flow() {
 
     // Verify the reviewer session is active.
     let active_count = opencode
-        .count_active_sessions()
+        .get_active_sessions()
         .await
+        .map(|sessions| sessions.len())
         .expect("Failed to count active sessions");
     assert!(active_count > 0, "Expected active reviewer session");
     eprintln!("Active sessions: {}", active_count);
 
     // ── 10. Simulate reviewer session ending ──────────────────────
+    let stale_binding = serialize_binding(&SessionBinding {
+        step: Some("Review Technical".to_string()),
+        id: "stale-session-id-that-no-longer-exists".to_string(),
+        resume: String::new(),
+        attempts: 1,
+    });
     github
         .update_project_item_session_id(
             &project_id,
             &item.id,
             &session_field_id,
-            Some("stale-session-id-that-no-longer-exists"),
+            Some(&stale_binding),
         )
         .await
         .expect("Failed to set stale session ID");
@@ -871,10 +883,9 @@ async fn e2e_failed_review_recovery_flow() {
         .expect("review check with failed review failed");
 
     // ── 12. Verify: recovery completed ────────────────────────────
-    // After run_failed_review_check:
-    // - Status should have changed from "Review Technical" to "Todo"
-    // - The old stale session ID should be cleared
-    // - A new developer session should have been started
+    // The stale review session is a 404 → not-found, so the item resets to
+    // Todo with its binding cleared. The todo check starts a fresh developer
+    // session on the next cycle.
     let values = github
         .get_project_item_values(&item.id)
         .await
@@ -891,32 +902,14 @@ async fn e2e_failed_review_recovery_flow() {
     );
     eprintln!("Recovery: Status=Todo");
 
-    let recovered_session_id = values
-        .get("sessionId")
-        .and_then(|v| v.as_deref())
-        .expect("sessionId should be set after recovery");
+    let recovered_session_id = values.get("sessionId").and_then(|v| v.as_deref());
     assert!(
-        !recovered_session_id.is_empty(),
-        "sessionId should be non-empty after recovery (new dev session started)"
-    );
-    assert_ne!(
-        recovered_session_id, "stale-session-id-that-no-longer-exists",
-        "sessionId should be replaced with new dev session ID"
-    );
-    assert_ne!(
-        recovered_session_id, reviewer_session_id,
-        "Recovered session should differ from the stale reviewer session"
-    );
-    // The new session should be a developer session (different from the
-    // reviewer session we set earlier).
-    assert_ne!(
-        recovered_session_id, reviewer_session_id,
-        "New dev session ID should differ from reviewer session"
-    );
-    eprintln!(
-        "Recovery: new dev session started, sessionId={}",
+        recovered_session_id.is_none_or(|s| s.is_empty()),
+        "sessionId should be cleared after the stale review was reset, got: {:?}",
         recovered_session_id
     );
+    let _ = reviewer_session_id;
+    eprintln!("Recovery: stale session cleared, awaiting a fresh developer session");
 
     // ── 13. Cleanup ───────────────────────────────────────────────
     std::env::set_current_dir(&original_dir)
@@ -924,7 +917,7 @@ async fn e2e_failed_review_recovery_flow() {
     drop(_cwd_guard);
 
     eprintln!(
-        "e2e failed review recovery test passed: issue #{}, recovered with new dev session",
+        "e2e failed review recovery test passed: issue #{}, reset to Todo",
         created_issue.number
     );
 }

@@ -1,11 +1,15 @@
 opencode:
   concurrency:
-    myprovider/slow: 2
-    myprovider/fast: 4
+    git-automate-developer: 2
+    default: 4
+    # Legacy model keys (containing "/") still work, e.g. myprovider/slow: 2
   url: ${env:OPENCODE_URL}
   pw: ${env:OPENCODE_PW}
   cwd: /workspace/git-automate-e2e
   project: git-automate-e2e
+  sessionTimeoutSecs: 1800
+  sessionMaxSecs: 86400
+  maxSessionAttempts: 3
 git:
   repository: https://github.com/krampenschiesser/git-automate-e2e
   projectId: 6

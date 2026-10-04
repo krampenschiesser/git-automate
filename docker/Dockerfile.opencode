@@ -1,0 +1,15 @@
+FROM node:24-bookworm-slim
+
+# git is needed by the workflow (branch/commit/push); ca-certificates for HTTPS.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# OpenCode v2 ships on npm as @opencode/cli; the server binary is `opencode2`.
+RUN npm i -g @opencode/cli@2.0.18
+
+WORKDIR /workspace
+
+EXPOSE 4096
+
+CMD ["opencode2", "serve", "--hostname", "0.0.0.0", "--port", "4096"]

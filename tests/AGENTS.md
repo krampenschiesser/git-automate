@@ -18,7 +18,7 @@ tests/
 | Add mock helper | `common/mod.rs` | Follow `mount_*_mock` pattern |
 | Add integration test | `workflow_tests.rs` or `e2e_test.rs` | Use `make_deps()` from common |
 | Mock GitHub API | `common/mod.rs` `mount_github_graphql_mocks` | `body_string_contains` disambiguation |
-| Mock OpenCode API | `common/mod.rs` `mount_opencode_mocks` | Health + agents endpoints |
+| Mock OpenCode API | `common/mod.rs` `mount_opencode_mocks` (+ `mount_opencode_v2_*`) | v2 endpoints under `/api/*` |
 | Test config parsing | `src/config.rs` inline tests | Uses `tempfile`, `SET_CWD_MUTEX` |
 | Debug test flakiness | `src/lib.rs` `SET_CWD_MUTEX` | 14 usage locations across codebase |
 
@@ -36,7 +36,7 @@ tests/
 - **`T#` numbering**: Tests numbered in comments (e.g. `T1`, `T7`) — follow for new tests
 - **`make_deps(github, with_opencode, opencode_url)`**: Builds `WorkflowContext` with a single project — use for all integration tests
 - **`project_with_opencode(url)` / `project_without_opencode()`**: Builder functions for `ProjectConfig` — use instead of constructing manually
-- **`wiremock`**: Both GitHub (`/graphql`) and OpenCode (`/global/health`, `/agent`, `/session`)
+- **`wiremock`**: Both GitHub (`/graphql`) and OpenCode (`/api/info`, `/api/agent`, `/api/session`, `/api/location`, `/api/worktree`, `/api/session/active`)
 - **`tempfile`**: Used for on-disk config files in config tests
 - **`ENV_LOCK`** (in `main.rs` tests): Mutex for env var isolation — not the same as `SET_CWD_MUTEX`
 

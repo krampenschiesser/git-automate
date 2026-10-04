@@ -18,9 +18,8 @@ Single-crate Rust daemon (`edition = "2024"`, req. Rust 1.85+). Polls GitHub for
 │   │   ├── agents/      (6)    *.agent.md (triage/taskmanager/dev/reviewer/product/qa)
 │   │   └── prompts/     (6)    *.md prompt templates
 │   ├── workflow/        (3, 5710 lines)   See AGENTS.md
-│   ├── external_agent/  (6 files)
-│   │   ├── common/      (1)    ExternalAgent trait (provider-agnostic)
-│   │   └── opencode/    (4)    OpenCode HTTP client — See AGENTS.md
+│   ├── external_agent/  (2 files)
+│   │   └── opencode/    (3)    OpenCode v2 HTTP client — See AGENTS.md
 │   └── external_issues/ (8 files)
 │       └── github/      (7 + 20 queries)  See AGENTS.md
 ├── tests/               (3 files)          See AGENTS.md
@@ -39,7 +38,7 @@ Single-crate Rust daemon (`edition = "2024"`, req. Rust 1.85+). Polls GitHub for
 | Add OpenCode API call | `src/external_agent/opencode/client.rs` | HTTP client, `include_str!` queries |
 | Add GitHub GraphQL query | `src/external_issues/github/queries/` + `client.rs` + `types.rs` | 4-step pattern: .graphql → struct → method → test |
 | Edit agent prompts | `src/assets/prompts/*.md` | Requires `cargo build` (include_str!) |
-| Edit agent definitions | `src/assets/agents/*.agent.md` | Copied to `~/.opencode/agents/` by `doctor` |
+| Edit agent definitions | `src/assets/agents/*.agent.md` | Installed as `<id>.md` under `~/.config/opencode/agents/` by `doctor` |
 | Add integration test | `tests/` | Helpers in `tests/common/mod.rs`, use `SET_CWD_MUTEX` |
 | Debug test flakiness | `src/lib.rs` | `SET_CWD_MUTEX` guards cwd mutations |
 | Update CI pipeline | `.github/workflows/rust.yml` | fmt → check → clippy → test |
@@ -53,9 +52,8 @@ Single-crate Rust daemon (`edition = "2024"`, req. Rust 1.85+). Polls GitHub for
 | `AgentName` | enum | `workflow/mod.rs` | 6 agents: triage, taskmanager, developer, reviewer, product, qa |
 | `WorkflowError` | enum | `workflow/helpers.rs` | Error type; per-project errors never propagate |
 | `WorkflowContext` | struct | `workflow/helpers.rs` | Config + GitHub client |
-| `OpencodeSessionConfig` | struct | `workflow/checks.rs` | Session creation config + per-model concurrency gate via API discovery |
-| `ExternalAgent` | trait | `external_agent/common/mod.rs` | Provider-agnostic: `create_session`, `get_session`, `list_agents` |
-| `OpenCodeClient` | struct | `external_agent/opencode/client.rs` | Concrete `ExternalAgent` impl via HTTP |
+| `OpencodeSessionConfig` | struct | `workflow/checks.rs` | Session creation config + per-agent concurrency gate (with `default` fallback + legacy model keys) via API discovery |
+| `OpenCodeClient` | struct | `external_agent/opencode/client.rs` | Canonical HTTP client for OpenCode v2 (sessions, worktrees, agents, prompts) |
 | `GitHubClient` | struct | `external_issues/github/client.rs` | GraphQL/REST; 17 `include_str!` queries |
 | `GitAutomateConfig` | struct | `config.rs` | Top-level YAML config with `${env:VAR}` |
 | `SET_CWD_MUTEX` | static | `lib.rs` | Serializes cwd-mutating tests |
@@ -78,7 +76,7 @@ git-automate doctor --config git-automate.yml   # install missing agents
 - **`projectId` is optional.** If it is numeric (a project *number*, not a relay ID) it is **resolved to a GitHub global ID at runtime** via `projectV2(number:)` — the original numeric value is **kept** in `git-automate.yml` (not replaced). Non-numeric values are treated as already-valid global IDs (no network call).
 - **`${env:VAR}`** interpolation runs on every string field (recursing into maps/sequences). Unset vars become empty strings.
 - **`.env`** is loaded via `dotenv()` at startup; vars already in the environment take precedence over the file.
-- `opencode.concurrency` (per-model map) caps active OpenCode sessions per model — when the limit for any model is reached, session creation is skipped with a warning. Model info is discovered via the OpenCode API (`GET /api/session` + `GET /session/status`).
+- `opencode.concurrency` (per-agent map keys, with a `default` fallback) caps active OpenCode sessions per agent — when the limit for the session's agent (or `default`) is reached, session creation is skipped with a warning and the poll cycle is short-circuited (`ConcurrencyExceeded` breaks the remaining steps). Keys containing `/` are legacy model keys, checked against per-model counts. Agent info is discovered via the OpenCode API (`GET /api/session/active` for running session ids, then a per-id `GET /api/session/{id}` for the `agent`/`model`).
 
 ## Required environment
 
@@ -90,7 +88,7 @@ git-automate doctor --config git-automate.yml   # install missing agents
 ```
 git-automate serve --config git-automate.yml      # daemon, polls every 30s
 git-automate health --url <url> --pw <pw>          # probe OpenCode server health
-git-automate doctor --config git-automate.yml      # one-shot setup; copies missing agents to ~/.opencode/agents/
+git-automate doctor --config git-automate.yml      # one-shot setup; copies missing agents to ~/.config/opencode/agents/
 ```
 
 ## Agent & workflow model
@@ -102,7 +100,7 @@ git-automate doctor --config git-automate.yml      # one-shot setup; copies miss
 
 ## Test conventions
 
-- **Mocking**: `wiremock` for both GitHub GraphQL (`/graphql`) and OpenCode (`/global/health`, `/agent`, `/session`, …). `tempfile` for on-disk config.
+- **Mocking**: `wiremock` for both GitHub GraphQL (`/graphql`) and OpenCode (`/api/info`, `/api/agent`, `/api/session`, `/api/location`, `/api/worktree`, …). `tempfile` for on-disk config.
 - **`SET_CWD_MUTEX`** (`lib.rs::test_utils`): any test that calls `write_project_id` or `load_config` mutates `cwd` — it **must** acquire this lock and restore the original directory afterward. This is the most common cause of test flakiness.
 - **Mock disambiguation**: GitHub mocks use `body_string_contains` on unique substrings (`user(login:`, `createProjectV2(input`, `field(name:`, `fields(first:`, `updateProjectV2Field`, `createProjectV2Field`) — follow the same pattern for new GraphQL tests.
 - **Shared fixtures**: integration tests live in `tests/` with helpers in `tests/common/mod.rs` (`mount_github_graphql_mocks`, `mount_opencode_mocks`, `make_deps`, `gh_client`, …).
@@ -118,7 +116,7 @@ git-automate doctor --config git-automate.yml      # one-shot setup; copies miss
 - `deny_unknown_fields` — unknown YAML keys cause parse errors; `titlePattern` validated as regex at deserialize
 - `directory` validated as non-empty string at deserialize (catches unset `${env:VAR}` → empty)
 - Mock disambiguation: GitHub mocks use `body_string_contains` on unique substrings (e.g. `user(login:`, `createProjectV2(input`, `field(name:`)
-- `concurrency` cap (per-model, in `opencode.concurrency`) skips session creation with a warning (not an error) when limit reached for any model (conservative: blocks all creation if any model is at capacity)
+- `concurrency` cap (per-agent in `opencode.concurrency`, `default` fallback, plus legacy model keys) skips session creation with a warning (not an error) when the agent's limit is reached; `ConcurrencyExceeded` short-circuits the poll cycle
 - GitHub client `None` → each check logs `warn` and returns `Ok(())` (intentional, e.g. `doctor` mode)
 
 ## Subdirectory AGENTS
@@ -126,7 +124,7 @@ git-automate doctor --config git-automate.yml      # one-shot setup; copies miss
 |---|---|
 | `src/workflow/AGENTS.md` | Workflow engine: `Workflow`, `WorkflowStep`, `run_all()`, error isolation, 5-step pipeline |
 | `src/external_issues/github/AGENTS.md` | GitHub GraphQL/REST client: `.graphql` files, `include_str!`, 4-step query pattern, `types.rs` |
-| `src/external_agent/opencode/AGENTS.md` | OpenCode HTTP client: `ExternalAgent` trait impl, sessions, agents, basic auth |
+| `src/external_agent/opencode/AGENTS.md` | OpenCode v2 HTTP client: inherent methods, sessions, agents, basic auth |
 | `tests/AGENTS.md` | Integration test conventions: `SET_CWD_MUTEX`, mock helpers, wiremock patterns, T# numbering |
 
 ## Notes that are easy to miss

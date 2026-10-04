@@ -176,9 +176,9 @@ triage, todo, and review steps.
 
 ### What the Check Does
 
-The `check_opencode` function probes the OpenCode server's
-health endpoint. This is the **only** endpoint consulted
-during this step.
+The `check_opencode` function probes the OpenCode server's v2 health
+endpoint (`GET /api/info`; OpenCode v2 removed `/global/health`). This is
+the **only** endpoint consulted during this step.
 
 - If the server responds with a healthy status, the check logs an
   informational message and returns `Ok(Workflow::Continue)`.
@@ -224,8 +224,10 @@ project board.
 
 5. **Start a triage session if needed.** If the project item does not
    yet have a `sessionId` value, the daemon starts a triage OpenCode
-   session. This session creation is code-driven: the daemon loads the
-   triage agent handlebars template as the system prompt and the triage prompt
+   session. This session creation is code-driven: the daemon creates the
+   session with the named OpenCode agent `git-automate-triage` (its system
+   instructions live in the OpenCode agent definition — OpenCode v2 has no
+   per-session system prompt) and the triage prompt
    template as the user message, filling in the following handlebars template
    variables:
    - `ISSUE_TITLE`
@@ -270,8 +272,9 @@ session, and it starts one.
    It then generates a list of comments, their files and the line numbers to pass down to the developer session.
 
 5. **Start a developer session.** The daemon starts a developer OpenCode
-   session (code-driven) using the developer agent template as the
-   system prompt and the developer prompt template as the user message.
+   session (code-driven) with the named OpenCode agent
+   `git-automate-developer` (system instructions come from the agent
+   definition) and the developer prompt template as the user message.
    Template variables filled in are:
    - `ISSUE_TITLE`
    - `ISSUE_NUMBER`
@@ -375,9 +378,12 @@ Each review state uses a specific agent and prompt template:
 | Review Product   | Product  | `product`       |
 | QA               | QA       | `qa`            |
 
-The agent template is loaded as the system prompt and the prompt
-template is filled with variables and used as the user message. Both
-loads are code-driven; no LLM agent decides which template to use.
+Each review state creates the session with its named OpenCode agent
+(`git-automate-reviewer`, `git-automate-product`, `git-automate-qa`); the prompt
+template is filled with variables and used as the user message. Both the
+agent choice and the prompt load are code-driven; no LLM agent decides which
+template to use. OpenCode v2 has no per-session system prompt — the agent's
+instructions come from its OpenCode definition.
 
 ### Agent Decision Outcomes
 
@@ -419,7 +425,7 @@ Then code-driven api calls resolve the comments so that they disappear from futu
 ### Session Creation
 
 For each matching item, the daemon creates an OpenCode session
-(code-driven) with the loaded system prompt and filled user prompt.
+(code-driven) with the named agent for the state and the filled user prompt.
 The session title is formatted as:
 
 ```
@@ -448,7 +454,9 @@ phase.
 #### What Failed Review Recovery Detects
 
 The recovery check identifies review sessions that have completed
-(i.e. they no longer appear in OpenCode's active session list) but
+(i.e. they no longer appear in OpenCode's v2 active-session list
+`/api/session/active`, and report a terminal `outcome`/`time.idle` on
+`/api/session/{id}`) but
 whose project item status has **not** transitioned. This indicates
 that the review agent finished without producing the expected status
 change, leaving the item stranded.
@@ -460,9 +468,9 @@ recovery check performs the following steps in order:
 
 1. **Clear the `sessionId` field.** The existing session ID is removed
    via `updateProjectItemSessionId` with a `None` value.
-2. **Start a new developer session.** The daemon loads the developer
-   agent template as the system prompt and the developer prompt
-   template as the user message, filling in the standard developer
+2. **Start a new developer session.** The daemon creates a session with
+   the named OpenCode agent `git-automate-developer` and the developer
+   prompt template as the user message, filling in the standard developer
    variables (`ISSUE_TITLE`, `ISSUE_NUMBER`, `ISSUE_BODY`,
    `BRANCH_NAME`, `PROJECT_REPOSITORY`). This session creation is
    code-driven.
@@ -476,40 +484,49 @@ to produce a correct implementation.
 
 ## Concurrency
 
-The daemon limits the total number of concurrently active OpenCode
-agent sessions by a map of model to concurrency in `git-automate.yml`:
+The daemon limits the number of concurrently active OpenCode agent sessions
+by a map keyed on the OpenCode agent name (with a `default` fallback) in
+`git-automate.yml`:
 ```
 opencode:
   concurrency:
-    myprovider/slow: 2
-    myprovider/fast: 4
+    git-automate-developer: 2
+    default: 4
 ```
+
+Keys containing `/` are treated as legacy model keys and are checked against
+the per-model active session count (e.g. `myprovider/slow: 2`).
 
 
 ### Behavior When Set
 
 When `concurrency` is configured, it acts as a **hard cap**. Before
-creating any new OpenCode session, the daemon queries the OpenCode
-server for the current active sessions. For each session it resolves the model
-handling the session. 
-If the sum of active sessions for any model is greater than the limit set, session creation is skipped completely and therefore
-ending the current loop.
+creating a new OpenCode session, the daemon queries the OpenCode server for
+the current active sessions and counts them by agent (and, for legacy keys,
+by model). The limit for the session's own agent is `concurrency[<agent>]`,
+falling back to `concurrency["default"]`.
+If the active count for that agent meets or exceeds the limit, session
+creation is skipped completely and the poll cycle is short-circuited — the
+remaining workflow steps are skipped for this cycle.
 An information message is logged once for this. Subsequent skips of the workflow loop will not be logged.
 However, when the workflow continues processing a new info message needs to be logged informing the user about capacity being available again.
 
 ## Agent Catalog
 
-The git-automate workflow defines six agents. Each agent has
-an embedded definition file that is copied to `~/.config/git-automate/agents`
-by the initial setup.
+The git-automate workflow defines six agents. Each has an embedded definition
+file (`src/assets/agents/git-automate-<role>.agent.md`) that `doctor` installs
+as `<id>.md` into the OpenCode v2 global agents directory
+(`$XDG_CONFIG_HOME/opencode/agents`, default `~/.config/opencode/agents`).
+The daemon selects an agent by its id when creating a session.
 
-| Agent | File | Role | Invoked By |
+| Agent | OpenCode agent id | Role | Invoked By |
 |---|---|---|---|
-| Triage | `git-automate-triage.agent.md` | Analyze issues, break into sub-tasks, and transition items to "Todo" | Step 3 (Triage) |
-| Developer | `git-automate-developer.agent.md` | Implement code changes for triaged issues | Step 4 (Todo), Failed Review Recovery |
-| Reviewer | `git-automate-reviewer.agent.md` | Technical code review for pull requests | Step 5 (Review Technical) |
-| Product | `git-automate-product.agent.md` | Product and UX review for implemented features | Step 5 (Review Product) |
-| QA | `git-automate-qa.agent.md` | Testing and QA verification before final approval | Step 5 (QA) |
+| Triage | `git-automate-triage` | Analyze issues, break into sub-tasks, and transition items to "Todo" | Step 3 (Triage) |
+| Task Manager | `git-automate-taskmanager` | Manage issues and tasks across the workflow | Not currently started by the daemon |
+| Developer | `git-automate-developer` | Implement code changes for triaged issues | Step 4 (Todo), Failed Review Recovery |
+| Reviewer | `git-automate-reviewer` | Technical code review for pull requests | Step 5 (Review Technical) |
+| Product | `git-automate-product` | Product and UX review for implemented features | Step 5 (Review Product) |
+| QA | `git-automate-qa` | Testing and QA verification before final approval | Step 5 (QA) |
 
 ## Prompt Variable Catalog
 
